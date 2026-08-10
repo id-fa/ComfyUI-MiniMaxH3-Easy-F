@@ -1841,13 +1841,32 @@ def _resample_video_frames(frames: torch.Tensor, source_fps: float) -> torch.Ten
     return frames[indexes]
 
 
-def _encode_reference_audio(audio_vae, audio: Mapping):
+def _encode_reference_audio(audio_vae, audio: Mapping, max_seconds: float | None = None):
     waveform = audio["waveform"]
     sample_rate = _audio_sample_rate(audio)
+    if max_seconds and max_seconds > 0:
+        # A reference video is truncated to the generated length, so its
+        # soundtrack has to follow: an untrimmed track both desynchronises the
+        # pair and costs VRAM linear in its duration.
+        limit = int(round(max_seconds * sample_rate))
+        if 0 < limit < waveform.shape[-1]:
+            waveform = waveform[..., :limit]
     vae_sample_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
     if sample_rate != vae_sample_rate:
         waveform = torchaudio.functional.resample(waveform, sample_rate, vae_sample_rate)
-    latent = audio_vae.encode(waveform[:1].movedim(1, -1))
+    seconds = waveform.shape[-1] / max(1, vae_sample_rate)
+    logging.info("MiniMax H3 Easy: encoding %.2fs of reference audio", seconds)
+    try:
+        latent = audio_vae.encode(waveform[:1].movedim(1, -1))
+    except IndexError as exc:
+        # ComfyUI retries a failed VAE encode with 2D image tiling, which cannot
+        # take this VAE's 3D waveform and dies with "tuple index out of range"
+        # instead of reporting the out-of-memory that triggered the retry.
+        raise RuntimeError(
+            f"Ran out of memory encoding {seconds:.1f}s of reference audio. The MiniMax H3 audio "
+            "VAE needs roughly 0.12 GB of VRAM per second of audio, plus 0.4 GB. Shorten the "
+            "reference audio or free VRAM."
+        ) from exc
     return latent, latent.shape[-1]
 
 
@@ -1990,7 +2009,9 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
         audio_latent = None
         audio_t = 0
         if soundtrack is not None:
-            audio_latent, audio_t = _encode_reference_audio(bundle.audio_vae, soundtrack)
+            audio_latent, audio_t = _encode_reference_audio(
+                bundle.audio_vae, soundtrack, max_seconds=count / h3.FPS
+            )
             audio_ordinal += 1
             soundtrack_pairs.append((audio_ordinal, video_ordinal))
             ref_items.append({"type": "audio"})

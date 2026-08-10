@@ -122,6 +122,13 @@ snapped to `5 + 17n` (`_frame_length`); reference images use a single uniform sc
 `_reference_aligned_size` (never non-uniform stretching, never cropping); `original` mode skips
 image-side resizing and reads the latent grid back from the VAE.
 
+A reference video's soundtrack comes out of the `VIDEO` (upstream takes it as a separate `AUDIO`
+input), so `_encode_reference_audio` gets `max_seconds` and trims it to the frames that survived the
+`5 + 17n` snap — otherwise the pair desynchronises and the audio VAE asks for ~0.12 GB of VRAM per
+second. Standalone audio references are never trimmed. That VAE has `latent_dim == 2` with a 3D
+waveform, so ComfyUI's OOM fallback to `encode_tiled_` raises `IndexError` instead of reporting the
+memory; the encode translates it back.
+
 ## Cross-file invariants
 
 Constants are duplicated between `nodes.py` and `web/minimax_h3_easy_ui.js` and must be edited in both:

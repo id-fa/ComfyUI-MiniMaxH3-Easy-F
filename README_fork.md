@@ -317,3 +317,42 @@ OpenAI-compatible format.
 `nodes.py` and `web/minimax_h3_easy_ui.js`. Adds
 `GET /minimax_h3_easy/gguf_models` for the model dropdown. Python changed, so
 **restart ComfyUI**.
+
+---
+
+## Reference video soundtracks
+
+Upstream's node takes a reference video's soundtrack as its own `AUDIO` input,
+so its length is the user's choice. This fork reads the soundtrack out of the
+connected `VIDEO` instead, which made it the one part of a reference video that
+was **not** truncated to the generated length.
+
+A reference video is now trimmed as a whole: its soundtrack is cut to the same
+duration as the frames that survive the `5 + 17n` snap. Two consequences:
+
+- Picture and sound stay aligned. A 60-second clip used for a 5-second
+  generation no longer contributes 60 seconds of audio against 5 seconds of
+  video.
+- It no longer runs out of VRAM. The H3 audio VAE needs roughly **0.12 GB per
+  second** of audio at 32 kHz (plus about 0.4 GB fixed), so a full-length
+  soundtrack could ask for more memory than the whole generation.
+
+Standalone `AUDIO` references are left untouched — their length is deliberate.
+
+### The confusing error this replaces
+
+When the audio VAE ran out of memory, ComfyUI retried the encode with its 2D
+image tiler, which cannot take a 3D waveform, and the run died with:
+
+```
+IndexError: tuple index out of range
+  File "comfy/sd.py", line 1105, in encode_tiled_
+```
+
+That names neither audio nor memory. The encode now reports the real cause and
+the audio length instead, and logs the length of every reference soundtrack it
+encodes.
+
+### Scope
+
+`nodes.py` only. **Restart ComfyUI.**
