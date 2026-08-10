@@ -82,3 +82,118 @@ the previous optimizer result; that heuristic is removed.
 Frontend only — `web/minimax_h3_easy_ui.js`. No Python node, input, or output
 changed, so a browser refresh is enough to pick this up; no ComfyUI restart is
 required.
+
+---
+
+## Prompt optimization with a local text encoder
+
+**Prompt optimization settings → API format** gains a third choice next to
+OpenAI Compatible and Gemini Native:
+
+> **Text encoder (clip input)**
+
+It rewrites the prompt with a text encoder connected to the node instead of an
+HTTP API, so no API URL, API key, model name, or network access is involved.
+
+### The `optimizer_clip` input
+
+The main node gains an optional **`optimizer_clip`** (`CLIP`) input, kept
+separate from the H3 model bundle on purpose: it is the LLM that rewrites the
+prompt, not one of the H3 generation models.
+
+Connect an LLM-backed text encoder — the same kind ComfyUI's built-in
+**Generate Text** node takes, e.g. a Gemma encoder from `CLIPLoader`. Generation
+uses the standard ComfyUI pipeline (`clip.tokenize` → `clip.generate` →
+`clip.decode`), so any encoder that node accepts works here. A plain CLIP that
+cannot generate text raises a clear error instead of failing silently.
+
+### Connected media
+
+**Read connected media** works here as it does for the HTTP formats: with the
+switch on the media wired to the node reaches the encoder, with it off only the
+prompt text is sent.
+
+It gets there as text. With the switch on, each connected asset is described by
+the same encoder in **its own pass**, and the descriptions are then handed to the
+prompt-writing pass as text:
+
+```
+=== CONNECTED MEDIA ===
+<Picture 1>: a woman in a red coat standing under a shop awning, overcast daylight...
+<Video 1>: a dog running left to right across wet asphalt, handheld camera following...
+<Audio 1>: heavy rain with distant thunder, no speech
+```
+
+A text encoder exposes a single slot per modality, which makes sending a whole
+H3 reference set at once lossy: images have to share one batch (so mismatched
+sizes get stretched), a video channel can shadow the reference images entirely,
+and only one audio clip fits. Describing one asset at a time removes all three
+limits, and the final prompt-writing pass runs on text alone.
+
+- Every description is labelled with the name the prompt itself uses — the
+  resolved `<Picture N>` / `<Video N>` / `<Audio N>` tag in Reference Video mode,
+  or `the first frame` / `the last frame` in I2V and first/last-frame mode — so
+  the prompt writer can tie a detail to the right reference.
+- A modality the encoder has no channel for is skipped rather than guessed at,
+  and the guide's media evidence rule is told how many descriptions exist, so
+  unlisted references are never invented.
+- Video is sampled before it reaches the encoder (8 frames through a native
+  video channel, otherwise 4 frames as stills).
+- Each description is capped at 256 tokens, or `clip_max_length` when that is
+  lower.
+
+### When it runs
+
+The encoder only exists while the graph is running, so `✦` cannot use it at edit
+time. Clicking `✦` in this mode reports when optimization will happen instead of
+sending a request.
+
+Optimization runs **while the workflow executes**, and follows the same rule as
+the tabs:
+
+- It runs only while the **Optimized** tab is empty.
+- The result is used for that run and pushed back into the **Optimized** tab, so
+  the next queue reuses the stored text instead of regenerating it.
+- To optimize again, clear the **Optimized** tab and queue the workflow.
+
+In **Reference Video** mode the optimization happens after `@` references are
+resolved, so the encoder sees the official `<Picture N>` / `<Video N>` /
+`<Audio N>` tags and its output goes straight to the H3 tokenizer.
+
+Sampling is disabled, so the same prompt and encoder produce the same result on
+every run.
+
+### Settings
+
+In this mode the settings popup hides the API URL, API key, and model rows and
+shows instead:
+
+- **Max generated tokens** (`clip_max_length`, default `1024`, range
+  `16`–`32768`).
+
+**Read connected media** stays visible and applies to every format. Both values
+are stored in the same shared `prompt_optimizer.json`.
+
+### Notes and limits
+
+- The system prompt is the full H3 Prompt Guide bundle (roughly 18–45 KB of
+  text depending on mode and selected scene guide). Local generation is
+  therefore noticeably slower than an API call, and small encoders may follow
+  the guide loosely. Selecting the **General only** Prompt Guide keeps it
+  shortest.
+- If this format is selected but nothing is connected to `optimizer_clip`, the
+  prompt is used as typed and a warning is logged; the run is not failed.
+- **Read connected media** costs one extra generation pass per connected asset,
+  and decodes reference videos a second time (once for the encoder, once for
+  H3's own conditioning). Leave it off if the workflow has many references and
+  the prompt does not need them.
+- A run started through the API without the web extension has no Optimized-tab
+  state, so it optimizes on every run (the hidden
+  `prompt_needs_optimization` input defaults to `true`).
+- Requires a ComfyUI build whose `CLIP` object exposes `generate` / `decode`
+  (the same requirement as the built-in **Generate Text** node).
+
+### Scope
+
+`nodes.py` and `web/minimax_h3_easy_ui.js`. This one adds a node input, so
+**ComfyUI must be restarted**, not just refreshed.

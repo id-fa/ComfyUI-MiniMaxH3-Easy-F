@@ -65,6 +65,8 @@ both files and cannot be understood from either alone:
   (see localization below).
 
 Consequence: if you add a media-related widget or change `MAX_MEDIA`, you must touch both files.
+`isTransportInputName` in the JS decides what gets pruned; anything added to it must also be re-emitted in
+the `graphToPrompt` patch, or the server silently falls back to the input's default.
 
 ### Prompt editor and `@` reference resolution
 
@@ -148,8 +150,28 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
 - Settings are **installation-global** (`prompt_optimizer.json`), not per-node; only
   `prompt_optimizer_scene_guide` is a saved node widget. The `prompt_optimizer_settings` boolean is a
   momentary trigger that the frontend resets to `false` and `graphToPrompt` always forces to `false`.
-- Two API shapes: OpenAI-compatible chat completions and Gemini native `generateContent`. URL handling is
-  forgiving (`_normalize_optimizer_url` appends/strips endpoints, injects the Gemini model path and `key=`).
+- Three `api_format`s: OpenAI-compatible chat completions, Gemini native `generateContent`, and `clip`.
+  URL handling for the HTTP pair is forgiving (`_normalize_optimizer_url` appends/strips endpoints, injects
+  the Gemini model path and `key=`).
+- `clip` runs locally through the node's optional `optimizer_clip` CLIP input using ComfyUI's
+  `clip.tokenize` → `clip.generate` → `clip.decode` (same as the built-in `TextGenerate` node). That object
+  only exists during execution, so the HTTP route rejects this format and `MiniMaxH3Easy.generate` does the
+  work instead, via a `prompt_transform` callback threaded into `_reference_conditioning` — placed after
+  `_resolve_reference_prompt` so the encoder sees real `<Picture N>` tags, not internal placeholders. The
+  result is pushed to the editor with `PromptServer.send_sync(PROMPT_OPTIMIZER_EVENT)`. It only fires while
+  the hidden `prompt_needs_optimization` transport input is true (frontend: "the Optimized tab is empty";
+  default true so headless runs still optimize).
+- `read_media` applies to all three formats. For `clip` it runs `_optimizer_clip_descriptions`: **one
+  describe generation per connected asset**, then the final prompt pass gets those descriptions as text and
+  no media at all. A text encoder has a single slot per modality, so sending a whole H3 reference set at
+  once is lossy — one shared image batch (mismatched sizes get stretched), Gemma's tokenizer ignoring
+  `image` whenever `video` is set, one audio clip max. Per-asset passes sidestep all of it. Descriptions are
+  labelled with the same tag the prompt uses, which is why `prompt_transform` takes the `tag_by_input` map
+  from `_reference_conditioning` (and `_keyframe_labels` in image mode).
+- `_optimizer_clip_media` still routes a *single* asset onto whatever argument the encoder has, probing with
+  `_tokenizer_accepts`: every tokenizer takes `**kwargs`, so an unsupported media argument is *silently
+  dropped* rather than raising, and the signature is the only reliable capability check. Qwen3-VL exposes
+  `images=`, Gemma exposes `image=`/`video=`/`audio=`.
 - The system prompt is assembled by `_prompt_guide_bundle`: general guide + base *or* full-reference
   guide (by mode) + the selected scene guide + every `.md`/`.txt` under that guide's `references/`.
   `_read_prompt_guide_text` enforces a realpath prefix check — keep that when touching guide loading.

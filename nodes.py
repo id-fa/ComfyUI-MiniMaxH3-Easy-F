@@ -7,6 +7,7 @@ chain. The browser extension supplies the ordered virtual media inputs.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -14,6 +15,7 @@ import sys
 import threading
 import base64
 import asyncio
+import inspect
 import json
 import mimetypes
 import tempfile
@@ -110,13 +112,43 @@ PROMPT_GUIDE_MANIFEST = os.path.join(PROMPT_GUIDES_DIR, "manifest.json")
 PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
 PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
 PROMPT_OPTIMIZER_CONFIG_VERSION = 1
+OPTIMIZER_FORMAT_OPENAI = "openai"
+OPTIMIZER_FORMAT_GEMINI = "gemini"
+# Local text generation through the CLIP input instead of an HTTP API.
+OPTIMIZER_FORMAT_CLIP = "clip"
+OPTIMIZER_FORMATS = (OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_CLIP)
+PROMPT_OPTIMIZER_CLIP_MAX_LENGTH = 1024
+PROMPT_OPTIMIZER_CLIP_MIN_LENGTH = 16
+PROMPT_OPTIMIZER_CLIP_LENGTH_LIMIT = 32768
+# Caps for the media handed to a local text encoder. Every still costs the
+# encoder a block of soft tokens, so reference sets are trimmed rather than
+# sent whole.
+OPTIMIZER_CLIP_MAX_STILLS = 12
+OPTIMIZER_CLIP_FRAMES_PER_VIDEO = 4
+OPTIMIZER_CLIP_MAX_VIDEO_FRAMES = 8
+OPTIMIZER_CLIP_DESCRIBE_LENGTH = 256
+OPTIMIZER_CLIP_DESCRIBE_SYSTEM = (
+    "You describe one reference asset for a video generation prompt.\n"
+    "Report only what is actually present in the attached media: subject, appearance, clothing, pose, "
+    "setting, lighting, colour and visual style; for video also motion, action and camera movement; "
+    "for audio the sounds, voices, spoken language and music.\n"
+    "Never guess, never invent, and never describe media you cannot perceive.\n"
+    "Answer with one dense factual paragraph of at most 80 words. No headings, no lists, no commentary."
+)
+OPTIMIZER_CLIP_DESCRIBE_REQUESTS = {
+    "image": "Describe this reference image.",
+    "video": "Describe this reference video.",
+    "audio": "Describe this reference audio clip.",
+}
+PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized"
 PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
-    "api_format": "openai",
+    "api_format": OPTIMIZER_FORMAT_OPENAI,
     "api_url": "",
     "api_key": "",
     "model": "",
     "read_media": False,
+    "clip_max_length": PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
 }
 
 
@@ -374,12 +406,17 @@ def _prompt_optimizer_config_path() -> str:
 
 def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     source = value if isinstance(value, Mapping) else {}
-    api_format = str(source.get("api_format") or "openai").strip().lower()
-    if api_format not in {"openai", "gemini"}:
-        api_format = "openai"
+    api_format = str(source.get("api_format") or OPTIMIZER_FORMAT_OPENAI).strip().lower()
+    if api_format not in OPTIMIZER_FORMATS:
+        api_format = OPTIMIZER_FORMAT_OPENAI
     read_media = source.get("read_media", False)
     if isinstance(read_media, str):
         read_media = read_media.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        clip_max_length = int(float(source.get("clip_max_length", PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)))
+    except (TypeError, ValueError):
+        clip_max_length = PROMPT_OPTIMIZER_CLIP_MAX_LENGTH
+    clip_max_length = min(PROMPT_OPTIMIZER_CLIP_LENGTH_LIMIT, max(PROMPT_OPTIMIZER_CLIP_MIN_LENGTH, clip_max_length))
     return {
         "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
         "api_format": api_format,
@@ -387,6 +424,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "api_key": str(source.get("api_key") or ""),
         "model": str(source.get("model") or "").strip(),
         "read_media": bool(read_media),
+        "clip_max_length": clip_max_length,
     }
 
 
@@ -662,9 +700,21 @@ def _optimizer_system_prompt(
     seconds: float,
     media_counts: Mapping[str, int],
     attached_media_count: int = 0,
+    described_media_count: int = 0,
 ) -> str:
     prompt = _prompt_guide_bundle(scene_guide, mode, seconds, media_counts)
     actual_count = max(0, int(attached_media_count or 0))
+    described_count = max(0, int(described_media_count or 0))
+    if described_count:
+        # The media itself was perceived in a separate pass; this request only
+        # carries the resulting descriptions.
+        return prompt + (
+            "\n\n=== MEDIA EVIDENCE RULE ===\n"
+            f"Descriptions of {described_count} connected media are listed under CONNECTED MEDIA below. "
+            "You produced them yourself from the actual connected media, so treat them as observed evidence for the tags they name. "
+            "Do not invent any detail beyond those descriptions and the user's prompt. "
+            "For a media tag with no description, preserve the tag and infer only from the user's text and explicit instructions, never from an imagined asset."
+        )
     if actual_count:
         prompt += (
             "\n\n=== MEDIA EVIDENCE RULE ===\n"
@@ -682,6 +732,255 @@ def _optimizer_system_prompt(
             "Preserve media reference tags when needed, but infer only from the original user prompt and explicit instructions. Never fabricate a subject, appearance, action, setting, sound, or other media detail."
         )
     return prompt
+
+
+def _strip_optimizer_output(text: Any) -> str:
+    """Drop the code fence some models wrap their answer in."""
+    value = str(text or "").strip()
+    value = re.sub(r"^```(?:[a-zA-Z]*)\s*", "", value)
+    value = re.sub(r"\s*```$", "", value)
+    return value.strip()
+
+
+def _tokenizer_accepts(clip, name: str) -> bool:
+    """True when the tokenizer declares `name` as a real parameter.
+
+    Every tokenizer also takes **kwargs, so an unsupported media argument is
+    silently dropped instead of raising. Checking the signature is what keeps
+    `video=` away from an encoder that would ignore it.
+    """
+    try:
+        return name in inspect.signature(clip.tokenizer.tokenize_with_weights).parameters
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _sample_frames(frames, limit: int):
+    """Evenly thin a frame batch down to at most `limit` frames."""
+    try:
+        count = int(frames.shape[0])
+    except (AttributeError, IndexError, TypeError):
+        return frames
+    if count <= limit:
+        return frames
+    step = count / float(limit)
+    return frames[[min(count - 1, int(index * step)) for index in range(limit)]]
+
+
+def _stack_stills(stills: list) -> Any:
+    """Pack per-image tensors into the single batch an `image=` tokenizer wants.
+
+    Such a tokenizer derives one resize target from the batch shape, so images
+    that do not already match the first one are stretched to it. Tokenizers
+    that accept an `images=` list keep their original sizes instead.
+    """
+    first = stills[0][..., :3]
+    if len(stills) == 1:
+        return first
+    height, width = int(first.shape[1]), int(first.shape[2])
+    normalized = [first]
+    for image in stills[1:]:
+        image = image[..., :3]
+        if int(image.shape[1]) != height or int(image.shape[2]) != width:
+            image = h3._resize(image, width, height, "disabled")
+        normalized.append(image)
+    return torch.cat(normalized, dim=0)
+
+
+def _optimizer_clip_media(clip, items: list[_MediaInput]) -> tuple[dict[str, Any], int]:
+    """Map connected media onto the tokenizer arguments the encoder supports.
+
+    Returns the tokenizer kwargs plus how many media parts were actually
+    attached, so the system prompt's evidence rule can state the truth.
+    """
+    stills = [
+        item.value[:1]
+        for item in items
+        if item.media_type == "image" and isinstance(item.value, torch.Tensor) and item.value.ndim == 4
+    ]
+    videos = []
+    soundtracks = []
+    for item in items:
+        if item.media_type != "video":
+            continue
+        try:
+            frames, soundtrack, _fps = _video_parts(item.value)
+        except ValueError:
+            continue
+        videos.append(frames)
+        if soundtrack is not None:
+            soundtracks.append(soundtrack)
+
+    media: dict[str, Any] = {}
+    attached = 0
+    # The dedicated video channel replaces the image channel on the encoders
+    # that have one, so it is only used when no reference image would be lost.
+    if not stills and len(videos) == 1 and _tokenizer_accepts(clip, "video"):
+        media["video"] = _sample_frames(videos[0], OPTIMIZER_CLIP_MAX_VIDEO_FRAMES)[..., :3]
+        # The frames are already thinned, so keep every one of them.
+        media["fps"] = 1.0
+        attached += 1
+    else:
+        for frames in videos:
+            sampled = _sample_frames(frames, OPTIMIZER_CLIP_FRAMES_PER_VIDEO)
+            stills.extend(sampled[index:index + 1] for index in range(int(sampled.shape[0])))
+        if stills:
+            dropped = max(0, len(stills) - OPTIMIZER_CLIP_MAX_STILLS)
+            if dropped:
+                logging.warning(
+                    "MiniMax H3 Easy: sending %d of %d stills to the optimizer text encoder.",
+                    OPTIMIZER_CLIP_MAX_STILLS, len(stills),
+                )
+            stills = stills[:OPTIMIZER_CLIP_MAX_STILLS]
+            if _tokenizer_accepts(clip, "images"):
+                media["images"] = [image[..., :3] for image in stills]
+            elif _tokenizer_accepts(clip, "image"):
+                media["image"] = _stack_stills(stills)
+            else:
+                stills = []
+            attached += len(stills)
+
+    if _tokenizer_accepts(clip, "audio"):
+        clips = [item.value for item in items if item.media_type == "audio" and isinstance(item.value, Mapping) and "waveform" in item.value]
+        clips.extend(track for track in soundtracks if isinstance(track, Mapping) and "waveform" in track)
+        if clips:
+            # Every encoder with an audio channel takes a single clip.
+            media["audio"] = clips[0]
+            attached += 1
+    return media, attached
+
+
+def _optimizer_clip_tokens(clip, text: str, media: Mapping[str, Any] | None = None):
+    extra = dict(media or {})
+    try:
+        return clip.tokenize(text, skip_template=False, min_length=1, thinking=False, **extra)
+    except TypeError:
+        # Older ComfyUI builds expose a narrower tokenize signature.
+        try:
+            return clip.tokenize(text, **extra)
+        except TypeError:
+            if extra:
+                logging.warning("MiniMax H3 Easy: this text encoder rejected the attached media; optimizing from text only.")
+            return clip.tokenize(text)
+
+
+def _optimizer_clip_generate(
+    clip,
+    system_prompt: str,
+    user_prompt: str,
+    max_length: int,
+    media: Mapping[str, Any] | None = None,
+    context: str = "",
+) -> str:
+    """Rewrite a prompt with the text encoder connected to `optimizer_clip`.
+
+    This mirrors ComfyUI's built-in Generate Text node: tokenize, generate,
+    decode. Only encoders whose model implements text generation (Gemma and
+    similar LLM-backed encoders) support this; a plain CLIP raises instead of
+    silently returning nothing. Sampling is disabled so re-running a workflow
+    with an unchanged prompt returns the same text.
+    """
+    if clip is None:
+        raise ValueError("Connect a text encoder to the optimizer CLIP input")
+    if not hasattr(clip, "generate") or not hasattr(clip, "decode"):
+        raise ValueError(
+            "This ComfyUI build cannot generate text from a CLIP input. "
+            "Update ComfyUI, or select an HTTP API format in the prompt optimization settings."
+        )
+    sections = [system_prompt]
+    if context.strip():
+        sections.append(f"=== CONNECTED MEDIA ===\n{context.strip()}")
+    sections.append(f"=== USER PROMPT ===\n{user_prompt}")
+    tokens = _optimizer_clip_tokens(clip, "\n\n".join(sections), media)
+    length = min(PROMPT_OPTIMIZER_CLIP_LENGTH_LIMIT, max(PROMPT_OPTIMIZER_CLIP_MIN_LENGTH, int(max_length)))
+    try:
+        generated = clip.generate(
+            tokens,
+            do_sample=False,
+            max_length=length,
+            temperature=1.0,
+            top_k=50,
+            top_p=0.95,
+            min_p=0.0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+            seed=0,
+        )
+    except TypeError:
+        generated = clip.generate(tokens, max_length=length)
+    except (AttributeError, NotImplementedError) as exc:
+        raise ValueError(
+            "The connected text encoder cannot generate text. Use an LLM-backed encoder "
+            f"such as Gemma, or select an HTTP API format instead ({type(exc).__name__}: {exc})."
+        ) from exc
+    result = _strip_optimizer_output(clip.decode(generated))
+    if not result:
+        raise ValueError("The connected text encoder returned an empty prompt")
+    return result
+
+
+def _optimizer_media_label(item: _MediaInput, labels: Mapping[int, str] | None, ordinals: dict[str, int]) -> str:
+    """Name a reference the way the prompt itself names it.
+
+    Reference mode passes the resolved H3 tags, so a description can be tied to
+    the exact `<Picture N>` the prompt mentions. Image mode has no tags, so the
+    keyframe role is used instead, and anything unlabelled falls back to a
+    per-type ordinal.
+    """
+    label = str((labels or {}).get(item.input_index) or "").strip()
+    if label:
+        return label
+    ordinals[item.media_type] = ordinals.get(item.media_type, 0) + 1
+    return f"{item.media_type} {ordinals[item.media_type]}"
+
+
+def _optimizer_clip_descriptions(clip, items: list[_MediaInput], labels: Mapping[int, str] | None, max_length: int) -> tuple[str, int]:
+    """Describe every connected media on its own, then return one text block.
+
+    One pass per asset avoids each encoder's single-slot media limits: no
+    stretching unrelated images into a shared batch, no video channel that
+    shadows the reference images, and no audio clip lost because only one fits.
+    The final optimization then runs on text alone.
+    """
+    lines = []
+    ordinals: dict[str, int] = {}
+    length = min(int(max_length), OPTIMIZER_CLIP_DESCRIBE_LENGTH)
+    for item in items:
+        request = OPTIMIZER_CLIP_DESCRIBE_REQUESTS.get(item.media_type)
+        if request is None:
+            continue
+        label = _optimizer_media_label(item, labels, ordinals)
+        media, attached = _optimizer_clip_media(clip, [item])
+        if not attached:
+            # The encoder has no channel for this modality; saying nothing is
+            # better than letting the prompt writer imagine the content.
+            continue
+        try:
+            description = _optimizer_clip_generate(clip, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, request, length, media)
+        except ValueError as exc:
+            logging.warning("MiniMax H3 Easy: could not describe %s for the prompt optimizer (%s).", label, exc)
+            continue
+        lines.append(f"{label}: {description}")
+    return "\n".join(lines), len(lines)
+
+
+def _notify_prompt_optimized(node_id: Any, prompt: str) -> None:
+    """Mirror an execution-time optimization back into the node's editor.
+
+    Best effort only: a headless or API run has no listener, and the prompt
+    that was actually generated is already in the conditioning either way.
+    """
+    if node_id is None:
+        return
+    try:
+        from server import PromptServer
+
+        instance = getattr(PromptServer, "instance", None)
+        if instance is None:
+            return
+        instance.send_sync(PROMPT_OPTIMIZER_EVENT, {"node_id": str(node_id), "prompt": str(prompt)})
+    except Exception:
+        pass
 
 
 class MiniMaxH3PromptOptimizer:
@@ -760,7 +1059,15 @@ def _register_prompt_optimizer_route() -> bool:
             mode = str(payload.get("mode") or MODE_IMAGE)
             scene_guide = str(payload.get("scene_guide") or "none")
             seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(payload.get("seconds") or 5.0)))
-            if api_format not in {"openai", "gemini"}:
+            if api_format == OPTIMIZER_FORMAT_CLIP:
+                # The optimizer CLIP only exists while the graph runs, so this
+                # format cannot be served from an editor-time request.
+                return web.json_response({
+                    "ok": False,
+                    "error": "The text encoder format optimizes the prompt when the workflow runs.",
+                    "deferred": True,
+                }, status=400)
+            if api_format not in {OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI}:
                 return web.json_response({"ok": False, "error": "Unsupported API format"}, status=400)
             if not prompt.strip() or not api_key.strip() or not api_url.strip() or not model.strip():
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
@@ -1174,7 +1481,7 @@ def _empty_image_conditioning(bundle, prompt, width, height, length, first_frame
     return conditioning, latent
 
 
-def _reference_conditioning(bundle, prompt, width, height, length, ref_image_size, items: list[_MediaInput]):
+def _reference_conditioning(bundle, prompt, width, height, length, ref_image_size, items: list[_MediaInput], prompt_transform=None):
     latent, frame_count = h3._empty_av_latent(width, height, length)
     ref_items = []
     ref_blocks = []
@@ -1282,6 +1589,13 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
         len(videos),
         len(audios),
     )
+    if prompt_transform is not None:
+        # Optimize after resolution so the optimizer sees the official
+        # <Picture N> / <Video N> / <Audio N> tags rather than the internal
+        # placeholders, and its output goes straight to the tokenizer. The tag
+        # map goes with it so each media description names the same reference
+        # the prompt does.
+        resolved_prompt = prompt_transform(resolved_prompt, tag_by_input)
 
     tokens = bundle.clip.tokenize(resolved_prompt, minimax_ref_items=ref_items)
     conditioning = bundle.clip.encode_from_tokens_scheduled(tokens)
@@ -1298,7 +1612,16 @@ class MiniMaxH3Easy:
 
     @classmethod
     def INPUT_TYPES(cls):
-        optional = {"media": ("*",)}
+        optional: dict[str, Any] = {
+            "media": ("*",),
+            # Kept out of the H3 bundle on purpose: this is the LLM that
+            # rewrites the prompt, not one of the H3 generation models.
+            "optimizer_clip": ("CLIP",),
+            # Transport-only: the editor reports whether its Optimized tab is
+            # still empty. Defaults to True so an API/headless run with the
+            # text encoder format configured still optimizes.
+            "prompt_needs_optimization": ("BOOLEAN", {"default": True, "hidden": True}),
+        }
         for index in range(1, MAX_MEDIA + 1):
             # Transport-only inputs used by the virtual multi-wire frontend.
             # Keep them in INPUT_TYPES so ComfyUI execution can resolve the
@@ -1329,6 +1652,7 @@ class MiniMaxH3Easy:
                 ),
             },
             "optional": optional,
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     @classmethod
@@ -1351,6 +1675,17 @@ class MiniMaxH3Easy:
         return items
 
     @staticmethod
+    def _keyframe_labels(items, role) -> dict[int, str]:
+        """Name the keyframe images the way the H3 guides talk about them."""
+        images = [item for item in items if item.media_type == "image"]
+        if not images:
+            return {}
+        if len(images) == 1:
+            return {images[0].input_index: "the last frame" if role == KEYFRAME_LAST else "the first frame"}
+        first, last = (images[1], images[0]) if role == KEYFRAME_LAST else (images[0], images[1])
+        return {first.input_index: "the first frame", last.input_index: "the last frame"}
+
+    @staticmethod
     def _keyframes(items, role):
         images = [item.value for item in items if item.media_type == "image"]
         if any(item.media_type != "image" for item in items):
@@ -1367,6 +1702,56 @@ class MiniMaxH3Easy:
             return images[1], images[0]
         return images[0], images[1]
 
+    @staticmethod
+    def _clip_prompt_transform(mode: str, seconds: float, items: list[_MediaInput], kwargs: Mapping[str, Any]):
+        """Build the execution-time prompt optimizer, or None when it is off.
+
+        The optimizer CLIP only exists while the graph runs, so this format
+        cannot be served by the editor's optimize button. It rewrites the
+        prompt once, right before it is tokenized, and only while the editor's
+        Optimized tab is still empty - the same rule the HTTP formats follow.
+        """
+        settings = _read_prompt_optimizer_config()
+        if str(settings.get("api_format") or "") != OPTIMIZER_FORMAT_CLIP:
+            return None, None
+        clip = kwargs.get("optimizer_clip")
+        if clip is None:
+            # Generating without the encoder the user asked for would be worse
+            # than generating the prompt as typed, so only say what happened.
+            logging.warning(
+                "MiniMax H3 Easy: prompt optimization is set to the text encoder format, "
+                "but no encoder is connected to the optimizer_clip input. Using the prompt as typed."
+            )
+            return None, None
+        pending = kwargs.get("prompt_needs_optimization", True)
+        if isinstance(pending, str):
+            pending = pending.strip().lower() in {"1", "true", "yes", "on"}
+        if not bool(pending):
+            return None, None
+
+        counts = {"image": 0, "video": 0, "audio": 0}
+        for item in items:
+            if item.media_type in counts:
+                counts[item.media_type] += 1
+        scene_guide = str(kwargs.get("prompt_optimizer_scene_guide") or "none")
+        max_length = int(settings.get("clip_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)
+        read_media = bool(settings.get("read_media"))
+        result: list[str] = []
+
+        def transform(text: str, labels: Mapping[int, str] | None = None) -> str:
+            source = str(text or "")
+            if not source.strip():
+                return source
+            # Reference videos are decoded again here; that is the price of
+            # showing them to the encoder, so it only happens when asked.
+            described, count = _optimizer_clip_descriptions(clip, items, labels, max_length) if read_media else ("", 0)
+            system = _optimizer_system_prompt(scene_guide, mode, float(seconds), counts, 0, count)
+            optimized = _optimizer_clip_generate(clip, system, source, max_length, None, described)
+            result.append(optimized)
+            return optimized
+
+        return transform, result
+
     @classmethod
     def generate(cls, h3_bundle, mode, prompt, resolution, aspect_ratio, width, height, seconds, advanced, fps, keyframe_role, ref_image_size, reference_mention_mode, **kwargs):
         if not isinstance(h3_bundle, MiniMaxH3Bundle):
@@ -1377,6 +1762,7 @@ class MiniMaxH3Easy:
         seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(seconds)))
         length = _frame_length(seconds, fps)
         items = cls._collect_media(kwargs)
+        prompt_transform, optimized_prompt = cls._clip_prompt_transform(mode, seconds, items, kwargs)
         if mode == MODE_REFERENCE and items:
             if len(items) > MAX_MEDIA:
                 raise ValueError("Reference mode accepts at most fifteen media resources")
@@ -1390,11 +1776,15 @@ class MiniMaxH3Easy:
             if counts["image"] == 0 and counts["video"] == 0:
                 raise ValueError("Reference mode needs an image or video in addition to audio")
             model = h3_bundle.model_for("ref2va")
-            conditioning, latent = _reference_conditioning(h3_bundle, prompt, width, height, length, ref_image_size, items)
+            conditioning, latent = _reference_conditioning(h3_bundle, prompt, width, height, length, ref_image_size, items, prompt_transform)
         else:
             first_frame, last_frame = cls._keyframes(items, keyframe_role)
             model = h3_bundle.model_for("fl2va")
+            if prompt_transform is not None:
+                prompt = prompt_transform(prompt, cls._keyframe_labels(items, keyframe_role))
             conditioning, latent = _empty_image_conditioning(h3_bundle, prompt, width, height, length, first_frame, last_frame)
+        if optimized_prompt:
+            _notify_prompt_optimized(kwargs.get("unique_id"), optimized_prompt[0])
         context = MiniMaxH3Context(
             conditioning=conditioning,
             latent=latent,

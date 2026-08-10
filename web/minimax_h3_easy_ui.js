@@ -14,12 +14,21 @@ const PROMPT_TAB_SOURCE = "source";
 const PROMPT_TAB_OPTIMIZED = "optimized";
 const PROMPT_TABS_HEIGHT = 19;
 const PROMPT_OPTIMIZER_SETTINGS_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_settings";
+const PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized";
+const OPTIMIZER_FORMAT_OPENAI = "openai";
+const OPTIMIZER_FORMAT_GEMINI = "gemini";
+const OPTIMIZER_FORMAT_CLIP = "clip";
+const OPTIMIZER_FORMATS = [OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_CLIP];
+const CLIP_MAX_LENGTH_DEFAULT = 1024;
+const CLIP_MIN_LENGTH = 16;
+const CLIP_MAX_LENGTH_LIMIT = 32768;
 const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
-    api_format: "openai",
+    api_format: OPTIMIZER_FORMAT_OPENAI,
     api_url: "",
     api_key: "",
     model: "",
     read_media: false,
+    clip_max_length: CLIP_MAX_LENGTH_DEFAULT,
 });
 let promptOptimizerSettingsCache = { ...PROMPT_OPTIMIZER_SETTINGS_DEFAULTS };
 let promptOptimizerSettingsLoaded = false;
@@ -96,6 +105,17 @@ const TEXT = {
     apiUrl: ZH_BROWSER ? "API \u5730\u5740" : "API URL",
     apiKey: "API Key",
     apiModel: ZH_BROWSER ? "\u6a21\u578b\u540d" : "Model",
+    clipMaxLength: ZH_BROWSER ? "\u751f\u6210\u4e0a\u9650 (tokens)" : "Max generated tokens",
+    optimizerClip: ZH_BROWSER ? "\u4f18\u5316\u5668\u6587\u672c\u7f16\u7801\u5668" : "Optimizer text encoder",
+    optimizerClipHint: ZH_BROWSER
+        ? "\u4f7f\u7528\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u7684\u6587\u672c\u7f16\u7801\u5668\u3002\u8be5\u7f16\u7801\u5668\u53ea\u5728\u5de5\u4f5c\u6d41\u8fd0\u884c\u65f6\u5b58\u5728\uff0c\u56e0\u6b64\u63d0\u793a\u8bcd\u4f18\u5316\u4f1a\u5728\u961f\u5217\u6267\u884c\u65f6\u8fdb\u884c\uff0c\u800c\u4e0d\u662f\u70b9\u51fb\u65f6\u3002\u5f00\u542f\u4e0b\u65b9\u5f00\u5173\u540e\uff0c\u6bcf\u4e2a\u5df2\u8fde\u63a5\u7d20\u6750\u4f1a\u5148\u7531\u8be5\u7f16\u7801\u5668\u9010\u4e2a\u751f\u6210\u63cf\u8ff0\uff0c\u518d\u4f5c\u4e3a\u6587\u672c\u968f\u63d0\u793a\u8bcd\u4e00\u8d77\u4f7f\u7528\u3002"
+        : "Uses the text encoder connected to the optimizer_clip input. That encoder only exists while the workflow runs, so the prompt is optimized when the workflow is queued, not on click. With the switch below on, each connected asset is described by the encoder one at a time and those descriptions are passed along as text.",
+    optimizerDeferred: ZH_BROWSER
+        ? "\u5df2\u9009\u62e9\u6587\u672c\u7f16\u7801\u5668\u683c\u5f0f\uff1a\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u4f1a\u81ea\u52a8\u4f18\u5316\u63d0\u793a\u8bcd\uff0c\u5e76\u5199\u5165\u201c\u4f18\u5316\u540e\u201d\u6807\u7b7e\u9875\u3002"
+        : "Text encoder format selected: the prompt is optimized when the workflow runs, and the result lands in the Optimized tab.",
+    optimizerClipMissing: ZH_BROWSER
+        ? "\u8bf7\u5148\u5c06\u6587\u672c\u7f16\u7801\u5668\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u3002"
+        : "Connect a text encoder to the optimizer_clip input first.",
     promptGuide: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u65b9\u6848" : "Prompt Guide",
     readMedia: ZH_BROWSER ? "\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53" : "Read connected media",
     optimizerMissing: ZH_BROWSER ? "\u8bf7\u5148\u6253\u5f00 API \u8bbe\u7f6e\u5e76\u586b\u5199 API \u5730\u5740\u3001API Key \u548c\u6a21\u578b\u540d\u3002" : "Open API settings and enter the API URL, API key, and model first.",
@@ -167,6 +187,7 @@ const OPTION_DEFS = {
     prompt_optimizer_api_format: {
         openai: ZH_BROWSER ? "OpenAI \u517c\u5bb9" : "OpenAI Compatible",
         gemini: ZH_BROWSER ? "Gemini \u539f\u751f" : "Gemini Native",
+        clip: ZH_BROWSER ? "\u6587\u672c\u7f16\u7801\u5668\uff08clip \u8f93\u5165\uff09" : "Text encoder (clip input)",
     },
     prompt_optimizer_scene_guide: {
         none: ZH_BROWSER ? "\u4ec5\u901a\u7528\u65b9\u6848" : "General only",
@@ -406,6 +427,7 @@ function localizeNodeInstance(node) {
     for (const input of node.inputs || []) {
         if (input.name === "h3_bundle") setLocalizedSlotLabel(input, TEXT.bundle);
         if (input.name === "media") setLocalizedSlotLabel(input, TEXT.inputMedia);
+        if (input.name === "optimizer_clip") setLocalizedSlotLabel(input, TEXT.optimizerClip);
     }
     const outputLabels = { model: TEXT.outputModel, h3_context: TEXT.outputContext };
     for (const output of node.outputs || []) {
@@ -1514,6 +1536,10 @@ function patchGraphToPrompt() {
             promptNode.inputs.seconds = Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 5)) || 5));
             promptNode.inputs.advanced = asBoolean(getWidgetValue(node, "advanced", false));
             promptNode.inputs.prompt_optimizer_settings = false;
+            // Tells the execution-time (clip) optimizer whether the Optimized
+            // tab is still empty, so a stored result is reused instead of
+            // being regenerated on every queue.
+            promptNode.inputs.prompt_needs_optimization = effectivePromptTab(node) === PROMPT_TAB_SOURCE;
             promptNode.inputs.prompt_optimizer_scene_guide = canonicalPromptGuide(getWidgetValue(node, "prompt_optimizer_scene_guide", "none"));
             promptNode.inputs.fps = Number(getWidgetValue(node, "fps", 24));
             promptNode.inputs.keyframe_role = canonicalOption("keyframe_role", getWidgetValue(node, "keyframe_role", KEYFRAME_FIRST));
@@ -3463,14 +3489,32 @@ function togglePromptView(node) {
 
 function normalizePromptOptimizerSettings(value) {
     const source = value && typeof value === "object" ? value : {};
-    const apiFormat = String(source.api_format || "openai").toLowerCase() === "gemini" ? "gemini" : "openai";
+    const requested = String(source.api_format || OPTIMIZER_FORMAT_OPENAI).toLowerCase();
+    const apiFormat = OPTIMIZER_FORMATS.includes(requested) ? requested : OPTIMIZER_FORMAT_OPENAI;
+    const rawLength = Number(source.clip_max_length);
+    const clipMaxLength = Number.isFinite(rawLength)
+        ? Math.min(CLIP_MAX_LENGTH_LIMIT, Math.max(CLIP_MIN_LENGTH, Math.round(rawLength)))
+        : CLIP_MAX_LENGTH_DEFAULT;
     return {
         api_format: apiFormat,
         api_url: String(source.api_url || "").trim(),
         api_key: String(source.api_key || ""),
         model: String(source.model || "").trim(),
         read_media: asBoolean(source.read_media, false),
+        clip_max_length: clipMaxLength,
     };
+}
+
+function isClipOptimizerFormat(value) {
+    return String(value || "").toLowerCase() === OPTIMIZER_FORMAT_CLIP;
+}
+
+function optimizerClipInputSlot(node) {
+    return (node?.inputs || []).find((input) => String(input?.name || "") === "optimizer_clip") || null;
+}
+
+function optimizerClipIsConnected(node) {
+    return optimizerClipInputSlot(node)?.link != null;
 }
 
 function promptOptimizerNodes() {
@@ -3532,7 +3576,7 @@ function makePromptOptimizerSettingsRow(labelText, control) {
     return row;
 }
 
-function makePromptOptimizerSelect(initialValue) {
+function makePromptOptimizerSelect(initialValue, onChange = null) {
     const root = document.createElement("div");
     root.className = "h3-optimizer-settings-select-wrap";
     const trigger = document.createElement("button");
@@ -3574,6 +3618,7 @@ function makePromptOptimizerSelect(initialValue) {
         render();
         close();
         trigger.focus();
+        onChange?.(value);
     };
     options.forEach((item, index) => {
         const option = document.createElement("button");
@@ -3693,7 +3738,7 @@ async function openPromptOptimizerSettings(node) {
     const form = document.createElement("form");
     form.id = "h3-optimizer-settings-form";
     form.className = "h3-optimizer-settings-form";
-    const apiFormat = makePromptOptimizerSelect(promptOptimizerSettingsCache.api_format);
+    const apiFormat = makePromptOptimizerSelect(promptOptimizerSettingsCache.api_format, () => syncFormatRows());
     const apiUrl = document.createElement("input");
     apiUrl.className = "h3-optimizer-settings-control";
     apiUrl.type = "text";
@@ -3711,6 +3756,13 @@ async function openPromptOptimizerSettings(node) {
     model.type = "text";
     model.autocomplete = "off";
     model.value = promptOptimizerSettingsCache.model;
+    const clipMaxLength = document.createElement("input");
+    clipMaxLength.className = "h3-optimizer-settings-control";
+    clipMaxLength.type = "number";
+    clipMaxLength.min = String(CLIP_MIN_LENGTH);
+    clipMaxLength.max = String(CLIP_MAX_LENGTH_LIMIT);
+    clipMaxLength.step = "16";
+    clipMaxLength.value = String(promptOptimizerSettingsCache.clip_max_length);
     const readMediaLabel = document.createElement("div");
     readMediaLabel.className = "h3-optimizer-settings-check";
     const readMedia = makePromptOptimizerSwitch(promptOptimizerSettingsCache.read_media);
@@ -3718,13 +3770,31 @@ async function openPromptOptimizerSettings(node) {
     const readMediaText = document.createElement("span");
     readMediaText.textContent = TEXT.readMedia;
     readMediaLabel.append(readMediaText, readMedia);
+    const clipHint = document.createElement("p");
+    clipHint.className = "h3-optimizer-settings-hint";
+    clipHint.textContent = TEXT.optimizerClipHint;
+    const apiUrlRow = makePromptOptimizerSettingsRow(TEXT.apiUrl, apiUrl);
+    const apiKeyRow = makePromptOptimizerSettingsRow(TEXT.apiKey, apiKey);
+    const modelRow = makePromptOptimizerSettingsRow(TEXT.apiModel, model);
+    const clipMaxLengthRow = makePromptOptimizerSettingsRow(TEXT.clipMaxLength, clipMaxLength);
     form.append(
         makePromptOptimizerSettingsRow(TEXT.apiFormat, apiFormat),
-        makePromptOptimizerSettingsRow(TEXT.apiUrl, apiUrl),
-        makePromptOptimizerSettingsRow(TEXT.apiKey, apiKey),
-        makePromptOptimizerSettingsRow(TEXT.apiModel, model),
+        clipHint,
+        apiUrlRow,
+        apiKeyRow,
+        modelRow,
+        clipMaxLengthRow,
         readMediaLabel,
     );
+    // The HTTP credentials and the local generation limit never apply at the
+    // same time, so only the rows the selected format uses stay visible.
+    const syncFormatRows = () => {
+        const local = isClipOptimizerFormat(apiFormat.value);
+        for (const row of [apiUrlRow, apiKeyRow, modelRow]) row.hidden = local;
+        clipMaxLengthRow.hidden = !local;
+        clipHint.hidden = !local;
+    };
+    syncFormatRows();
 
     const error = document.createElement("div");
     error.className = "h3-optimizer-settings-error";
@@ -3770,6 +3840,7 @@ async function openPromptOptimizerSettings(node) {
                 api_key: apiKey.value,
                 model: model.value,
                 read_media: readMedia.checked,
+                clip_max_length: clipMaxLength.value,
             });
             notifyPromptOptimizer(TEXT.settingsSaved, "success");
             close();
@@ -3855,11 +3926,16 @@ function syncPromptOptimizerButton(node) {
     const button = node?.__h3PromptOptimizeButton;
     if (!button) return;
     const state = promptOptimizerState(node);
-    const configured = Boolean(state.api_url.trim() && state.model.trim() && state.api_key.trim());
+    const local = isClipOptimizerFormat(state.api_format);
+    // The local format needs no credentials; it is configured as soon as a
+    // text encoder is wired to the optimizer CLIP input.
+    const configured = local
+        ? optimizerClipIsConnected(node)
+        : Boolean(state.api_url.trim() && state.model.trim() && state.api_key.trim());
     const external = promptInputIsConnected(node);
     const pending = Boolean(node.__h3OptimizerPending);
     const locked = external || pending;
-    button.title = external ? TEXT.promptExternalConnected : TEXT.optimizePrompt;
+    button.title = external ? TEXT.promptExternalConnected : local ? TEXT.optimizerDeferred : TEXT.optimizePrompt;
     button.setAttribute("aria-label", button.title);
     button.classList.toggle("is-configured", configured);
     button.classList.toggle("is-loading", pending);
@@ -3950,6 +4026,15 @@ async function optimizePromptFromEditor(node) {
         return;
     }
     const state = promptOptimizerState(node);
+    if (isClipOptimizerFormat(state.api_format)) {
+        // The optimizer CLIP is only alive during execution, so this format
+        // cannot run from the editor. Say when it will run instead.
+        notifyPromptOptimizer(
+            optimizerClipIsConnected(node) ? TEXT.optimizerDeferred : TEXT.optimizerClipMissing,
+            optimizerClipIsConnected(node) ? "info" : "warn",
+        );
+        return;
+    }
     if (!state.api_url.trim() || !state.model.trim() || !state.api_key.trim()) {
         notifyPromptOptimizer(TEXT.optimizerMissing);
         return;
@@ -4898,7 +4983,10 @@ function updatePromptEditor(node) {
 }
 
 function isTransportInputName(name) {
-    return /^media_[0-9]+$/i.test(String(name || "")) || /^media_type_[0-9]+$/i.test(String(name || ""));
+    const value = String(name || "");
+    return /^media_[0-9]+$/i.test(value)
+        || /^media_type_[0-9]+$/i.test(value)
+        || value === "prompt_needs_optimization";
 }
 
 function removeInputSlot(node, index) {
@@ -5216,6 +5304,7 @@ function installNode(nodeType, nodeData) {
             syncPromptExternalConnectionState(this);
             globalThis.requestAnimationFrame?.(() => syncPromptExternalConnectionState(this));
         }
+        if (String(input?.name || "") === "optimizer_clip") syncPromptOptimizerButton(this);
         if (connected && !this.__h3VirtualWireClearing && /^media(?:_\d+)?$/i.test(String(input?.name || ""))) {
             scheduleNativeMediaConnectionConversion(this, inputIndex, linkInfo);
         }
@@ -5339,6 +5428,16 @@ function install() {
         }
     }, true);
     setTimeout(() => loadPromptOptimizerSettings().catch(() => {}), 0);
+    // The clip optimizer runs inside the graph, so the result comes back as a
+    // server event instead of a fetch response.
+    api.addEventListener?.(PROMPT_OPTIMIZER_EVENT, (event) => {
+        const detail = event?.detail || {};
+        const node = app.graph?.getNodeById?.(Number(detail.node_id));
+        const prompt = String(detail.prompt || "");
+        if (!node || !isTarget(node) || !prompt.trim()) return;
+        installPromptEditorSoon(node);
+        setPromptFromOptimizedText(node, prompt);
+    });
     const style = document.createElement("style");
     style.textContent = `
       .h3-prompt-editor-wrap {
@@ -5479,6 +5578,10 @@ function install() {
       .h3-optimizer-settings-form { display: grid; gap: 10px; padding: 14px 20px 12px; }
       .h3-optimizer-settings-row { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-height: 0; }
       .h3-optimizer-settings-label { color: var(--h3-settings-muted); font-size: 13px; font-weight: 500; }
+      .h3-optimizer-settings-hint { margin: -2px 0 2px; color: var(--h3-settings-muted); font-size: 12px; line-height: 1.5; }
+      .h3-optimizer-settings-hint[hidden] { display: none !important; }
+      .h3-optimizer-settings-row[hidden] { display: none !important; }
+      .h3-optimizer-settings-check[hidden] { display: none !important; }
       .h3-optimizer-settings-control {
         width: 100%; min-width: 0; box-sizing: border-box; height: 34px; padding: 7px 12px; border: 1px solid var(--h3-settings-border); border-radius: 8px;
         background: var(--h3-settings-bg-base); color: var(--h3-settings-text); outline: none; font: inherit; font-size: 14px; transition: border-color .2s, background .2s, box-shadow .2s;
