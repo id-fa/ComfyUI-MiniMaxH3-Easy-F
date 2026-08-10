@@ -7,21 +7,41 @@ upstream. Everything this fork adds or changes is documented here.
 
 ---
 
-## Source / Optimized prompt tabs
+## Prompt tabs
 
-The prompt editor is split into two tabs, so the prompt you wrote and the prompt
-the optimizer produced are stored separately and both stay reusable.
+The prompt editor holds **two stacked fields** — **Source** and **Optimized** —
+and a row of **tabs** above them. Each tab is its own pair of prompts, so several
+prompt ideas live in one node and are switched with a click.
+
+```
+[ Tab 1 ] [ ◀ Tab 2 ▶ × ] [ Tab 3 × ] [ + ]
+Source
+┌──────────────────────────────────────────┐
+│ original text                            │
+└──────────────────────────────────────────┘
+Optimized ●
+┌──────────────────────────────────────────┐
+│ optimized text                           │
+└──────────────────────────────────────────┘
+```
 
 - **Source** — the prompt you write. This is what prompt optimization reads.
-- **Optimized** — the optimizer result. It can be edited by hand like any other
-  prompt.
+- **Optimized** — the optimizer result, editable by hand like any other prompt.
 
-Both tabs belong to the node and are saved with the workflow.
+Every tab keeps both fields, and all of it is saved with the workflow.
 
-### Which tab is generated
+### Tabs
 
-Generation uses the **Optimized** tab whenever it contains text, and the
-**Source** tab while it is empty:
+- `+` adds a tab and opens it (up to 20).
+- Click a tab to switch to it; **double-click** its name to rename it.
+- `×` deletes a tab, asking first when it still holds text. The node always
+  keeps one tab, so deleting the last one empties it instead.
+- `◀` `▶` on the open tab move it left or right.
+
+### Which field is generated
+
+Generation uses the open tab's **Optimized** field whenever it contains text,
+and its **Source** field while that is empty:
 
 | Source | Optimized | Prompt sent to MiniMax H3 |
 | --- | --- | --- |
@@ -30,23 +50,24 @@ Generation uses the **Optimized** tab whenever it contains text, and the
 | empty | text | Optimized |
 | text | whitespace only | Source |
 
-A small dot on the tab marks the one that will be generated. Clearing the
-**Optimized** tab therefore returns generation to the **Source** tab, and a
-workflow that never ran the optimizer always generates its original text.
+A small dot next to the field name marks the one that will be generated.
+Clearing **Optimized** therefore returns generation to **Source**, and a tab
+that never ran the optimizer always generates its original text. Only the open
+tab is generated; the others are stored, not sent.
 
 ### Optimization behavior
 
 This replaces the **Re-optimization** section of the upstream README.
 
-`✦` always reads the **Source** tab, writes the result into the **Optimized**
-tab, and switches to it. Consequences:
+`✦` always reads the open tab's **Source** field and writes the result into its
+**Optimized** field. Consequences:
 
 - Clicking `✦` again regenerates from the original text instead of rewriting a
   previous result.
 - A hand-edited optimized prompt is never fed back in as the next optimizer
   input.
-- If the **Source** tab is empty, the currently open tab is optimized instead,
-  so a prompt typed straight into the **Optimized** tab is still usable.
+- If **Source** is empty, the **Optimized** text is optimized instead, so a
+  prompt typed straight into that field is still usable.
 
 Upstream instead inferred the source prompt by comparing the editor text with
 the previous optimizer result; that heuristic is removed.
@@ -54,28 +75,30 @@ the previous optimizer result; that heuristic is removed.
 ### Editor details
 
 - `@` media references, `#` dialogue blocks, and the `</>` raw prompt view work
-  in both tabs.
-- Undo/redo applies to the tab you are editing and restarts when you switch
-  tabs, because one history stack cannot span two documents.
-- An external `STRING` link on the `prompt` input still overrides both tabs. No
-  tab is marked as generated while that link is connected.
+  in both fields.
+- Undo/redo is per field and restarts when you switch tabs, because one history
+  stack cannot span two documents.
+- An external `STRING` link on the `prompt` input still overrides both fields.
+  No field is marked as generated while that link is connected.
 - Tabs are disabled while an optimization request is running.
-- Tab labels follow the existing localization: English, or Chinese in a Chinese
+- Labels follow the existing localization: English, or Chinese in a Chinese
   browser.
 
 ### Compatibility
 
-- Workflows saved before this change load their prompt into the **Source** tab.
-  The **Optimized** tab starts empty, so their generated prompt is unchanged.
+- Workflows saved before this change load their prompt into the first tab's
+  **Source** field, so their generated prompt is unchanged. Prompts stored by
+  the earlier two-tab version of this fork migrate into the first tab as well.
 - The node's `prompt` widget value is kept equal to the prompt that would
   actually be generated, so the workflow still executes correctly if the web
   extension is disabled.
-- Stored in the node properties, alongside the existing prompt document:
-  - `minimax_h3_prompt_reference_doc` — Source tab (the upstream property).
-  - `minimax_h3_prompt_optimized_doc` — Optimized tab.
-  - `minimax_h3_prompt_active_tab` — the tab currently shown.
-- The prompt editor reserves about 19 px for the tab strip, so an existing node
-  shows slightly less prompt text at the same node height.
+- Stored in the node properties:
+  - `minimax_h3_prompt_tabs` — the tabs, each with a label and both documents.
+  - `minimax_h3_prompt_tab_index` — the open tab.
+  - The upstream `minimax_h3_prompt_reference_doc` property is read once for
+    migration and then removed.
+- The editor needs noticeably more height than upstream's single box (a tab row
+  plus two labelled fields), so existing nodes grow to that minimum on load.
 
 ### Scope
 
@@ -149,12 +172,12 @@ time. Clicking `✦` in this mode reports when optimization will happen instead 
 sending a request.
 
 Optimization runs **while the workflow executes**, and follows the same rule as
-the tabs:
+the prompt fields:
 
-- It runs only while the **Optimized** tab is empty.
-- The result is used for that run and pushed back into the **Optimized** tab, so
-  the next queue reuses the stored text instead of regenerating it.
-- To optimize again, clear the **Optimized** tab and queue the workflow.
+- It runs only while the open tab's **Optimized** field is empty.
+- The result is used for that run and written back into that field, so the next
+  queue reuses the stored text instead of regenerating it.
+- To optimize again, clear the **Optimized** field and queue the workflow.
 
 In **Reference Video** mode the optimization happens after `@` references are
 resolved, so the encoder sees the official `<Picture N>` / `<Video N>` /
@@ -187,9 +210,9 @@ are stored in the same shared `prompt_optimizer.json`.
   and decodes reference videos a second time (once for the encoder, once for
   H3's own conditioning). Leave it off if the workflow has many references and
   the prompt does not need them.
-- A run started through the API without the web extension has no Optimized-tab
-  state, so it optimizes on every run (the hidden
-  `prompt_needs_optimization` input defaults to `true`).
+- A run started through the API without the web extension has no prompt-field
+  state, so it optimizes on every run (the hidden `prompt_needs_optimization`
+  input defaults to `true`).
 - Requires a ComfyUI build whose `CLIP` object exposes `generate` / `decode`
   (the same requirement as the built-in **Generate Text** node).
 

@@ -8,11 +8,17 @@ const OUTPUT_CLASS = "MiniMaxH3EasyOutput";
 const LINKS_PROP = "minimax_h3_virtual_media_links";
 const PROMPT_DOC_PROP = "minimax_h3_prompt_reference_doc";
 const PROMPT_OPTIMIZED_DOC_PROP = "minimax_h3_prompt_optimized_doc";
-const PROMPT_TAB_PROP = "minimax_h3_prompt_active_tab";
+const PROMPT_TABS_PROP = "minimax_h3_prompt_tabs";
+const PROMPT_TAB_INDEX_PROP = "minimax_h3_prompt_tab_index";
 const PROMPT_VIEW_PROP = "minimax_h3_prompt_view_mode";
-const PROMPT_TAB_SOURCE = "source";
-const PROMPT_TAB_OPTIMIZED = "optimized";
-const PROMPT_TABS_HEIGHT = 19;
+const PROMPT_FIELD_SOURCE = "source";
+const PROMPT_FIELD_OPTIMIZED = "optimized";
+const PROMPT_FIELDS = [PROMPT_FIELD_SOURCE, PROMPT_FIELD_OPTIMIZED];
+const PROMPT_TABS_HEIGHT = 21;
+const PROMPT_FIELD_LABEL_HEIGHT = 14;
+const PROMPT_FIELD_MIN_HEIGHT = 44;
+const PROMPT_TAB_LABEL_LIMIT = 24;
+const PROMPT_TAB_LIMIT = 20;
 const PROMPT_OPTIMIZER_SETTINGS_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_settings";
 const PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized";
 const OPTIMIZER_FORMAT_OPENAI = "openai";
@@ -78,15 +84,22 @@ const TEXT = {
     deleteLink: ZH_BROWSER ? "\u5220\u9664" : "Delete",
     promptPlaceholder: "Prompt...",
     rawPromptPlaceholder: ZH_BROWSER ? "\u539f\u59cb\u63d0\u793a\u8bcd..." : "Raw prompt...",
-    promptTabSource: ZH_BROWSER ? "\u539f\u6587" : "Source",
-    promptTabOptimized: ZH_BROWSER ? "\u4f18\u5316\u540e" : "Optimized",
-    promptTabSourceHint: ZH_BROWSER
+    promptTabPrefix: ZH_BROWSER ? "\u6807\u7b7e" : "Tab",
+    promptTabAdd: ZH_BROWSER ? "\u65b0\u5efa\u6807\u7b7e" : "New tab",
+    promptTabRemove: ZH_BROWSER ? "\u5220\u9664\u6807\u7b7e" : "Delete tab",
+    promptTabRemoveConfirm: ZH_BROWSER ? "\u786e\u5b9a\u5220\u9664\u8be5\u6807\u7b7e\u7684\u63d0\u793a\u8bcd\uff1f" : "Delete this tab and its prompts?",
+    promptTabMoveLeft: ZH_BROWSER ? "\u5de6\u79fb" : "Move left",
+    promptTabMoveRight: ZH_BROWSER ? "\u53f3\u79fb" : "Move right",
+    promptTabRenameHint: ZH_BROWSER ? "\u53cc\u51fb\u91cd\u547d\u540d" : "Double-click to rename",
+    promptFieldSource: ZH_BROWSER ? "\u539f\u6587" : "Source",
+    promptFieldOptimized: ZH_BROWSER ? "\u4f18\u5316\u540e" : "Optimized",
+    promptFieldSourceHint: ZH_BROWSER
         ? "\u539f\u6587\uff1a\u63d0\u793a\u8bcd\u4f18\u5316\u7684\u8f93\u5165\uff0c\u59cb\u7ec8\u4fdd\u7559"
         : "Source prompt: the optimizer input, always kept",
-    promptTabOptimizedHint: ZH_BROWSER
+    promptFieldOptimizedHint: ZH_BROWSER
         ? "\u4f18\u5316\u540e\u7684\u63d0\u793a\u8bcd\uff1a\u4e3a\u7a7a\u65f6\u4f7f\u7528\u539f\u6587"
         : "Optimized prompt: the source is used while this is empty",
-    promptTabEffective: ZH_BROWSER ? "\u5f53\u524d\u7528\u4e8e\u751f\u6210" : "Used for generation",
+    promptFieldEffective: ZH_BROWSER ? "\u5f53\u524d\u7528\u4e8e\u751f\u6210" : "Used for generation",
     optimizedPromptPlaceholder: ZH_BROWSER
         ? "\u4f18\u5316\u540e\u7684\u63d0\u793a\u8bcd...\uff08\u7559\u7a7a\u5219\u4f7f\u7528\u539f\u6587\uff09"
         : "Optimized prompt... (empty uses the source)",
@@ -111,8 +124,8 @@ const TEXT = {
         ? "\u4f7f\u7528\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u7684\u6587\u672c\u7f16\u7801\u5668\u3002\u8be5\u7f16\u7801\u5668\u53ea\u5728\u5de5\u4f5c\u6d41\u8fd0\u884c\u65f6\u5b58\u5728\uff0c\u56e0\u6b64\u63d0\u793a\u8bcd\u4f18\u5316\u4f1a\u5728\u961f\u5217\u6267\u884c\u65f6\u8fdb\u884c\uff0c\u800c\u4e0d\u662f\u70b9\u51fb\u65f6\u3002\u5f00\u542f\u4e0b\u65b9\u5f00\u5173\u540e\uff0c\u6bcf\u4e2a\u5df2\u8fde\u63a5\u7d20\u6750\u4f1a\u5148\u7531\u8be5\u7f16\u7801\u5668\u9010\u4e2a\u751f\u6210\u63cf\u8ff0\uff0c\u518d\u4f5c\u4e3a\u6587\u672c\u968f\u63d0\u793a\u8bcd\u4e00\u8d77\u4f7f\u7528\u3002"
         : "Uses the text encoder connected to the optimizer_clip input. That encoder only exists while the workflow runs, so the prompt is optimized when the workflow is queued, not on click. With the switch below on, each connected asset is described by the encoder one at a time and those descriptions are passed along as text.",
     optimizerDeferred: ZH_BROWSER
-        ? "\u5df2\u9009\u62e9\u6587\u672c\u7f16\u7801\u5668\u683c\u5f0f\uff1a\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u4f1a\u81ea\u52a8\u4f18\u5316\u63d0\u793a\u8bcd\uff0c\u5e76\u5199\u5165\u201c\u4f18\u5316\u540e\u201d\u6807\u7b7e\u9875\u3002"
-        : "Text encoder format selected: the prompt is optimized when the workflow runs, and the result lands in the Optimized tab.",
+        ? "\u5df2\u9009\u62e9\u6587\u672c\u7f16\u7801\u5668\u683c\u5f0f\uff1a\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u4f1a\u81ea\u52a8\u4f18\u5316\u63d0\u793a\u8bcd\uff0c\u5e76\u5199\u5165\u5f53\u524d\u6807\u7b7e\u9875\u7684\u201c\u4f18\u5316\u540e\u201d\u3002"
+        : "Text encoder format selected: the prompt is optimized when the workflow runs, and the result lands in the open tab's Optimized field.",
     optimizerClipMissing: ZH_BROWSER
         ? "\u8bf7\u5148\u5c06\u6587\u672c\u7f16\u7801\u5668\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u3002"
         : "Connect a text encoder to the optimizer_clip input first.",
@@ -1539,7 +1552,7 @@ function patchGraphToPrompt() {
             // Tells the execution-time (clip) optimizer whether the Optimized
             // tab is still empty, so a stored result is reused instead of
             // being regenerated on every queue.
-            promptNode.inputs.prompt_needs_optimization = effectivePromptTab(node) === PROMPT_TAB_SOURCE;
+            promptNode.inputs.prompt_needs_optimization = effectivePromptField(node) === PROMPT_FIELD_SOURCE;
             promptNode.inputs.prompt_optimizer_scene_guide = canonicalPromptGuide(getWidgetValue(node, "prompt_optimizer_scene_guide", "none"));
             promptNode.inputs.fps = Number(getWidgetValue(node, "fps", 24));
             promptNode.inputs.keyframe_role = canonicalOption("keyframe_role", getWidgetValue(node, "keyframe_role", KEYFRAME_FIRST));
@@ -1724,7 +1737,7 @@ function refreshMentionPreviews() {
         }
         const options = mentionOptions(node);
         const currentMode = referenceMentionMode(node);
-        for (const chip of node.__h3Editor?.querySelectorAll?.(".h3-mention-chip") || []) {
+        for (const chip of promptEditors(node).flatMap((editor) => [...editor.querySelectorAll(".h3-mention-chip")])) {
             const sourceId = chip.dataset.sourceId ? Number(chip.dataset.sourceId) : null;
             const ordinal = Number(chip.dataset.ordinal) || null;
             const option = findMentionOption(options, {
@@ -2130,32 +2143,8 @@ function setPromptViewMode(node, mode) {
     node.properties[PROMPT_VIEW_PROP] = mode === PROMPT_VIEW_RAW ? PROMPT_VIEW_RAW : PROMPT_VIEW_STRUCTURED;
 }
 
-function normalizePromptTab(value) {
-    return String(value || "").toLowerCase() === PROMPT_TAB_OPTIMIZED ? PROMPT_TAB_OPTIMIZED : PROMPT_TAB_SOURCE;
-}
-
-function promptTabDocProp(tab) {
-    return normalizePromptTab(tab) === PROMPT_TAB_OPTIMIZED ? PROMPT_OPTIMIZED_DOC_PROP : PROMPT_DOC_PROP;
-}
-
-function activePromptTab(node) {
-    return normalizePromptTab(node?.properties?.[PROMPT_TAB_PROP]);
-}
-
-function setActivePromptTab(node, tab) {
-    if (!node) return;
-    node.properties ||= {};
-    node.properties[PROMPT_TAB_PROP] = normalizePromptTab(tab);
-}
-
-function promptDocForTab(node, tab) {
-    return node?.properties?.[promptTabDocProp(tab)] || null;
-}
-
-function setPromptDocForTab(node, tab, doc) {
-    if (!node) return;
-    node.properties ||= {};
-    node.properties[promptTabDocProp(tab)] = doc;
+function normalizePromptField(value) {
+    return String(value || "").toLowerCase() === PROMPT_FIELD_OPTIMIZED ? PROMPT_FIELD_OPTIMIZED : PROMPT_FIELD_SOURCE;
 }
 
 function promptDocText(doc) {
@@ -2167,30 +2156,95 @@ function promptDocIsEmpty(doc) {
     return !promptDocText(doc).trim();
 }
 
+function emptyPromptDoc() {
+    return { version: 1, text: "", parts: [] };
+}
+
+function defaultPromptTabLabel(index) {
+    return `${TEXT.promptTabPrefix} ${Math.max(1, Number(index) + 1)}`;
+}
+
+function normalizePromptTabEntry(entry, index) {
+    const source = entry && typeof entry === "object" ? entry : {};
+    const label = String(source.label || "").trim().slice(0, PROMPT_TAB_LABEL_LIMIT);
+    return {
+        label: label || defaultPromptTabLabel(index),
+        [PROMPT_FIELD_SOURCE]: clonePromptDoc(source[PROMPT_FIELD_SOURCE]),
+        [PROMPT_FIELD_OPTIMIZED]: clonePromptDoc(source[PROMPT_FIELD_OPTIMIZED]),
+    };
+}
+
 /**
- * The tab whose text is actually sent to MiniMax H3. The optimized tab only
- * takes over once it holds text, so a workflow that never ran the optimizer
- * keeps generating from the source prompt.
+ * The node's tab sets, migrating older shapes on first touch.
+ *
+ * Upstream stored one prompt document; the first version of this fork stored a
+ * source and an optimized document. Both become the first tab, so no saved
+ * prompt is lost when a workflow is opened with a newer build.
  */
-function effectivePromptTab(node) {
-    return promptDocIsEmpty(promptDocForTab(node, PROMPT_TAB_OPTIMIZED)) ? PROMPT_TAB_SOURCE : PROMPT_TAB_OPTIMIZED;
+function promptTabs(node) {
+    if (!node) return [];
+    node.properties ||= {};
+    let tabs = node.properties[PROMPT_TABS_PROP];
+    if (!Array.isArray(tabs) || !tabs.length) {
+        const legacySource = node.properties[PROMPT_DOC_PROP];
+        const legacyOptimized = node.properties[PROMPT_OPTIMIZED_DOC_PROP];
+        const first = normalizePromptTabEntry({ source: legacySource, optimized: legacyOptimized }, 0);
+        if (!legacySource) {
+            const text = String(getWidget(node, "prompt")?.value || "");
+            if (text) first[PROMPT_FIELD_SOURCE] = { version: 1, text, parts: promptPartsFromText(node, text) };
+        }
+        tabs = [first];
+        node.properties[PROMPT_TABS_PROP] = tabs;
+        delete node.properties[PROMPT_DOC_PROP];
+        delete node.properties[PROMPT_OPTIMIZED_DOC_PROP];
+        return tabs;
+    }
+    return tabs;
+}
+
+function activePromptTabIndex(node) {
+    const tabs = promptTabs(node);
+    const index = Number(node?.properties?.[PROMPT_TAB_INDEX_PROP]);
+    if (!Number.isFinite(index)) return 0;
+    return Math.min(tabs.length - 1, Math.max(0, Math.floor(index)));
+}
+
+function setActivePromptTabIndex(node, index) {
+    if (!node) return;
+    const tabs = promptTabs(node);
+    node.properties ||= {};
+    node.properties[PROMPT_TAB_INDEX_PROP] = Math.min(tabs.length - 1, Math.max(0, Math.floor(Number(index) || 0)));
+}
+
+function activePromptTab(node) {
+    const tabs = promptTabs(node);
+    return tabs[activePromptTabIndex(node)] || null;
+}
+
+function promptDocForField(node, field) {
+    return activePromptTab(node)?.[normalizePromptField(field)] || null;
+}
+
+function setPromptDocForField(node, field, doc) {
+    const tab = activePromptTab(node);
+    if (!tab) return;
+    tab[normalizePromptField(field)] = doc;
+}
+
+/**
+ * The field of the active tab that is actually sent to MiniMax H3. The
+ * optimized text only takes over once it holds something, so a tab that never
+ * ran the optimizer keeps generating from its source prompt.
+ */
+function effectivePromptField(node) {
+    return promptDocIsEmpty(promptDocForField(node, PROMPT_FIELD_OPTIMIZED)) ? PROMPT_FIELD_SOURCE : PROMPT_FIELD_OPTIMIZED;
 }
 
 function effectivePromptDoc(node) {
-    return promptDocForTab(node, effectivePromptTab(node));
-}
-
-function activePromptDoc(node) {
-    return promptDocForTab(node, activePromptTab(node));
+    return promptDocForField(node, effectivePromptField(node));
 }
 
 function effectivePromptText(node) {
-    // Workflows saved before the tabs existed carry the prompt in the widget
-    // value alone. Once either tab holds a document the documents decide, so a
-    // cleared tab can never fall back to a stale widget value.
-    if (!promptDocForTab(node, PROMPT_TAB_SOURCE) && !promptDocForTab(node, PROMPT_TAB_OPTIMIZED)) {
-        return String(getWidget(node, "prompt")?.value || "");
-    }
     return promptDocText(effectivePromptDoc(node));
 }
 
@@ -2202,10 +2256,23 @@ function syncPromptWidgetFromDocs(node) {
     if (widget._state) widget._state.value = text;
 }
 
-function promptEditorPlaceholder(node) {
+function promptEditorPlaceholder(node, field) {
+    if (normalizePromptField(field) === PROMPT_FIELD_OPTIMIZED) return TEXT.optimizedPromptPlaceholder;
     if (isRawPromptMode(node)) return TEXT.rawPromptPlaceholder;
-    if (activePromptTab(node) === PROMPT_TAB_OPTIMIZED) return TEXT.optimizedPromptPlaceholder;
     return isReferenceMode(node) ? TEXT.referencePromptPlaceholder : TEXT.promptPlaceholder;
+}
+
+function promptEditors(node) {
+    const editors = node?.__h3Editors;
+    return editors ? PROMPT_FIELDS.map((field) => editors[field]).filter(Boolean) : [];
+}
+
+function promptEditorFor(node, field) {
+    return node?.__h3Editors?.[normalizePromptField(field)] || null;
+}
+
+function editorPromptField(editor) {
+    return normalizePromptField(editor?.__h3PromptField);
 }
 
 function promptMentionTag(type, ordinal) {
@@ -2326,8 +2393,8 @@ function appendRawPromptText(container, value) {
 function serializeEditorDoc(editor) {
     const node = editorPromptNode(editor);
     if (isRawPromptMode(node)) {
-        const current = activePromptDoc(node);
-        if (!node?.__h3RawPromptNeedsSync && current) return clonePromptDoc(current);
+        const current = promptDocForField(node, editorPromptField(editor));
+        if (!editor?.__h3RawNeedsSync && current) return clonePromptDoc(current);
         return serializeRawPromptDoc(node, editor);
     }
     const parts = [];
@@ -2387,27 +2454,25 @@ function appendTextWithBreaks(container, value) {
     });
 }
 
-function renderEditorFromNode(node, force = false) {
-    const editor = node?.__h3Editor;
-    const widget = getWidget(node, "prompt");
-    if (!editor || !widget || (document.activeElement === editor && !force)) return;
-    const tab = activePromptTab(node);
-    const doc = promptDocForTab(node, tab);
-    // Only the source tab may fall back to the widget value: it carries the
-    // prompt of workflows saved before the tabs existed. The optimized tab
-    // stays empty until the optimizer or the user fills it.
-    const legacyText = tab === PROMPT_TAB_SOURCE ? String(widget.value || "") : "";
+function renderEditorFromNode(node, force = false, field = null) {
+    if (field === null) {
+        for (const name of PROMPT_FIELDS) renderEditorFromNode(node, force, name);
+        return;
+    }
+    const editor = promptEditorFor(node, field);
+    if (!editor || (document.activeElement === editor && !force)) return;
+    const doc = promptDocForField(node, field);
     editor.textContent = "";
     const raw = isRawPromptMode(node);
     editor.classList.toggle("is-raw", raw);
     node.__h3EditorWrap?.classList?.toggle("is-raw", raw);
     if (raw) {
         closeMentionMenu(node);
-        appendRawPromptText(editor, Array.isArray(doc?.parts) ? promptDocTextFromParts(doc.parts) : String(doc?.text ?? legacyText));
+        appendRawPromptText(editor, promptDocText(doc));
         return;
     }
     if (!Array.isArray(doc?.parts)) {
-        appendPromptTextWithDialogueBlocks(editor, legacyText);
+        appendPromptTextWithDialogueBlocks(editor, String(doc?.text || ""));
         return;
     }
     const live = mentionOptions(node);
@@ -2447,19 +2512,20 @@ function renderEditorFromNode(node, force = false) {
 }
 
 function syncPromptFromEditor(node, markDirty = true) {
-    const editor = node?.__h3Editor;
     const widget = getWidget(node, "prompt");
-    if (!editor || !widget || node.__h3EditorSyncing) return;
+    const editors = promptEditors(node);
+    if (!editors.length || !widget || node.__h3EditorSyncing) return;
     node.__h3EditorSyncing = true;
     try {
-        const doc = serializeEditorDoc(editor);
         node.properties ||= {};
-        setPromptDocForTab(node, activePromptTab(node), doc);
+        for (const editor of editors) {
+            setPromptDocForField(node, editorPromptField(editor), serializeEditorDoc(editor));
+            if (isRawPromptMode(node)) editor.__h3RawNeedsSync = false;
+        }
         // The widget value stays the prompt that will actually be generated,
         // so a disabled frontend or a legacy reader still sees the right text.
         syncPromptWidgetFromDocs(node);
-        syncPromptTabs(node);
-        if (isRawPromptMode(node)) node.__h3RawPromptNeedsSync = false;
+        syncPromptTabStrip(node);
         if (markDirty) {
             node.setDirtyCanvas?.(true, true);
             app.graph?.setDirtyCanvas?.(true, true);
@@ -2504,28 +2570,30 @@ function isPromptUndoRedoEvent(event) {
     return key === "z" || key === "y" || code === "KeyZ" || code === "KeyY";
 }
 
-function ensurePromptHistory(node) {
-    const editor = node?.__h3Editor;
+// Undo state lives on the editor element, so every prompt field keeps its own
+// stack without the callers having to name a field.
+function ensurePromptHistory(node, editor = node?.__h3Editor) {
     if (!editor) return null;
-    if (node.__h3PromptHistory) return node.__h3PromptHistory;
+    if (editor.__h3History) return editor.__h3History;
     const doc = clonePromptDoc(serializeEditorDoc(editor));
-    node.__h3PromptHistory = {
+    editor.__h3History = {
         undo: [{ doc }],
         redo: [],
         lastKey: promptDocKey(doc),
         applying: false,
     };
-    return node.__h3PromptHistory;
+    return editor.__h3History;
 }
 
 function resetPromptHistory(node) {
-    node.__h3PromptHistory = null;
-    ensurePromptHistory(node);
+    for (const editor of promptEditors(node)) {
+        editor.__h3History = null;
+        ensurePromptHistory(node, editor);
+    }
 }
 
-function pushPromptHistory(node) {
-    const history = ensurePromptHistory(node);
-    const editor = node?.__h3Editor;
+function pushPromptHistory(node, editor = node?.__h3Editor) {
+    const history = ensurePromptHistory(node, editor);
     if (!history || !editor || history.applying) return;
     const doc = clonePromptDoc(serializeEditorDoc(editor));
     const key = promptDocKey(doc);
@@ -2547,18 +2615,18 @@ function setEditorCaretAtEnd(editor) {
     selection.addRange(range);
 }
 
-function applyPromptHistoryEntry(node, entry) {
-    const history = node?.__h3PromptHistory;
-    const editor = node?.__h3Editor;
+function applyPromptHistoryEntry(node, entry, editor = node?.__h3Editor) {
+    const history = editor?.__h3History;
     const widget = getWidget(node, "prompt");
     if (!history || !editor || !entry?.doc || !widget) return false;
+    const field = editorPromptField(editor);
     history.applying = true;
     try {
         const doc = clonePromptDoc(entry.doc);
         node.properties ||= {};
-        setPromptDocForTab(node, activePromptTab(node), doc);
+        setPromptDocForField(node, field, doc);
         syncPromptWidgetFromDocs(node);
-        renderEditorFromNode(node, true);
+        renderEditorFromNode(node, true, field);
         syncPromptFromEditor(node, false);
         history.lastKey = promptDocKey(doc);
     } finally {
@@ -2575,7 +2643,8 @@ function handlePromptHistoryKeydown(node, event) {
     event.preventDefault?.();
     event.stopPropagation?.();
     event.stopImmediatePropagation?.();
-    const history = ensurePromptHistory(node);
+    const editor = node?.__h3Editor;
+    const history = ensurePromptHistory(node, editor);
     if (!history) return true;
     const key = String(event.key || "").toLowerCase();
     const isRedo = key === "y" || String(event.code || "") === "KeyY" || (key === "z" && event.shiftKey);
@@ -2921,7 +2990,9 @@ function positionMentionMenu(element, editor) {
 function chooseMention(node, option) {
     const state = node?.__h3MentionMenu;
     const range = state?.mention?.range;
-    const editor = node?.__h3Editor;
+    // The chip belongs to the field the picker was opened from, not to
+    // whatever happens to hold focus when the menu item is clicked.
+    const editor = state?.editor || node?.__h3Editor;
     if (!range || !editor) return;
     range.deleteContents();
     const before = document.createTextNode("\u200B");
@@ -3002,6 +3073,7 @@ function openMentionMenu(node, editor) {
     const existing = node.__h3MentionMenu;
     if (existing) {
         existing.mention = mention;
+        existing.editor = editor;
         existing.options = options;
         existing.activeIndex = Math.min(existing.activeIndex, Math.max(0, options.length - 1));
         renderMentionMenu(node);
@@ -3376,18 +3448,27 @@ function repairNodeLayout(node) {
     else setTimeout(run, 0);
 }
 
-function makePromptTabButton(node, tab, label) {
+function makePromptTabStrip(node) {
+    const strip = document.createElement("div");
+    strip.className = "h3-prompt-tabs";
+    strip.setAttribute("role", "tablist");
+    strip.addEventListener("pointerdown", (event) => event.stopPropagation());
+    strip.addEventListener("wheel", (event) => {
+        // A tab row that overflows scrolls sideways instead of zooming the canvas.
+        if (strip.scrollWidth <= strip.clientWidth) return;
+        strip.scrollLeft += event.deltaY || event.deltaX;
+        event.preventDefault();
+        event.stopPropagation();
+    }, { passive: false });
+    return strip;
+}
+
+function makePromptTabAction(className, label, onClick) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "h3-prompt-tab";
-    button.dataset.tab = tab;
-    button.setAttribute("role", "tab");
-    const text = document.createElement("span");
-    text.className = "h3-prompt-tab-label";
-    text.textContent = label;
-    const dot = document.createElement("span");
-    dot.className = "h3-prompt-tab-dot";
-    button.append(text, dot);
+    button.className = className;
+    button.title = label;
+    button.setAttribute("aria-label", label);
     button.addEventListener("pointerdown", (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -3395,64 +3476,162 @@ function makePromptTabButton(node, tab, label) {
     button.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        switchPromptTab(node, tab);
+        onClick();
     });
     return button;
 }
 
-function makePromptTabBar(node) {
-    const tabs = document.createElement("div");
-    tabs.className = "h3-prompt-tabs";
-    tabs.setAttribute("role", "tablist");
-    tabs.append(
-        makePromptTabButton(node, PROMPT_TAB_SOURCE, TEXT.promptTabSource),
-        makePromptTabButton(node, PROMPT_TAB_OPTIMIZED, TEXT.promptTabOptimized),
-    );
-    return tabs;
+function beginPromptTabRename(node, index, labelElement) {
+    const tabs = promptTabs(node);
+    const tab = tabs[index];
+    if (!tab || labelElement.querySelector("input")) return;
+    const input = document.createElement("input");
+    input.className = "h3-prompt-tab-rename";
+    input.value = tab.label;
+    input.maxLength = PROMPT_TAB_LABEL_LIMIT;
+    input.spellcheck = false;
+    const commit = (save) => {
+        input.remove();
+        if (save) {
+            const next = input.value.trim().slice(0, PROMPT_TAB_LABEL_LIMIT);
+            tab.label = next || defaultPromptTabLabel(index);
+            app.graph?.change?.();
+        }
+        syncPromptTabStrip(node);
+    };
+    input.addEventListener("pointerdown", (event) => event.stopPropagation());
+    input.addEventListener("keydown", (event) => {
+        event.stopPropagation();
+        if (event.key === "Enter") commit(true);
+        else if (event.key === "Escape") commit(false);
+    });
+    input.addEventListener("blur", () => commit(true));
+    labelElement.append(input);
+    input.focus();
+    input.select();
 }
 
-function syncPromptTabs(node) {
-    const tabs = node?.__h3PromptTabs;
-    if (!tabs) return;
-    const active = activePromptTab(node);
-    // An external text link replaces both tabs, so no tab is marked as the
-    // one that will be generated while that link is connected.
-    const effective = promptInputIsConnected(node) ? "" : effectivePromptTab(node);
-    for (const button of tabs.querySelectorAll(".h3-prompt-tab")) {
-        const tab = normalizePromptTab(button.dataset.tab);
-        const isActive = tab === active;
-        const isEffective = tab === effective;
-        const hint = tab === PROMPT_TAB_OPTIMIZED ? TEXT.promptTabOptimizedHint : TEXT.promptTabSourceHint;
-        button.classList.toggle("is-active", isActive);
-        button.classList.toggle("is-effective", isEffective);
-        button.setAttribute("aria-selected", isActive ? "true" : "false");
-        button.tabIndex = isActive ? 0 : -1;
-        button.title = isEffective ? `${hint} \u00b7 ${TEXT.promptTabEffective}` : hint;
-        button.setAttribute("aria-label", button.title);
-    }
+function syncPromptTabStrip(node) {
+    const strip = node?.__h3PromptTabStrip;
+    if (!strip) return;
+    const tabs = promptTabs(node);
+    const active = activePromptTabIndex(node);
+    // Typing runs a sync on every keystroke, so the strip is only rebuilt when
+    // something it actually shows changed. That also keeps an in-progress
+    // rename and the horizontal scroll position alive.
+    const signature = `${active}/${tabs.length}/${tabs.map((tab) => tab.label).join(" ")}`;
+    if (strip.__h3TabSignature === signature) return;
+    strip.__h3TabSignature = signature;
+    strip.textContent = "";
+    tabs.forEach((tab, index) => {
+        const isActive = index === active;
+        const item = document.createElement("div");
+        item.className = `h3-prompt-tab${isActive ? " is-active" : ""}`;
+        item.setAttribute("role", "tab");
+        item.setAttribute("aria-selected", isActive ? "true" : "false");
+        item.title = isActive ? TEXT.promptTabRenameHint : tab.label;
+        if (isActive && index > 0) {
+            const left = makePromptTabAction("h3-prompt-tab-move", TEXT.promptTabMoveLeft, () => movePromptTab(node, index, -1));
+            left.textContent = "\u25c0";
+            item.append(left);
+        }
+        const label = document.createElement("span");
+        label.className = "h3-prompt-tab-label";
+        label.textContent = tab.label;
+        label.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+        label.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            switchPromptTab(node, index);
+        });
+        label.addEventListener("dblclick", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            switchPromptTab(node, index);
+            beginPromptTabRename(node, index, label);
+        });
+        item.append(label);
+        if (isActive && index < tabs.length - 1) {
+            const right = makePromptTabAction("h3-prompt-tab-move", TEXT.promptTabMoveRight, () => movePromptTab(node, index, 1));
+            right.textContent = "\u25b6";
+            item.append(right);
+        }
+        const close = makePromptTabAction("h3-prompt-tab-close", TEXT.promptTabRemove, () => removePromptTab(node, index));
+        close.textContent = "\u00d7";
+        item.append(close);
+        strip.append(item);
+    });
+    const add = makePromptTabAction("h3-prompt-tab-add", TEXT.promptTabAdd, () => addPromptTab(node));
+    add.textContent = "+";
+    add.disabled = tabs.length >= PROMPT_TAB_LIMIT;
+    strip.append(add);
 }
 
-function switchPromptTab(node, tab) {
-    const editor = node?.__h3Editor;
-    if (!editor) return;
-    const next = normalizePromptTab(tab);
-    if (activePromptTab(node) === next) return;
-    // Persist whatever is on screen before the editor is repopulated, so the
-    // tab that is being left keeps its text.
-    if (!isRawPromptMode(node) || node.__h3RawPromptNeedsSync) syncPromptFromEditor(node, false);
-    setActivePromptTab(node, next);
-    node.__h3RawPromptNeedsSync = false;
+function switchPromptTab(node, index) {
+    const next = Math.min(promptTabs(node).length - 1, Math.max(0, Number(index) || 0));
+    if (next === activePromptTabIndex(node)) return;
+    // Persist what is on screen before the editors are repopulated, so the tab
+    // being left keeps its text.
+    syncPromptFromEditor(node, false);
+    setActivePromptTabIndex(node, next);
+    reloadPromptTab(node);
+}
+
+function reloadPromptTab(node) {
+    for (const editor of promptEditors(node)) editor.__h3RawNeedsSync = false;
     renderEditorFromNode(node, true);
     syncPromptFromEditor(node, false);
     resetPromptHistory(node);
     closeMentionMenu(node);
     syncEditorMode(node);
-    if (!promptInputIsConnected(node) && !node.__h3OptimizerPending) {
-        editor.focus({ preventScroll: true });
-        setEditorCaretAtEnd(editor);
-    }
+    syncPromptTabStrip(node);
     node.setDirtyCanvas?.(true, true);
     app.graph?.setDirtyCanvas?.(true, true);
+    app.graph?.change?.();
+}
+
+function addPromptTab(node) {
+    const tabs = promptTabs(node);
+    if (tabs.length >= PROMPT_TAB_LIMIT) return;
+    syncPromptFromEditor(node, false);
+    tabs.push(normalizePromptTabEntry({}, tabs.length));
+    setActivePromptTabIndex(node, tabs.length - 1);
+    reloadPromptTab(node);
+    const editor = promptEditorFor(node, PROMPT_FIELD_SOURCE);
+    if (editor && !promptInputIsConnected(node)) editor.focus({ preventScroll: true });
+}
+
+function removePromptTab(node, index) {
+    const tabs = promptTabs(node);
+    const tab = tabs[index];
+    if (!tab) return;
+    const used = PROMPT_FIELDS.some((field) => !promptDocIsEmpty(tab[field]));
+    if (used && !globalThis.confirm?.(`${TEXT.promptTabRemoveConfirm}\n\n${tab.label}`)) return;
+    if (tabs.length === 1) {
+        // The node always keeps one tab; emptying it is the closest thing to
+        // deleting the last one.
+        tabs[0] = normalizePromptTabEntry({}, 0);
+    } else {
+        const previous = activePromptTabIndex(node);
+        tabs.splice(index, 1);
+        setActivePromptTabIndex(node, previous > index ? previous - 1 : Math.min(previous, tabs.length - 1));
+    }
+    reloadPromptTab(node);
+}
+
+function movePromptTab(node, index, offset) {
+    const tabs = promptTabs(node);
+    const target = index + offset;
+    if (!tabs[index] || target < 0 || target >= tabs.length) return;
+    syncPromptFromEditor(node, false);
+    const [tab] = tabs.splice(index, 1);
+    tabs.splice(target, 0, tab);
+    setActivePromptTabIndex(node, target);
+    syncPromptTabStrip(node);
+    node.setDirtyCanvas?.(true, true);
     app.graph?.change?.();
 }
 
@@ -3472,17 +3651,17 @@ function syncPromptViewButton(node) {
 }
 
 function togglePromptView(node) {
-    const editor = node?.__h3Editor;
-    if (!editor) return;
+    const editors = promptEditors(node);
+    if (!editors.length) return;
     const raw = isRawPromptMode(node);
-    if (!raw) syncPromptFromEditor(node, false);
-    else if (node.__h3RawPromptNeedsSync) syncPromptFromEditor(node, false);
+    syncPromptFromEditor(node, false);
     setPromptViewMode(node, raw ? PROMPT_VIEW_STRUCTURED : PROMPT_VIEW_RAW);
-    node.__h3RawPromptNeedsSync = false;
+    for (const editor of editors) editor.__h3RawNeedsSync = false;
     renderEditorFromNode(node, true);
     syncEditorMode(node);
-    editor.focus({ preventScroll: true });
-    setEditorCaretAtEnd(editor);
+    const focused = node.__h3Editor || editors[0];
+    focused.focus({ preventScroll: true });
+    setEditorCaretAtEnd(focused);
     node.setDirtyCanvas?.(true, true);
     app.graph?.setDirtyCanvas?.(true, true);
 }
@@ -3873,9 +4052,8 @@ function notifyPromptOptimizer(message, severity = "error") {
 function syncPromptExternalConnectionState(node) {
     const connected = promptInputIsConnected(node);
     node.__h3PromptExternalConnected = connected;
-    const editor = node?.__h3Editor;
     const wrap = node?.__h3EditorWrap;
-    if (editor) {
+    for (const editor of promptEditors(node)) {
         editor.contentEditable = connected ? "false" : "true";
         editor.setAttribute("aria-readonly", connected ? "true" : "false");
         editor.title = connected ? TEXT.promptExternalConnected : "";
@@ -3942,9 +4120,8 @@ function syncPromptOptimizerButton(node) {
     button.classList.toggle("is-external", external);
     button.setAttribute("aria-disabled", external ? "true" : "false");
     button.disabled = pending || external;
-    const editor = node?.__h3Editor;
     const wrap = node?.__h3EditorWrap;
-    if (editor) {
+    for (const editor of promptEditors(node)) {
         editor.contentEditable = locked ? "false" : "true";
         editor.setAttribute("aria-readonly", locked ? "true" : "false");
         editor.setAttribute("aria-busy", pending ? "true" : "false");
@@ -3953,7 +4130,7 @@ function syncPromptOptimizerButton(node) {
         editor.classList.toggle("is-loading", pending);
     }
     wrap?.classList?.toggle("is-loading", pending);
-    syncPromptTabs(node);
+    syncPromptFieldLabels(node);
     if (pending) closeMentionMenu(node);
 }
 
@@ -4001,13 +4178,13 @@ function setPromptFromOptimizedText(node, value) {
     const text = String(value || "").replace(/^```(?:text)?\s*/i, "").replace(/\s*```$/, "").trim();
     const doc = { version: 1, text, parts: promptPartsFromText(node, text) };
     node.properties ||= {};
-    // The result lands in its own tab, so the source prompt stays available
-    // for another optimization run or for manual reuse.
-    setPromptDocForTab(node, PROMPT_TAB_OPTIMIZED, doc);
-    setActivePromptTab(node, PROMPT_TAB_OPTIMIZED);
+    // The result lands in the active tab's optimized field, so the source
+    // prompt stays available for another run or for manual reuse.
+    setPromptDocForField(node, PROMPT_FIELD_OPTIMIZED, doc);
     syncPromptWidgetFromDocs(node);
-    node.__h3RawPromptNeedsSync = false;
-    renderEditorFromNode(node, true);
+    const editor = promptEditorFor(node, PROMPT_FIELD_OPTIMIZED);
+    if (editor) editor.__h3RawNeedsSync = false;
+    renderEditorFromNode(node, true, PROMPT_FIELD_OPTIMIZED);
     syncPromptFromEditor(node, false);
     resetPromptHistory(node);
     syncEditorMode(node);
@@ -4039,11 +4216,12 @@ async function optimizePromptFromEditor(node) {
         notifyPromptOptimizer(TEXT.optimizerMissing);
         return;
     }
-    // Optimization always reads the source tab, so clicking again regenerates
-    // from the original text instead of rewriting a previous result. A prompt
-    // typed directly into the optimized tab is still usable as its own source.
-    const sourceText = promptDocText(promptDocForTab(node, PROMPT_TAB_SOURCE));
-    const sourcePrompt = sourceText.trim() ? sourceText : promptDocText(activePromptDoc(node));
+    // Optimization always reads the active tab's source field, so clicking
+    // again regenerates from the original text instead of rewriting a previous
+    // result. A prompt typed straight into the optimized field still works as
+    // its own source.
+    const sourceText = promptDocText(promptDocForField(node, PROMPT_FIELD_SOURCE));
+    const sourcePrompt = sourceText.trim() ? sourceText : promptDocText(promptDocForField(node, PROMPT_FIELD_OPTIMIZED));
     if (!sourcePrompt.trim()) return;
     const resources = promptOptimizerResources(node);
     const mediaCounts = { image: 0, video: 0, audio: 0 };
@@ -4078,26 +4256,46 @@ async function optimizePromptFromEditor(node) {
     }
 }
 
+function syncPromptFieldLabels(node) {
+    const labels = node?.__h3PromptFieldLabels;
+    if (!labels) return;
+    // The dot marks the field that will actually be generated. An external
+    // text link replaces both fields, so nothing is marked while it is wired.
+    const effective = promptInputIsConnected(node) ? "" : effectivePromptField(node);
+    for (const field of PROMPT_FIELDS) {
+        const label = labels[field];
+        if (!label) continue;
+        const hint = field === PROMPT_FIELD_OPTIMIZED ? TEXT.promptFieldOptimizedHint : TEXT.promptFieldSourceHint;
+        const isEffective = field === effective;
+        label.classList.toggle("is-effective", isEffective);
+        label.title = isEffective ? `${hint} \u00b7 ${TEXT.promptFieldEffective}` : hint;
+    }
+}
+
 function syncEditorMode(node) {
     syncModeWidgets(node, { adjustHeight: false });
     const widget = getWidget(node, "prompt");
-    const editor = node.__h3Editor;
     const wrap = node.__h3EditorWrap;
     const domWidget = node.__h3DomWidget;
-    if (!widget || !editor || !wrap || !domWidget) return;
+    if (!widget || !promptEditors(node).length || !wrap || !domWidget) return;
     syncPromptExternalConnectionState(node);
     const reference = isReferenceMode(node);
     const raw = isRawPromptMode(node);
     hideOriginalPromptWidget(widget);
     setWidgetOption(domWidget, "canvasOnly", false);
     showDomEditorWidget(domWidget);
-    editor.style.display = "block";
-    wrap.style.display = "block";
-    editor.dataset.placeholder = promptEditorPlaceholder(node);
-    editor.classList.toggle("is-raw", raw);
+    wrap.style.display = "flex";
+    for (const field of PROMPT_FIELDS) {
+        const editor = promptEditorFor(node, field);
+        if (!editor) continue;
+        editor.style.display = "block";
+        editor.dataset.placeholder = promptEditorPlaceholder(node, field);
+        editor.classList.toggle("is-raw", raw);
+    }
     wrap.classList.toggle("is-raw", raw);
     syncPromptViewButton(node);
-    syncPromptTabs(node);
+    syncPromptTabStrip(node);
+    syncPromptFieldLabels(node);
     applyNativeEditorTheme(wrap);
     if (!reference || raw) closeMentionMenu(node);
 }
@@ -4603,9 +4801,235 @@ function insertTextWithMentionChips(node, editor, text) {
     return true;
 }
 
+function createPromptFieldEditor(node, field, wrap) {
+    const editor = document.createElement("div");
+    editor.className = "comfy-multiline-input h3-prompt-editor";
+    editor.contentEditable = "true";
+    preparePromptEditorForUndo(editor);
+    editor.__h3PromptNode = node;
+    editor.__h3PromptField = field;
+    editor.tabIndex = 0;
+    editor.setAttribute("role", "textbox");
+    editor.setAttribute("aria-label", field === PROMPT_FIELD_OPTIMIZED ? "optimized prompt" : "prompt");
+    editor.dataset.placeholder = promptEditorPlaceholder(node, field);
+    editor.spellcheck = false;
+    editor.addEventListener("beforeinput", (event) => {
+        if (isRawPromptMode(node)) {
+            node.__h3DialogueHashHandled = false;
+            return;
+        }
+        if (node.__h3DialogueHashHandled) {
+            node.__h3DialogueHashHandled = false;
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            return;
+        }
+        if (event.inputType === "insertText" && event.data === "#" && insertDialogueBlockAtSelection(node, editor)) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            syncPromptFromEditor(node);
+            pushPromptHistory(node, editor);
+            return;
+        }
+        if (isReferenceMode(node) && event.data === "@") setTimeout(() => syncMentionMenuToCaret(node, editor), 0);
+    });
+    editor.addEventListener("input", (event) => {
+        const raw = isRawPromptMode(node);
+        if (raw) editor.__h3RawNeedsSync = true;
+        syncPromptFromEditor(node);
+        if (event?.isComposing || event?.inputType === "insertCompositionText" || node.__h3PromptComposing) {
+            if (!raw) syncMentionMenuToCaret(node, editor);
+            return;
+        }
+        pushPromptHistory(node, editor);
+        if (raw) {
+            closeMentionMenu(node);
+            return;
+        }
+        syncMentionMenuToCaret(node, editor);
+    });
+    editor.addEventListener("compositionstart", () => {
+        node.__h3PromptComposing = true;
+    });
+    editor.addEventListener("compositionend", () => {
+        node.__h3PromptComposing = false;
+        if (isRawPromptMode(node)) editor.__h3RawNeedsSync = true;
+        syncPromptFromEditor(node);
+        pushPromptHistory(node, editor);
+    });
+    editor.addEventListener("focus", () => {
+        activePromptNode = node;
+        // Everything that acts on "the prompt the user is editing" - the
+        // mention picker, undo, caret helpers - follows the focused field.
+        node.__h3Editor = editor;
+        applyNativeEditorTheme(wrap);
+        // Focusing the editor must not open the picker by itself. It should only
+        // appear when the caret is actually inside a freshly typed @ query.
+        if (isRawPromptMode(node)) closeMentionMenu(node);
+        else syncMentionMenuToCaret(node, editor);
+    });
+    editor.addEventListener("pointerdown", () => {
+        activePromptNode = node;
+        node.__h3Editor = editor;
+    }, true);
+    editor.addEventListener("keyup", (event) => {
+        if (isRawPromptMode(node) || !isReferenceMode(node) || ["ArrowUp", "ArrowDown", "Enter", "Escape", "Tab"].includes(event.key)) return;
+        syncMentionMenuToCaret(node, editor);
+        event.stopPropagation();
+    });
+    editor.addEventListener("keydown", (event) => {
+        if (isPromptUndoRedoEvent(event)) {
+            node.__h3Editor = editor;
+            handlePromptHistoryKeydown(node, event);
+        }
+    }, true);
+    editor.addEventListener("keydown", (event) => {
+        const key = String(event.key || "").toLowerCase();
+        if ((event.ctrlKey || event.metaKey) && key === "s") {
+            syncPromptFromEditor(node);
+            event.preventDefault();
+            return;
+        }
+        const raw = isRawPromptMode(node);
+        if (raw) closeMentionMenu(node);
+        if (!raw && handleMentionMenuKeydown(node, event)) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
+        if (!raw && event.key === "#" && !event.ctrlKey && !event.metaKey && !event.altKey && insertDialogueBlockAtSelection(node, editor)) {
+            event.preventDefault();
+            event.stopPropagation();
+            node.__h3DialogueHashHandled = true;
+            setTimeout(() => { node.__h3DialogueHashHandled = false; }, 0);
+            syncPromptFromEditor(node);
+            pushPromptHistory(node, editor);
+            return;
+        }
+        const dialogue = dialogueBlockAtSelection(editor);
+        if (event.key === "Enter" && dialogue && !event.shiftKey) {
+            event.preventDefault();
+            event.stopPropagation();
+            exitDialogueBlock(node, editor, dialogue);
+            syncPromptFromEditor(node);
+            pushPromptHistory(node, editor);
+            return;
+        }
+        if (event.key === "Enter" && dialogue && event.shiftKey && insertEditorLineBreak(editor)) {
+            event.preventDefault();
+            event.stopPropagation();
+            syncPromptFromEditor(node);
+            pushPromptHistory(node, editor);
+            return;
+        }
+        if (event.key === "Backspace" && (
+            backspaceDialogueBoundary(editor, node)
+            || deleteLineBreakNearCaret(editor, node, "backward")
+            || deleteChipNearCaret(editor, node, "backward")
+            || backspaceBeforeChip(editor, node)
+            || backspaceAtLooseSentinel(editor, node)
+            || blockNativeSentinelDeletion(editor)
+        )) {
+            event.preventDefault();
+            syncPromptFromEditor(node);
+            pushPromptHistory(node, editor);
+        } else if (event.key === "Delete" && deleteChipNearCaret(editor, node, "forward")) {
+            event.preventDefault();
+            syncPromptFromEditor(node);
+            pushPromptHistory(node, editor);
+        } else if (event.key === "Enter" && insertEditorLineBreak(editor)) {
+            event.preventDefault();
+            closeMentionMenu(node);
+            syncPromptFromEditor(node);
+            pushPromptHistory(node, editor);
+        } else if (event.key === "Escape") {
+            closeMentionMenu(node);
+        }
+        event.stopPropagation();
+    });
+    editor.addEventListener("paste", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+        const text = event.clipboardData?.getData("text/plain") || "";
+        if (isRawPromptMode(node)) {
+            insertPlainText(editor, text);
+            editor.__h3RawNeedsSync = true;
+            syncPromptFromEditor(node);
+            pushPromptHistory(node, editor);
+            return;
+        }
+        insertTextWithMentionChips(node, editor, text);
+        syncPromptFromEditor(node);
+        pushPromptHistory(node, editor);
+        syncMentionMenuToCaret(node, editor);
+    });
+    editor.addEventListener("blur", () => {
+        syncPromptFromEditor(node);
+        setTimeout(() => {
+            if (!node.__h3MentionMenu?.element?.matches?.(":hover")) closeMentionMenu(node);
+        }, 160);
+    });
+    editor.addEventListener("wheel", (event) => {
+        const editorFocused = document.activeElement === editor;
+        const horizontal = Math.abs(event.deltaX || 0) > Math.abs(event.deltaY || 0);
+        const maxScrollTop = Math.max(0, editor.scrollHeight - editor.clientHeight);
+        const lineHeight = parseFloat(getComputedStyle(editor).lineHeight) || 16;
+        const deltaY = event.deltaMode === 1
+            ? event.deltaY * lineHeight
+            : event.deltaMode === 2
+                ? event.deltaY * editor.clientHeight
+                : event.deltaY;
+        if (!editorFocused) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            app.canvas?.processMouseWheel?.(event);
+            return;
+        }
+        if (!event.ctrlKey && !horizontal && maxScrollTop > 0 && deltaY) {
+            const next = Math.max(0, Math.min(maxScrollTop, editor.scrollTop + deltaY));
+            if (next !== editor.scrollTop) {
+                editor.scrollTop = next;
+                event.preventDefault();
+                event.stopPropagation();
+                event.stopImmediatePropagation?.();
+                return;
+            }
+        }
+        if (!event.ctrlKey && !horizontal && maxScrollTop > 0) {
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+        app.canvas?.processMouseWheel?.(event);
+    }, { passive: false, capture: true });
+    return editor;
+}
+
+function createPromptField(node, field, wrap) {
+    const container = document.createElement("div");
+    container.className = `h3-prompt-field is-${field}`;
+    const label = document.createElement("div");
+    label.className = "h3-prompt-field-label";
+    const name = document.createElement("span");
+    name.textContent = field === PROMPT_FIELD_OPTIMIZED ? TEXT.promptFieldOptimized : TEXT.promptFieldSource;
+    const dot = document.createElement("span");
+    dot.className = "h3-prompt-field-dot";
+    label.append(name, dot);
+    const editor = createPromptFieldEditor(node, field, wrap);
+    container.append(label, editor);
+    return { container, label, editor };
+}
+
 function ensurePromptEditor(node) {
-    if (node.__h3Editor) {
-        preparePromptEditorForUndo(node.__h3Editor);
+    if (node.__h3Editors) {
+        for (const editor of promptEditors(node)) preparePromptEditorForUndo(editor);
         return;
     }
     if (typeof document === "undefined" || typeof node.addDOMWidget !== "function") return;
@@ -4623,17 +5047,16 @@ function ensurePromptEditor(node) {
     wrap.className = "h3-prompt-editor-wrap";
     wrap.style.minHeight = "0px";
     applyNativeEditorTheme(wrap);
-    const editor = document.createElement("div");
-    editor.className = "comfy-multiline-input h3-prompt-editor";
-    editor.contentEditable = "true";
-    preparePromptEditorForUndo(editor);
-    editor.__h3PromptNode = node;
-    editor.tabIndex = 0;
-    editor.setAttribute("role", "textbox");
-    editor.setAttribute("aria-label", "prompt");
-    editor.dataset.placeholder = promptEditorPlaceholder(node);
-    editor.spellcheck = false;
-    const promptTabs = makePromptTabBar(node);
+    const tabStrip = makePromptTabStrip(node);
+    const fields = {};
+    const editors = {};
+    const labels = {};
+    for (const field of PROMPT_FIELDS) {
+        const built = createPromptField(node, field, wrap);
+        fields[field] = built.container;
+        editors[field] = built.editor;
+        labels[field] = built.label;
+    }
     const editorTools = document.createElement("div");
     editorTools.className = "h3-prompt-editor-tools";
     const optimizerStatus = document.createElement("div");
@@ -4671,207 +5094,24 @@ function ensurePromptEditor(node) {
         optimizePromptFromEditor(node);
     });
     editorTools.append(optimizeButton, viewButton);
-    editor.addEventListener("beforeinput", (event) => {
-        if (isRawPromptMode(node)) {
-            node.__h3DialogueHashHandled = false;
-            return;
-        }
-        if (node.__h3DialogueHashHandled) {
-            node.__h3DialogueHashHandled = false;
-            event.preventDefault();
-            event.stopPropagation();
-            event.stopImmediatePropagation?.();
-            return;
-        }
-        if (event.inputType === "insertText" && event.data === "#" && insertDialogueBlockAtSelection(node, editor)) {
-            event.preventDefault();
-            event.stopPropagation();
-            event.stopImmediatePropagation?.();
-            syncPromptFromEditor(node);
-            pushPromptHistory(node);
-            return;
-        }
-        if (isReferenceMode(node) && event.data === "@") setTimeout(() => syncMentionMenuToCaret(node, editor), 0);
-    });
-    editor.addEventListener("input", (event) => {
-        const raw = isRawPromptMode(node);
-        if (raw) node.__h3RawPromptNeedsSync = true;
-        syncPromptFromEditor(node);
-        if (event?.isComposing || event?.inputType === "insertCompositionText" || node.__h3PromptComposing) {
-            if (!raw) syncMentionMenuToCaret(node, editor);
-            return;
-        }
-        pushPromptHistory(node);
-        if (raw) {
-            closeMentionMenu(node);
-            return;
-        }
-        syncMentionMenuToCaret(node, editor);
-    });
-    editor.addEventListener("compositionstart", () => {
-        node.__h3PromptComposing = true;
-    });
-    editor.addEventListener("compositionend", () => {
-        node.__h3PromptComposing = false;
-        if (isRawPromptMode(node)) node.__h3RawPromptNeedsSync = true;
-        syncPromptFromEditor(node);
-        pushPromptHistory(node);
-    });
-    editor.addEventListener("focus", () => {
-        activePromptNode = node;
-        applyNativeEditorTheme(wrap);
-        // Focusing the editor must not open the picker by itself. It should only
-        // appear when the caret is actually inside a freshly typed @ query.
-        if (isRawPromptMode(node)) closeMentionMenu(node);
-        else syncMentionMenuToCaret(node, editor);
-    });
-    editor.addEventListener("pointerdown", () => {
-        activePromptNode = node;
-    }, true);
-    editor.addEventListener("keyup", (event) => {
-        if (isRawPromptMode(node) || !isReferenceMode(node) || ["ArrowUp", "ArrowDown", "Enter", "Escape", "Tab"].includes(event.key)) return;
-        syncMentionMenuToCaret(node, editor);
-        event.stopPropagation();
-    });
-    editor.addEventListener("keydown", (event) => {
-        if (isPromptUndoRedoEvent(event)) {
-            handlePromptHistoryKeydown(node, event);
-        }
-    }, true);
-    editor.addEventListener("keydown", (event) => {
-        const key = String(event.key || "").toLowerCase();
-        if ((event.ctrlKey || event.metaKey) && key === "s") {
-            syncPromptFromEditor(node);
-            event.preventDefault();
-            return;
-        }
-        const raw = isRawPromptMode(node);
-        if (raw) closeMentionMenu(node);
-        if (!raw && handleMentionMenuKeydown(node, event)) {
-            event.preventDefault();
-            event.stopPropagation();
-            return;
-        }
-        if (!raw && event.key === "#" && !event.ctrlKey && !event.metaKey && !event.altKey && insertDialogueBlockAtSelection(node, editor)) {
-            event.preventDefault();
-            event.stopPropagation();
-            node.__h3DialogueHashHandled = true;
-            setTimeout(() => { node.__h3DialogueHashHandled = false; }, 0);
-            syncPromptFromEditor(node);
-            pushPromptHistory(node);
-            return;
-        }
-        const dialogue = dialogueBlockAtSelection(editor);
-        if (event.key === "Enter" && dialogue && !event.shiftKey) {
-            event.preventDefault();
-            event.stopPropagation();
-            exitDialogueBlock(node, editor, dialogue);
-            syncPromptFromEditor(node);
-            pushPromptHistory(node);
-            return;
-        }
-        if (event.key === "Enter" && dialogue && event.shiftKey && insertEditorLineBreak(editor)) {
-            event.preventDefault();
-            event.stopPropagation();
-            syncPromptFromEditor(node);
-            pushPromptHistory(node);
-            return;
-        }
-        if (event.key === "Backspace" && (
-            backspaceDialogueBoundary(editor, node)
-            || deleteLineBreakNearCaret(editor, node, "backward")
-            || deleteChipNearCaret(editor, node, "backward")
-            || backspaceBeforeChip(editor, node)
-            || backspaceAtLooseSentinel(editor, node)
-            || blockNativeSentinelDeletion(editor)
-        )) {
-            event.preventDefault();
-            syncPromptFromEditor(node);
-            pushPromptHistory(node);
-        } else if (event.key === "Delete" && deleteChipNearCaret(editor, node, "forward")) {
-            event.preventDefault();
-            syncPromptFromEditor(node);
-            pushPromptHistory(node);
-        } else if (event.key === "Enter" && insertEditorLineBreak(editor)) {
-            event.preventDefault();
-            closeMentionMenu(node);
-            syncPromptFromEditor(node);
-            pushPromptHistory(node);
-        } else if (event.key === "Escape") {
-            closeMentionMenu(node);
-        }
-        event.stopPropagation();
-    });
-    editor.addEventListener("paste", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation?.();
-        const text = event.clipboardData?.getData("text/plain") || "";
-        if (isRawPromptMode(node)) {
-            insertPlainText(editor, text);
-            node.__h3RawPromptNeedsSync = true;
-            syncPromptFromEditor(node);
-            pushPromptHistory(node);
-            return;
-        }
-        insertTextWithMentionChips(node, editor, text);
-        syncPromptFromEditor(node);
-        pushPromptHistory(node);
-        syncMentionMenuToCaret(node, editor);
-    });
-    editor.addEventListener("blur", () => {
-        syncPromptFromEditor(node);
-        setTimeout(() => {
-            if (!node.__h3MentionMenu?.element?.matches?.(":hover")) closeMentionMenu(node);
-        }, 160);
-    });
     wrap.addEventListener("pointerdown", (event) => {
         event.stopPropagation();
         if (!event.target?.closest?.(".h3-mention-chip")) closeMentionMenu(node);
     });
-    const wheelHandler = (event) => {
-        const editorFocused = document.activeElement === editor;
-        const horizontal = Math.abs(event.deltaX || 0) > Math.abs(event.deltaY || 0);
-        const maxScrollTop = Math.max(0, editor.scrollHeight - editor.clientHeight);
-        const lineHeight = parseFloat(getComputedStyle(editor).lineHeight) || 16;
-        const deltaY = event.deltaMode === 1
-            ? event.deltaY * lineHeight
-            : event.deltaMode === 2
-                ? event.deltaY * editor.clientHeight
-                : event.deltaY;
-        if (!editorFocused) {
-            event.preventDefault();
-            event.stopPropagation();
-            event.stopImmediatePropagation?.();
-            app.canvas?.processMouseWheel?.(event);
-            return;
-        }
-        if (!event.ctrlKey && !horizontal && maxScrollTop > 0 && deltaY) {
-            const next = Math.max(0, Math.min(maxScrollTop, editor.scrollTop + deltaY));
-            if (next !== editor.scrollTop) {
-                editor.scrollTop = next;
-                event.preventDefault();
-                event.stopPropagation();
-                event.stopImmediatePropagation?.();
-                return;
-            }
-        }
-        if (!event.ctrlKey && !horizontal && maxScrollTop > 0) {
-            event.stopPropagation();
-            event.stopImmediatePropagation?.();
-            return;
-        }
+    wrap.addEventListener("wheel", (event) => {
+        // Anything outside an editor (tab strip, labels, padding) keeps the
+        // canvas zoom behaviour.
+        if (event.target?.closest?.(".h3-prompt-editor, .h3-prompt-tabs")) return;
         event.preventDefault();
         event.stopPropagation();
-        event.stopImmediatePropagation?.();
         app.canvas?.processMouseWheel?.(event);
-    };
-    editor.addEventListener("wheel", wheelHandler, { passive: false, capture: true });
-    wrap.addEventListener("wheel", wheelHandler, { passive: false });
-    wrap.append(promptTabs, editor, optimizerStatus, editorTools);
-    node.__h3Editor = editor;
+    }, { passive: false });
+    wrap.append(tabStrip, fields[PROMPT_FIELD_SOURCE], fields[PROMPT_FIELD_OPTIMIZED], optimizerStatus, editorTools);
+    node.__h3Editors = editors;
+    node.__h3Editor = editors[PROMPT_FIELD_SOURCE];
     node.__h3EditorWrap = wrap;
-    node.__h3PromptTabs = promptTabs;
+    node.__h3PromptTabStrip = tabStrip;
+    node.__h3PromptFieldLabels = labels;
     node.__h3PromptEditorTools = editorTools;
     node.__h3PromptViewButton = viewButton;
     node.__h3PromptOptimizeButton = optimizeButton;
@@ -4879,6 +5119,7 @@ function ensurePromptEditor(node) {
     node.__h3PromptOptimizerStatusText = optimizerStatusText;
     syncPromptExternalConnectionState(node);
     renderEditorFromNode(node);
+    syncPromptTabStrip(node);
     syncPromptOptimizerButton(node);
     resetPromptHistory(node);
     const domWidget = node.addDOMWidget("h3_prompt_mentions", "h3_prompt_mentions", wrap, {
@@ -4890,7 +5131,7 @@ function ensurePromptEditor(node) {
         },
         margin: 10,
         serialize: false,
-        getMinHeight: () => 50 + PROMPT_TABS_HEIGHT,
+        getMinHeight: () => PROMPT_TABS_HEIGHT + 2 * (PROMPT_FIELD_LABEL_HEIGHT + PROMPT_FIELD_MIN_HEIGHT),
         afterResize: () => {
             applyNativeEditorTheme(wrap);
             node._widgetSlotsDirty = true;
@@ -4901,9 +5142,11 @@ function ensurePromptEditor(node) {
     if (!domWidget) {
         restoreOriginalPromptWidget(widget);
         wrap.remove();
+        node.__h3Editors = null;
         node.__h3Editor = null;
         node.__h3EditorWrap = null;
-        node.__h3PromptTabs = null;
+        node.__h3PromptTabStrip = null;
+        node.__h3PromptFieldLabels = null;
         node.__h3PromptEditorTools = null;
         node.__h3PromptViewButton = null;
         node.__h3PromptOptimizeButton = null;
@@ -4972,13 +5215,12 @@ function removePromptEditorWidgets(node) {
 }
 
 function updatePromptEditor(node) {
-    if (!node.__h3Editor) {
+    const editors = promptEditors(node);
+    if (!editors.length) {
         installPromptEditorSoon(node);
         return;
     }
-    const editor = node.__h3Editor;
-    if (!editor) return;
-    preparePromptEditorForUndo(editor);
+    for (const editor of editors) preparePromptEditorForUndo(editor);
     syncEditorMode(node);
 }
 
@@ -5269,7 +5511,7 @@ function installNode(nodeType, nodeData) {
             // minimum every time the workflow tab is activated.
             this.__h3EditorStableSize = configuredSize;
         }
-        for (const prop of [PROMPT_DOC_PROP, PROMPT_OPTIMIZED_DOC_PROP, PROMPT_TAB_PROP, PROMPT_VIEW_PROP]) {
+        for (const prop of [PROMPT_TABS_PROP, PROMPT_TAB_INDEX_PROP, PROMPT_DOC_PROP, PROMPT_OPTIMIZED_DOC_PROP, PROMPT_VIEW_PROP]) {
             if (!info?.properties?.[prop]) continue;
             this.properties ||= {};
             this.properties[prop] = info.properties[prop];
@@ -5315,7 +5557,7 @@ function installNode(nodeType, nodeData) {
     nodeType.prototype.onSerialize = function onSerializeH3Easy(info) {
         if (this.__h3Editor) syncPromptFromEditor(this, false);
         const result = originalSerialize?.apply(this, arguments);
-        for (const prop of [PROMPT_DOC_PROP, PROMPT_OPTIMIZED_DOC_PROP, PROMPT_TAB_PROP, PROMPT_VIEW_PROP]) {
+        for (const prop of [PROMPT_TABS_PROP, PROMPT_TAB_INDEX_PROP, PROMPT_DOC_PROP, PROMPT_OPTIMIZED_DOC_PROP, PROMPT_VIEW_PROP]) {
             if (!info || !this.properties?.[prop]) continue;
             info.properties ||= {};
             info.properties[prop] = this.properties[prop];
@@ -5341,12 +5583,13 @@ function installNode(nodeType, nodeData) {
         this.__h3PromptInstallAttempts = 0;
         this.__h3PromptInstallNextAt = 0;
         this.__h3EditorWrap?.remove?.();
+        this.__h3Editors = null;
         this.__h3Editor = null;
         this.__h3EditorWrap = null;
-        this.__h3PromptTabs = null;
+        this.__h3PromptTabStrip = null;
+        this.__h3PromptFieldLabels = null;
         this.__h3PromptEditorTools = null;
         this.__h3PromptViewButton = null;
-        this.__h3RawPromptNeedsSync = false;
         this.__h3PromptOptimizerStatus = null;
         this.__h3PromptOptimizerStatusText = null;
         removePromptEditorWidgets(this);
@@ -5446,30 +5689,63 @@ function install() {
       }
       .h3-prompt-tabs {
         display: flex; align-items: stretch; gap: 3px; flex: 0 0 auto; height: ${PROMPT_TABS_HEIGHT}px;
-        box-sizing: border-box; padding: 0 0 2px; overflow: hidden; user-select: none;
+        box-sizing: border-box; padding: 0 0 3px; overflow-x: auto; overflow-y: hidden; user-select: none;
+        scrollbar-width: none;
       }
-      .h3-prompt-tab {
-        appearance: none; display: inline-flex; align-items: center; gap: 4px; flex: 1 1 0; min-width: 0; padding: 0 7px;
+      .h3-prompt-tabs::-webkit-scrollbar { display: none; }
+      .h3-prompt-tab, .h3-prompt-tab-add {
+        display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; max-width: 160px; padding: 0 3px 0 6px;
         border: 1px solid var(--h3-native-widget-outline, rgba(255,255,255,.12)); border-radius: 4px; outline: none;
-        background: transparent; color: var(--h3-native-widget-text, rgba(255,255,255,.78)); opacity: .34; cursor: pointer;
+        background: transparent; color: var(--h3-native-widget-text, rgba(255,255,255,.78)); opacity: .38; cursor: pointer;
         font: 600 9px/1 Consolas, "Courier New", monospace; letter-spacing: 0; white-space: nowrap;
         transition: opacity .12s ease, background-color .12s ease, border-color .12s ease;
       }
-      .h3-prompt-tab:hover, .h3-prompt-tab:focus-visible { opacity: .62; background: rgba(255,255,255,.045); }
-      .h3-prompt-tab.is-active { opacity: .84; background: rgba(255,255,255,.07); border-color: var(--h3-native-widget-outline, rgba(255,255,255,.22)); }
-      .h3-prompt-tab-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-      .h3-prompt-tab-dot {
-        width: 5px; height: 5px; flex: 0 0 5px; margin-left: auto; border-radius: 50%;
+      .h3-prompt-tab:hover { opacity: .66; background: rgba(255,255,255,.045); }
+      .h3-prompt-tab.is-active {
+        opacity: .92; background: rgba(0,226,187,.07); border-color: rgba(0,226,187,.28); color: rgba(190,255,244,.96);
+      }
+      .h3-prompt-tab-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+      .h3-prompt-tab-rename {
+        width: 88px; height: 13px; margin: 0; padding: 0 3px; border: 1px solid rgba(0,226,187,.4); border-radius: 3px;
+        outline: none; background: var(--h3-native-widget-bg, #222); color: var(--h3-native-widget-text, #ddd);
+        font: 600 9px/1 Consolas, "Courier New", monospace;
+      }
+      .h3-prompt-tab-move, .h3-prompt-tab-close, .h3-prompt-tab-add {
+        appearance: none; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+        width: 11px; height: 12px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: inherit;
+        cursor: pointer; font: 600 9px/1 Consolas, "Courier New", monospace; opacity: .72;
+      }
+      .h3-prompt-tab-move:hover, .h3-prompt-tab-close:hover { opacity: 1; background: rgba(255,255,255,.12); }
+      .h3-prompt-tab-close { font-size: 11px; }
+      .h3-prompt-tab-add {
+        width: 16px; padding: 0; justify-content: center; opacity: .42; color: rgba(160,255,178,.9);
+        border-color: var(--h3-native-widget-outline, rgba(255,255,255,.12));
+      }
+      .h3-prompt-tab-add:hover:not(:disabled) { opacity: .85; background: rgba(160,255,178,.1); }
+      .h3-prompt-tab-add:disabled { opacity: .16; cursor: not-allowed; }
+      .h3-prompt-editor-wrap.is-loading .h3-prompt-tabs { pointer-events: none; opacity: .3; }
+      .h3-prompt-field {
+        display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; min-width: 0; box-sizing: border-box;
+      }
+      .h3-prompt-field-label {
+        display: flex; align-items: center; gap: 4px; flex: 0 0 ${PROMPT_FIELD_LABEL_HEIGHT}px; height: ${PROMPT_FIELD_LABEL_HEIGHT}px;
+        color: var(--h3-native-widget-text, rgba(255,255,255,.78)); opacity: .44; user-select: none;
+        font: 600 9px/1 Consolas, "Courier New", monospace; letter-spacing: 0; white-space: nowrap;
+      }
+      .h3-prompt-field-dot {
+        width: 5px; height: 5px; flex: 0 0 5px; border-radius: 50%;
         background: rgba(0,226,187,.92); opacity: 0; transition: opacity .12s ease;
       }
-      .h3-prompt-tab.is-effective .h3-prompt-tab-dot { opacity: .9; }
-      .h3-prompt-editor-wrap.is-external .h3-prompt-tab { opacity: .3; }
-      .h3-prompt-editor-wrap.is-loading .h3-prompt-tab { pointer-events: none; opacity: .22; }
+      .h3-prompt-field-label.is-effective { opacity: .72; }
+      .h3-prompt-field-label.is-effective .h3-prompt-field-dot { opacity: .9; }
+      .h3-prompt-field.is-source { padding-bottom: 3px; }
+      .h3-prompt-field.is-optimized .h3-prompt-editor {
+        padding-bottom: calc(var(--h3-native-widget-padding, 2px) + 22px);
+      }
       .h3-prompt-editor {
         --h3-prompt-text-size: var(--h3-native-widget-text-size, var(--comfy-textarea-font-size, 12px));
         display: block; width: 100%; flex: 1 1 auto; height: auto; min-width: 0; min-height: 0; max-height: 100%; box-sizing: border-box;
-        padding: var(--h3-native-widget-padding, 2px);
-        padding-bottom: calc(var(--h3-native-widget-padding, 2px) + 24px); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+        padding: var(--h3-native-widget-padding, 2px); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
         white-space: pre-wrap; overflow-wrap: anywhere; border: 0; border-radius: var(--h3-native-widget-radius, 0); outline: none;
         resize: none; background-color: var(--h3-native-widget-bg, var(--comfy-input-bg, #222));
         color: var(--h3-native-widget-text, var(--input-text, #ddd)); caret-color: var(--h3-native-widget-text, var(--input-text, #ddd));

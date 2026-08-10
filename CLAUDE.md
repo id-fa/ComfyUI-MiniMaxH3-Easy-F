@@ -70,22 +70,30 @@ the `graphToPrompt` patch, or the server silently falls back to the input's defa
 
 ### Prompt editor and `@` reference resolution
 
-The native `prompt` textarea is hidden and replaced by a contenteditable editor. Its structured
-document is a `parts` array of `text` / `mention` / `dialogue` entries, and the editor holds **two**
-of them behind a tab strip:
+The native `prompt` textarea is hidden and replaced by a composite DOM widget: a tab strip over **two**
+contenteditable fields (`source` and `optimized`, `PROMPT_FIELDS`). Each field's structured document is
+a `parts` array of `text` / `mention` / `dialogue` entries, and each *tab* owns a full pair:
 
-- `node.properties["minimax_h3_prompt_reference_doc"]` — the source tab (also the legacy property).
-- `node.properties["minimax_h3_prompt_optimized_doc"]` — the optimizer result tab.
-- `node.properties["minimax_h3_prompt_active_tab"]` — which tab the editor is showing.
+```
+node.properties["minimax_h3_prompt_tabs"]      = [{ label, source: doc, optimized: doc }, …]
+node.properties["minimax_h3_prompt_tab_index"] = open tab
+```
 
-`effectivePromptTab()` picks the optimized doc when it holds text and the source doc otherwise; that
-choice drives `buildRuntimePrompt` **and** the `prompt` widget value (`syncPromptWidgetFromDocs`), so
-the widget always carries the prompt that would actually be generated even if the extension is
-disabled. Editing writes to the *active* tab only (`syncPromptFromEditor`, `applyPromptHistoryEntry`),
-and undo history is reset on tab switch because a single stack cannot span two documents. The
-optimizer reads the source tab and writes the optimized tab, so re-running it never rewrites its own
-output. Only the source tab may fall back to `widget.value` when its doc is missing — that fallback is
-what loads workflows saved before the tabs existed.
+`promptTabs()` is the only accessor and migrates on first touch: upstream's single
+`minimax_h3_prompt_reference_doc`, this fork's earlier `…_optimized_doc`, or a bare `widget.value` all
+become the first tab, and the legacy properties are deleted so there is one source of truth.
+
+`effectivePromptField()` picks the open tab's optimized doc when it holds text and its source doc
+otherwise; that choice drives `buildRuntimePrompt` **and** the `prompt` widget value
+(`syncPromptWidgetFromDocs`), so the widget always carries the prompt that would actually be generated
+even if the extension is disabled. Only the open tab is ever sent.
+
+Per-field state lives on the editor element rather than the node — `editor.__h3PromptField`,
+`editor.__h3History`, `editor.__h3RawNeedsSync` — so history, raw-view sync, and serialization need no
+field plumbing. `node.__h3Editor` means *the focused field* (updated on focus/pointerdown) and is what
+the mention picker, caret helpers, and undo act on; `node.__h3Editors` is the map of both. Undo resets
+on tab switch because one stack cannot span two documents. `syncPromptTabStrip` rebuilds only when its
+signature (labels + count + index) changes, since typing syncs on every keystroke.
 
 The frontend→backend prompt protocol:
 
@@ -159,8 +167,8 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   work instead, via a `prompt_transform` callback threaded into `_reference_conditioning` — placed after
   `_resolve_reference_prompt` so the encoder sees real `<Picture N>` tags, not internal placeholders. The
   result is pushed to the editor with `PromptServer.send_sync(PROMPT_OPTIMIZER_EVENT)`. It only fires while
-  the hidden `prompt_needs_optimization` transport input is true (frontend: "the Optimized tab is empty";
-  default true so headless runs still optimize).
+  the hidden `prompt_needs_optimization` transport input is true (frontend: "the open tab's Optimized
+  field is empty"; default true so headless runs still optimize).
 - `read_media` applies to all three formats. For `clip` it runs `_optimizer_clip_descriptions`: **one
   describe generation per connected asset**, then the final prompt pass gets those descriptions as text and
   no media at all. A text encoder has a single slot per modality, so sending a whole H3 reference set at
