@@ -265,6 +265,25 @@ Selecting this format replaces the API rows with:
 The model stays loaded between optimizations and is released automatically when
 any of these settings change.
 
+### Reasoning models
+
+The optimizer's answer becomes the H3 prompt verbatim, so thinking is always
+switched off — there is no toggle for it:
+
+- Qwen-family models get the inline `/no_think` switch, and Qwen chat handlers
+  are constructed with `force_reasoning=False`.
+- Gemma takes neither (its handler rejects the flag), so it relies on the
+  cleanup below.
+- Turn markers (`<|im_end|>`, `<end_of_turn>`, …) are passed as stop strings.
+- Any `<think>` / `<thinking>` / `<reasoning>` block that still comes back is
+  stripped from the front of the answer. An answer that is *only* an
+  unterminated thought counts as empty and reports an error rather than feeding
+  half a thought into the prompt.
+
+The same cleanup applies to the HTTP and text-encoder formats, so a reasoning
+model behind an OpenAI-compatible endpoint cannot leak its thoughts either. The
+text-encoder format additionally passes `thinking=False` to the tokenizer.
+
 ### Connected media
 
 **Read connected media** attaches the connected images exactly as the

@@ -169,6 +169,10 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   handler class, whose name varies per llama-cpp build/fork, so `_optimizer_gguf_chat_handler` probes
   candidates by model-name family and degrades to text-only. llama-cpp takes the same OpenAI-shaped
   `image_url` parts, so `_optimizer_media_parts(..., "openai")` is reused verbatim.
+- Reasoning is always off — the answer *is* the prompt. Each backend suppresses it its own way (`clip`:
+  `thinking=False`; `gguf`: `/no_think` for Qwen, `force_reasoning=False` on the handler, family-specific
+  `stop` markers), and `_strip_optimizer_output` removes any leading think block as the shared backstop.
+  Don't add a "reasoning" toggle without deciding what the leftover block should do to the H3 prompt.
 - `clip` runs locally through the node's optional `optimizer_clip` CLIP input using ComfyUI's
   `clip.tokenize` → `clip.generate` → `clip.decode` (same as the built-in `TextGenerate` node). That object
   only exists during execution, so the HTTP route rejects this format and `MiniMaxH3Easy.generate` does the

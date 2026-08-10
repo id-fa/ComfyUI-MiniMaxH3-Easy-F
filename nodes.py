@@ -772,9 +772,23 @@ def _optimizer_system_prompt(
     return prompt
 
 
+_OPTIMIZER_THINK_RE = re.compile(r"^\s*<(think|thinking|reasoning)>.*?</\1>", flags=re.I | re.S)
+_OPTIMIZER_OPEN_THINK_RE = re.compile(r"^\s*<(think|thinking|reasoning)>", flags=re.I)
+
+
 def _strip_optimizer_output(text: Any) -> str:
-    """Drop the code fence some models wrap their answer in."""
+    """Reduce a model's answer to the prompt text itself.
+
+    Reasoning models emit a thinking block before the answer, and it must never
+    reach the H3 prompt. Thinking is switched off per format where the backend
+    allows it; this is the backstop for models that ignore that.
+    """
     value = str(text or "").strip()
+    value = _OPTIMIZER_THINK_RE.sub("", value).strip()
+    if _OPTIMIZER_OPEN_THINK_RE.match(value):
+        # An unterminated block means the answer was cut off mid-thought, so
+        # there is no prompt in here at all.
+        return ""
     value = re.sub(r"^```(?:[a-zA-Z]*)\s*", "", value)
     value = re.sub(r"\s*```$", "", value)
     return value.strip()
@@ -1065,6 +1079,10 @@ def _optimizer_gguf_mmproj_path(model_path: str, requested: str, projectors: Map
     return ""
 
 
+def _is_gemma_gguf_name(model_name: str) -> bool:
+    return "gemma" in os.path.basename(str(model_name or "")).lower()
+
+
 def _optimizer_gguf_chat_handler(model_name: str, mmproj_path: str):
     """Pick the llama_cpp vision handler that matches the model family.
 
@@ -1088,8 +1106,20 @@ def _optimizer_gguf_chat_handler(model_name: str, mmproj_path: str):
         handler = getattr(llama_chat_format, name, None)
         if handler is None:
             continue
+        kwargs: dict[str, Any] = {"clip_model_path": mmproj_path, "verbose": False}
+        # Qwen-style handlers reason by default; the optimizer only wants the
+        # prompt text. Gemma's handler rejects the flag, and older builds of the
+        # others do not know it either, hence the retry without it.
+        if not _is_gemma_gguf_name(model_name):
+            kwargs["force_reasoning"] = False
         try:
-            return handler(clip_model_path=mmproj_path, verbose=False)
+            return handler(**kwargs)
+        except TypeError:
+            kwargs.pop("force_reasoning", None)
+            try:
+                return handler(**kwargs)
+            except Exception as exc:
+                logging.warning("MiniMax H3 Easy: %s could not load the vision projector (%s).", name, exc)
         except Exception as exc:
             logging.warning("MiniMax H3 Easy: %s could not load the vision projector (%s).", name, exc)
     return None
@@ -1175,9 +1205,15 @@ def _optimizer_gguf_json(settings: Mapping[str, Any], system_prompt: str, user_p
     if images and not vision:
         logging.warning("MiniMax H3 Easy: no vision projector for this GGUF; optimizing from text only.")
         images = []
-    content: Any = user_prompt
+    gemma = _is_gemma_gguf_name(str(settings.get("gguf_model") or ""))
+    # Qwen switches reasoning off with an inline token; Gemma has no equivalent
+    # and relies on the handler flag plus the output cleanup. The optimizer's
+    # answer is used as the prompt verbatim, so a thinking block is never wanted.
+    text = user_prompt if gemma else f"/no_think\n{user_prompt}"
+    stop = ["<|turn>", "<|channel>", "<end_of_turn>", "<start_of_turn>"] if gemma else ["<|im_end|>", "<|im_start|>"]
+    content: Any = text
     if images:
-        content = [{"type": "text", "text": user_prompt}, *images]
+        content = [{"type": "text", "text": text}, *images]
     try:
         result = llm.create_chat_completion(
             messages=[
@@ -1188,6 +1224,7 @@ def _optimizer_gguf_json(settings: Mapping[str, Any], system_prompt: str, user_p
             temperature=0.7,
             top_p=0.95,
             seed=0,
+            stop=stop,
         )
     finally:
         if bool(settings.get("gguf_unload_after")):
