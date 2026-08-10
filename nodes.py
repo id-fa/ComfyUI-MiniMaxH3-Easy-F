@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import threading
+import time
 import base64
 import asyncio
 import inspect
@@ -153,6 +154,7 @@ OPTIMIZER_CLIP_DESCRIBE_REQUESTS = {
     "audio": "Describe this reference audio clip.",
 }
 PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized"
+PROMPT_OPTIMIZER_CANCEL_LIMIT = 64
 PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
     "api_format": OPTIMIZER_FORMAT_OPENAI,
@@ -620,9 +622,63 @@ def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
     return base + endpoint
 
 
+def _optimizer_log(message: str, *args: Any) -> None:
+    """Progress lines for a step that can take minutes and shows no UI."""
+    logging.info("MiniMax H3 Easy: " + message, *args)
+
+
+class _OptimizerCancelled(Exception):
+    """The editor asked for this optimization to stop."""
+
+
+_OPTIMIZER_CANCEL_LOCK = threading.RLock()
+_OPTIMIZER_CANCELLED: list[str] = []
+
+
+def _optimizer_cancel(request_id: str) -> bool:
+    """Mark an in-flight optimization as cancelled.
+
+    The id list is capped because a cancel that arrives after its request has
+    already finished has nothing left to clear it.
+    """
+    request_id = str(request_id or "").strip()
+    if not request_id:
+        return False
+    with _OPTIMIZER_CANCEL_LOCK:
+        if request_id not in _OPTIMIZER_CANCELLED:
+            _OPTIMIZER_CANCELLED.append(request_id)
+        del _OPTIMIZER_CANCELLED[:-PROMPT_OPTIMIZER_CANCEL_LIMIT]
+    return True
+
+
+def _optimizer_is_cancelled(request_id: str) -> bool:
+    request_id = str(request_id or "").strip()
+    if not request_id:
+        return False
+    with _OPTIMIZER_CANCEL_LOCK:
+        return request_id in _OPTIMIZER_CANCELLED
+
+
+def _optimizer_forget_cancel(request_id: str) -> None:
+    request_id = str(request_id or "").strip()
+    with _OPTIMIZER_CANCEL_LOCK:
+        while request_id in _OPTIMIZER_CANCELLED:
+            _OPTIMIZER_CANCELLED.remove(request_id)
+
+
+def _optimizer_raise_if_cancelled(request_id: str) -> None:
+    if _optimizer_is_cancelled(request_id):
+        raise _OptimizerCancelled("Prompt optimization was cancelled")
+
+
 def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str, system_prompt: str, user_prompt: str, media_parts: list[dict[str, Any]] | None = None) -> str:
     url = _normalize_optimizer_url(api_url, api_format, model)
     media_parts = list(media_parts or [])
+    started = time.perf_counter()
+    _optimizer_log(
+        "optimizing the prompt via %s (model=%s, guide=%d chars, prompt=%d chars, media parts=%d)",
+        api_format, model or "?", len(system_prompt), len(user_prompt), len(media_parts),
+    )
     if api_format == "gemini":
         headers = {"Content-Type": "application/json", "Accept": "application/json", "x-goog-api-key": api_key}
         # Some Gemini-compatible channels accept the native payload and return
@@ -676,6 +732,7 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
     text = str(text or "").strip()
     if not text:
         raise RuntimeError("Prompt optimization API returned an empty response")
+    _optimizer_log("prompt optimization finished in %.1fs (%d chars)", time.perf_counter() - started, len(text))
     return text
 
 
@@ -997,22 +1054,30 @@ def _optimizer_clip_descriptions(clip, items: list[_MediaInput], labels: Mapping
     lines = []
     ordinals: dict[str, int] = {}
     length = min(int(max_length), OPTIMIZER_CLIP_DESCRIBE_LENGTH)
-    for item in items:
-        request = OPTIMIZER_CLIP_DESCRIBE_REQUESTS.get(item.media_type)
-        if request is None:
-            continue
+    describable = [item for item in items if item.media_type in OPTIMIZER_CLIP_DESCRIBE_REQUESTS]
+    if not describable:
+        return "", 0
+    started = time.perf_counter()
+    _optimizer_log("describing %d connected media with the text encoder", len(describable))
+    for index, item in enumerate(describable, start=1):
+        request = OPTIMIZER_CLIP_DESCRIBE_REQUESTS[item.media_type]
         label = _optimizer_media_label(item, labels, ordinals)
         media, attached = _optimizer_clip_media(clip, [item])
         if not attached:
             # The encoder has no channel for this modality; saying nothing is
             # better than letting the prompt writer imagine the content.
+            _optimizer_log("  %s (%d/%d): skipped, this encoder has no %s channel", label, index, len(describable), item.media_type)
             continue
+        _optimizer_log("  %s (%d/%d): describing the %s...", label, index, len(describable), item.media_type)
+        step = time.perf_counter()
         try:
             description = _optimizer_clip_generate(clip, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, request, length, media)
         except ValueError as exc:
             logging.warning("MiniMax H3 Easy: could not describe %s for the prompt optimizer (%s).", label, exc)
             continue
+        _optimizer_log("  %s (%d/%d): %.1fs, %d chars", label, index, len(describable), time.perf_counter() - step, len(description))
         lines.append(f"{label}: {description}")
+    _optimizer_log("described %d of %d connected media in %.1fs", len(lines), len(describable), time.perf_counter() - started)
     return "\n".join(lines), len(lines)
 
 
@@ -1186,11 +1251,13 @@ def _optimizer_gguf_model(settings: Mapping[str, Any], want_vision: bool):
     }
     if handler is not None:
         kwargs["chat_handler"] = handler
-    logging.info(
-        "MiniMax H3 Easy: loading GGUF prompt optimizer %s (ctx=%d, gpu_layers=%d, vision=%s)",
+    _optimizer_log(
+        "loading GGUF prompt optimizer %s (ctx=%d, gpu_layers=%d, vision=%s)...",
         os.path.basename(model_path), context, gpu_layers, bool(handler),
     )
+    started = time.perf_counter()
     llm = Llama(**kwargs)
+    _optimizer_log("GGUF loaded in %.1fs", time.perf_counter() - started)
     with _OPTIMIZER_GGUF_LOCK:
         _OPTIMIZER_GGUF_STATE["llm"] = llm
         _OPTIMIZER_GGUF_STATE["signature"] = signature
@@ -1198,10 +1265,34 @@ def _optimizer_gguf_model(settings: Mapping[str, Any], want_vision: bool):
     return llm, handler is not None
 
 
-def _optimizer_gguf_json(settings: Mapping[str, Any], system_prompt: str, user_prompt: str, media_parts: list[dict[str, Any]] | None = None) -> str:
+def _optimizer_gguf_stopping_criteria(should_stop):
+    """Wrap the cancel check in what llama-cpp expects, when it supports one."""
+    if should_stop is None:
+        return None
+    try:
+        from llama_cpp import StoppingCriteriaList
+    except ImportError:
+        return None
+    return StoppingCriteriaList([lambda input_ids, logits: bool(should_stop())])
+
+
+def _optimizer_gguf_json(
+    settings: Mapping[str, Any],
+    system_prompt: str,
+    user_prompt: str,
+    media_parts: list[dict[str, Any]] | None = None,
+    should_stop=None,
+) -> str:
     """Run the prompt through a local GGUF and return the rewritten text."""
     images = [part for part in (media_parts or []) if part.get("type") == "image_url"]
+    started = time.perf_counter()
+    # Announced once the model resolves, so a misconfigured run reports the
+    # problem instead of claiming to start. Loading its own progress line.
     llm, vision = _optimizer_gguf_model(settings, bool(images))
+    _optimizer_log(
+        "optimizing the prompt with GGUF %s (guide=%d chars, prompt=%d chars, images=%d)",
+        str(settings.get("gguf_model") or ""), len(system_prompt), len(user_prompt), len(images),
+    )
     if images and not vision:
         logging.warning("MiniMax H3 Easy: no vision projector for this GGUF; optimizing from text only.")
         images = []
@@ -1214,26 +1305,46 @@ def _optimizer_gguf_json(settings: Mapping[str, Any], system_prompt: str, user_p
     content: Any = text
     if images:
         content = [{"type": "text", "text": text}, *images]
+    max_tokens = int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)
+    _optimizer_log("generating (max_tokens=%d, images=%d)...", max_tokens, len(images))
+    step = time.perf_counter()
+    request = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "seed": 0,
+        "stop": stop,
+    }
+    criteria = _optimizer_gguf_stopping_criteria(should_stop)
     try:
-        result = llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-            max_tokens=int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH),
-            temperature=0.7,
-            top_p=0.95,
-            seed=0,
-            stop=stop,
-        )
+        try:
+            result = llm.create_chat_completion(**request, stopping_criteria=criteria) if criteria else llm.create_chat_completion(**request)
+        except TypeError:
+            # Builds without stopping_criteria support run to completion; the
+            # editor has already stopped waiting either way.
+            result = llm.create_chat_completion(**request)
     finally:
         if bool(settings.get("gguf_unload_after")):
             _optimizer_gguf_release()
+    if should_stop is not None and should_stop():
+        raise _OptimizerCancelled("Prompt optimization was cancelled")
+    generated = time.perf_counter() - step
+    usage = result.get("usage") if isinstance(result, Mapping) else None
+    tokens = (usage or {}).get("completion_tokens") if isinstance(usage, Mapping) else None
+    if isinstance(tokens, int) and tokens > 0:
+        _optimizer_log("generated %d tokens in %.1fs (%.1f tok/s)", tokens, generated, tokens / max(generated, 1e-6))
+    else:
+        _optimizer_log("generation finished in %.1fs", generated)
     choices = result.get("choices") if isinstance(result, Mapping) else None
     message = (choices or [{}])[0].get("message") if choices else None
     text = _strip_optimizer_output((message or {}).get("content"))
     if not text:
         raise ValueError("The GGUF model returned an empty prompt")
+    _optimizer_log("prompt optimization finished in %.1fs (%d chars)", time.perf_counter() - started, len(text))
     return text
 
 
@@ -1332,10 +1443,24 @@ def _register_prompt_optimizer_route() -> bool:
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
-    @routes.post("/minimax_h3_easy/prompt_optimize")
-    async def _prompt_optimize(request):
+    @routes.post("/minimax_h3_easy/prompt_optimize_cancel")
+    async def _prompt_optimize_cancel(request):
         try:
             payload = await request.json()
+            request_id = str((payload or {}).get("request_id") or "")
+            if not _optimizer_cancel(request_id):
+                return web.json_response({"ok": False, "error": "A request id is required"}, status=400)
+            _optimizer_log("cancel requested for prompt optimization %s", request_id)
+            return web.json_response({"ok": True})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    @routes.post("/minimax_h3_easy/prompt_optimize")
+    async def _prompt_optimize(request):
+        request_id = ""
+        try:
+            payload = await request.json()
+            request_id = str(payload.get("request_id") or "")
             prompt = str(payload.get("prompt") or "")
             settings = _read_prompt_optimizer_config()
             api_key = str(settings.get("api_key") or "")
@@ -1370,13 +1495,32 @@ def _register_prompt_optimizer_route() -> bool:
             parts_format = OPTIMIZER_FORMAT_OPENAI if local else api_format
             media_parts = _optimizer_media_parts(resources, parts_format) if bool(settings.get("read_media")) else []
             system = _optimizer_system_prompt(scene_guide, mode, seconds, counts, len(media_parts))
+            _optimizer_raise_if_cancelled(request_id)
             if local:
-                result = await asyncio.to_thread(_optimizer_gguf_json, settings, system, prompt, media_parts)
+                # The GGUF loop polls this, so cancelling actually stops the
+                # generation instead of only freeing the editor.
+                result = await asyncio.to_thread(
+                    _optimizer_gguf_json, settings, system, prompt, media_parts,
+                    (lambda: _optimizer_is_cancelled(request_id)) if request_id else None,
+                )
             else:
                 result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
+            # An HTTP request cannot be interrupted mid-flight, so a late cancel
+            # is honoured by throwing the answer away.
+            _optimizer_raise_if_cancelled(request_id)
             return web.json_response({"ok": True, "prompt": result})
+        except _OptimizerCancelled as exc:
+            _optimizer_log("prompt optimization cancelled")
+            return web.json_response({"ok": False, "cancelled": True, "error": str(exc)}, status=409)
+        except asyncio.CancelledError:
+            # The editor went away (tab closed, page reloaded). Stop the work
+            # the same way an explicit cancel would.
+            _optimizer_cancel(request_id)
+            raise
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
+        finally:
+            _optimizer_forget_cancel(request_id)
 
     _register_prompt_optimizer_route._registered = True
     return True
@@ -2024,6 +2168,9 @@ class MiniMaxH3Easy:
         if isinstance(pending, str):
             pending = pending.strip().lower() in {"1", "true", "yes", "on"}
         if not bool(pending):
+            # Says why the encoder stayed idle on a run the user expected it to
+            # work: the tab already holds an optimized prompt.
+            _optimizer_log("the Optimized field already holds a prompt; keeping it instead of optimizing again")
             return None, None
 
         counts = {"image": 0, "video": 0, "audio": 0}
@@ -2039,11 +2186,22 @@ class MiniMaxH3Easy:
             source = str(text or "")
             if not source.strip():
                 return source
+            started = time.perf_counter()
+            _optimizer_log(
+                "optimizing the prompt with the connected text encoder (mode=%s, guide=%s, media=%d, read media=%s)",
+                mode, scene_guide, len(items), "on" if read_media else "off",
+            )
             # Reference videos are decoded again here; that is the price of
             # showing them to the encoder, so it only happens when asked.
             described, count = _optimizer_clip_descriptions(clip, items, labels, max_length) if read_media else ("", 0)
             system = _optimizer_system_prompt(scene_guide, mode, float(seconds), counts, 0, count)
+            _optimizer_log("writing the final prompt (guide=%d chars, descriptions=%d)...", len(system), count)
+            step = time.perf_counter()
             optimized = _optimizer_clip_generate(clip, system, source, max_length, None, described)
+            _optimizer_log(
+                "prompt optimization finished in %.1fs (final pass %.1fs, %d chars)",
+                time.perf_counter() - started, time.perf_counter() - step, len(optimized),
+            )
             result.append(optimized)
             return optimized
 

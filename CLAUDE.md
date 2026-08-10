@@ -169,6 +169,12 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   handler class, whose name varies per llama-cpp build/fork, so `_optimizer_gguf_chat_handler` probes
   candidates by model-name family and degrades to text-only. llama-cpp takes the same OpenAI-shaped
   `image_url` parts, so `_optimizer_media_parts(..., "openai")` is reused verbatim.
+- The editor-driven formats can be stopped: `✦` becomes a stop button while pending, aborting the fetch
+  and calling `POST /minimax_h3_easy/prompt_optimize_cancel` with the request id it generated. The id
+  registry (`_optimizer_cancel` / `_optimizer_is_cancelled`, capped) is polled by the GGUF loop through
+  llama-cpp's `stopping_criteria`, which is the only path that truly interrupts work; urllib cannot be
+  interrupted, so an HTTP answer that arrives after a cancel is discarded instead. A client disconnect
+  raises `asyncio.CancelledError` in the route and is treated as a cancel.
 - Reasoning is always off — the answer *is* the prompt. Each backend suppresses it its own way (`clip`:
   `thinking=False`; `gguf`: `/no_think` for Qwen, `force_reasoning=False` on the handler, family-specific
   `stop` markers), and `_strip_optimizer_output` removes any leading think block as the shared backstop.

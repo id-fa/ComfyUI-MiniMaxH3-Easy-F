@@ -158,6 +158,8 @@ const TEXT = {
     optimizerMissing: ZH_BROWSER ? "\u8bf7\u5148\u6253\u5f00 API \u8bbe\u7f6e\u5e76\u586b\u5199 API \u5730\u5740\u3001API Key \u548c\u6a21\u578b\u540d\u3002" : "Open API settings and enter the API URL, API key, and model first.",
     optimizerFailed: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u5931\u8d25" : "Prompt optimization failed",
     optimizerRunning: ZH_BROWSER ? "\u6b63\u5728\u4f18\u5316" : "Optimizing",
+    optimizerStop: ZH_BROWSER ? "\u505c\u6b62\u63d0\u793a\u8bcd\u4f18\u5316" : "Stop prompt optimization",
+    optimizerCancelled: ZH_BROWSER ? "\u5df2\u505c\u6b62\u63d0\u793a\u8bcd\u4f18\u5316" : "Prompt optimization stopped",
     optimizerDone: ZH_BROWSER ? "\u4f18\u5316\u5b8c\u6210" : "Optimization complete",
     optimizerError: ZH_BROWSER ? "\u4f18\u5316\u5931\u8d25" : "Optimization failed",
     promptExternalConnected: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u6765\u81ea\u5916\u90e8\u6587\u672c\u8fde\u63a5" : "Prompt supplied by external text input",
@@ -3544,7 +3546,7 @@ function syncPromptTabStrip(node) {
     // Typing runs a sync on every keystroke, so the strip is only rebuilt when
     // something it actually shows changed. That also keeps an in-progress
     // rename and the horizontal scroll position alive.
-    const signature = `${active}/${tabs.length}/${tabs.map((tab) => tab.label).join(" ")}`;
+    const signature = `${active}/${tabs.length}/${tabs.map((tab) => tab.label).join("\u0000")}`;
     if (strip.__h3TabSignature === signature) return;
     strip.__h3TabSignature = signature;
     strip.textContent = "";
@@ -4248,13 +4250,21 @@ function syncPromptOptimizerButton(node) {
     const external = promptInputIsConnected(node);
     const pending = Boolean(node.__h3OptimizerPending);
     const locked = external || pending;
-    button.title = external ? TEXT.promptExternalConnected : clip ? TEXT.optimizerDeferred : TEXT.optimizePrompt;
+    // While a request is running the same button stops it, so a slow API call
+    // or a local generation is never something the user has to sit through.
+    button.textContent = pending ? "\u25a0" : "\u2726";
+    button.title = external
+        ? TEXT.promptExternalConnected
+        : pending
+            ? TEXT.optimizerStop
+            : clip ? TEXT.optimizerDeferred : TEXT.optimizePrompt;
     button.setAttribute("aria-label", button.title);
     button.classList.toggle("is-configured", configured);
     button.classList.toggle("is-loading", pending);
+    button.classList.toggle("is-stop", pending);
     button.classList.toggle("is-external", external);
     button.setAttribute("aria-disabled", external ? "true" : "false");
-    button.disabled = pending || external;
+    button.disabled = external;
     const wrap = node?.__h3EditorWrap;
     for (const editor of promptEditors(node)) {
         editor.contentEditable = locked ? "false" : "true";
@@ -4366,7 +4376,11 @@ async function optimizePromptFromEditor(node) {
     const resources = promptOptimizerResources(node);
     const mediaCounts = { image: 0, video: 0, audio: 0 };
     resources.forEach((item) => { mediaCounts[item.type] = (mediaCounts[item.type] || 0) + 1; });
+    const requestId = `${node.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
     node.__h3OptimizerPending = true;
+    node.__h3OptimizerRequestId = requestId;
+    node.__h3OptimizerAbort = controller;
     node.__h3OptimizerStartedAt = globalThis.performance?.now?.() || Date.now();
     setPromptOptimizerStatus(node, "loading");
     syncPromptOptimizerButton(node);
@@ -4374,7 +4388,9 @@ async function optimizePromptFromEditor(node) {
         const response = await api.fetchApi("/minimax_h3_easy/prompt_optimize", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: controller?.signal,
             body: JSON.stringify({
+                request_id: requestId,
                 prompt: sourcePrompt,
                 scene_guide: state.scene_guide,
                 mode: canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE)),
@@ -4384,16 +4400,45 @@ async function optimizePromptFromEditor(node) {
             }),
         });
         const data = await response.json().catch(() => ({}));
+        if (data?.cancelled) throw new DOMException("cancelled", "AbortError");
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
         setPromptFromOptimizedText(node, String(data.prompt || ""));
         setPromptOptimizerStatus(node, "success");
     } catch (error) {
-        setPromptOptimizerStatus(node, "error");
-        notifyPromptOptimizer(error?.message || error);
+        if (error?.name === "AbortError") {
+            // Stopping is something the user asked for, not a failure.
+            setPromptOptimizerStatus(node, "idle");
+        } else {
+            setPromptOptimizerStatus(node, "error");
+            notifyPromptOptimizer(error?.message || error);
+        }
     } finally {
         node.__h3OptimizerPending = false;
+        node.__h3OptimizerRequestId = "";
+        node.__h3OptimizerAbort = null;
         syncPromptOptimizerButton(node);
     }
+}
+
+function cancelPromptOptimization(node) {
+    if (!node?.__h3OptimizerPending) return;
+    const requestId = node.__h3OptimizerRequestId;
+    // Tell the server first: it stops a local GGUF mid-generation, and the
+    // abort below only stops this browser from waiting.
+    if (requestId) {
+        api.fetchApi("/minimax_h3_easy/prompt_optimize_cancel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ request_id: requestId }),
+        }).catch(() => {});
+    }
+    node.__h3OptimizerAbort?.abort?.();
+    node.__h3OptimizerPending = false;
+    node.__h3OptimizerAbort = null;
+    node.__h3OptimizerRequestId = "";
+    setPromptOptimizerStatus(node, "idle");
+    syncPromptOptimizerButton(node);
+    notifyPromptOptimizer(TEXT.optimizerCancelled, "info");
 }
 
 function syncPromptFieldLabels(node) {
@@ -5231,7 +5276,8 @@ function ensurePromptEditor(node) {
     optimizeButton.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        optimizePromptFromEditor(node);
+        if (node.__h3OptimizerPending) cancelPromptOptimization(node);
+        else optimizePromptFromEditor(node);
     });
     editorTools.append(optimizeButton, viewButton);
     wrap.addEventListener("pointerdown", (event) => {
@@ -5715,6 +5761,8 @@ function installNode(nodeType, nodeData) {
     const originalRemoved = nodeType.prototype.onRemoved;
     nodeType.prototype.onRemoved = function onRemovedH3Easy() {
         if (Array.isArray(this.size) && this.size.length >= 2) this.__h3EditorStableSize = [...this.size];
+        // A request still in flight has nowhere to put its answer now.
+        if (this.__h3OptimizerPending) cancelPromptOptimization(this);
         clearPromptOptimizerStatusTimers(this);
         closeMentionMenu(this);
         if (this.__h3PromptInstallRetry) clearTimeout(this.__h3PromptInstallRetry);
@@ -5933,6 +5981,13 @@ function install() {
       }
       .h3-prompt-editor-tool.is-configured { opacity: .46; }
       .h3-prompt-editor-tool.is-loading { opacity: .64; animation: h3-prompt-tool-pulse .8s ease-in-out infinite alternate; }
+      .h3-prompt-editor-tool.is-stop {
+        opacity: .82; color: rgba(255,155,155,.95); background: rgba(255,110,110,.08); border-color: rgba(255,110,110,.22);
+        animation: none;
+      }
+      .h3-prompt-editor-tool.is-stop:hover, .h3-prompt-editor-tool.is-stop:focus-visible {
+        opacity: 1; background: rgba(255,110,110,.16); border-color: rgba(255,110,110,.4);
+      }
       .h3-prompt-editor-tool:disabled, .h3-prompt-editor-tool.is-external { opacity: .16; cursor: not-allowed; pointer-events: none; }
       @keyframes h3-prompt-tool-pulse { from { transform: scale(.88); } to { transform: scale(1.06); } }
       .h3-mention-chip {

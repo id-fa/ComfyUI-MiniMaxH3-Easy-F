@@ -72,6 +72,22 @@ This replaces the **Re-optimization** section of the upstream README.
 Upstream instead inferred the source prompt by comparing the editor text with
 the previous optimizer result; that heuristic is removed.
 
+### Stopping a running optimization
+
+While a request is running, `✦` turns into a stop button (`■`). Pressing it ends
+the wait immediately and leaves the prompt untouched — no error is reported,
+since stopping is a choice rather than a failure. Closing the tab or removing
+the node stops it the same way.
+
+How much actually stops depends on the format:
+
+- **GGUF** — generation stops mid-run, so the model releases the GPU right away.
+- **OpenAI-compatible / Gemini** — an HTTP request already in flight cannot be
+  interrupted, so the remote call finishes and may still be billed. Its answer
+  is discarded.
+- **Text encoder (clip input)** — no stop button, because it runs inside the
+  workflow; use ComfyUI's own cancel instead.
+
 ### Editor details
 
 - `@` media references, `#` dialogue blocks, and the `</>` raw prompt view work
