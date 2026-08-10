@@ -158,9 +158,17 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
 - Settings are **installation-global** (`prompt_optimizer.json`), not per-node; only
   `prompt_optimizer_scene_guide` is a saved node widget. The `prompt_optimizer_settings` boolean is a
   momentary trigger that the frontend resets to `false` and `graphToPrompt` always forces to `false`.
-- Three `api_format`s: OpenAI-compatible chat completions, Gemini native `generateContent`, and `clip`.
-  URL handling for the HTTP pair is forgiving (`_normalize_optimizer_url` appends/strips endpoints, injects
-  the Gemini model path and `key=`).
+- Four `api_format`s: OpenAI-compatible chat completions, Gemini native `generateContent`, `clip`, and
+  `gguf`. URL handling for the HTTP pair is forgiving (`_normalize_optimizer_url` appends/strips
+  endpoints, injects the Gemini model path and `key=`).
+- `gguf` loads a local model with llama-cpp-python and therefore runs from the **editor route**, like the
+  HTTP formats — only `clip` has to wait for execution. `_optimizer_gguf_catalog` scans `text_encoders`
+  and `LLM` (the folders ComfyUI-QwenVL-F uses) and `GET /minimax_h3_easy/gguf_models` feeds the dropdown.
+  The loaded `Llama` is cached in `_OPTIMIZER_GGUF_STATE` keyed by (model, mmproj, ctx, gpu layers) and
+  released when that changes or when `gguf_unload_after` is set. Vision needs an mmproj plus a chat
+  handler class, whose name varies per llama-cpp build/fork, so `_optimizer_gguf_chat_handler` probes
+  candidates by model-name family and degrades to text-only. llama-cpp takes the same OpenAI-shaped
+  `image_url` parts, so `_optimizer_media_parts(..., "openai")` is reused verbatim.
 - `clip` runs locally through the node's optional `optimizer_clip` CLIP input using ComfyUI's
   `clip.tokenize` → `clip.generate` → `clip.decode` (same as the built-in `TextGenerate` node). That object
   only exists during execution, so the HTTP route rejects this format and `MiniMaxH3Easy.generate` does the

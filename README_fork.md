@@ -220,3 +220,65 @@ are stored in the same shared `prompt_optimizer.json`.
 
 `nodes.py` and `web/minimax_h3_easy_ui.js`. This one adds a node input, so
 **ComfyUI must be restarted**, not just refreshed.
+
+---
+
+## Prompt optimization with a GGUF model
+
+**Prompt optimization settings → API format** gains a fourth choice:
+
+> **GGUF (llama-cpp-python)**
+
+It rewrites the prompt with a GGUF model loaded through
+[llama-cpp-python](https://github.com/abetlen/llama-cpp-python), so no API URL,
+API key, or network access is involved. Unlike the text encoder format, the
+model is loaded by the node itself, so `✦` works immediately in the editor —
+nothing has to be queued.
+
+### Models
+
+Any `.gguf` under **`models/text_encoders`** or **`models/LLM`** is offered,
+including subfolders and any extra roots `extra_model_paths.yaml` maps to those
+keys. These are the same folders
+[ComfyUI-QwenVL-F](https://github.com/id-fa/ComfyUI-QwenVL-F) scans, so a model
+installed for one is found by the other.
+
+`llama-cpp-python` is **not** installed by this node. If it is missing, the
+optimizer says so instead of failing obscurely.
+
+### Settings
+
+Selecting this format replaces the API rows with:
+
+- **GGUF model** — the file to load, from the scan above.
+- **Vision projector (mmproj)** — `Auto` picks the first `*mmproj*.gguf` sitting
+  next to the model; `None` disables vision; or name a file explicitly. Only
+  used when **Read connected media** is on.
+- **Context length** — `n_ctx`, default `16384`. The H3 Prompt Guide bundle is
+  large (roughly 18–45 KB depending on mode and scene guide), so a small context
+  will truncate it.
+- **GPU layers** — `n_gpu_layers`, default `-1` (all layers on the GPU).
+- **Max generated tokens** — shared with the text encoder format.
+- **Unload the model after use** — frees it as soon as the prompt comes back,
+  instead of keeping it resident for the next click.
+
+The model stays loaded between optimizations and is released automatically when
+any of these settings change.
+
+### Connected media
+
+**Read connected media** attaches the connected images exactly as the
+OpenAI-compatible format does, since llama-cpp takes the same message shape.
+This needs a multimodal GGUF **and** its mmproj projector; the handler is chosen
+from the model's filename (Qwen, Gemma, MiniCPM, LLaVA) against whatever
+`llama_cpp.llama_chat_format` provides in the installed build. With no projector
+resolved, the prompt is optimized from text alone and a warning is logged.
+
+Video and audio references are not sent — only images, matching the
+OpenAI-compatible format.
+
+### Scope
+
+`nodes.py` and `web/minimax_h3_easy_ui.js`. Adds
+`GET /minimax_h3_easy/gguf_models` for the model dropdown. Python changed, so
+**restart ComfyUI**.

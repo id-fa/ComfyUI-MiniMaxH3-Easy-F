@@ -21,20 +21,32 @@ const PROMPT_TAB_LABEL_LIMIT = 24;
 const PROMPT_TAB_LIMIT = 20;
 const PROMPT_OPTIMIZER_SETTINGS_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_settings";
 const PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized";
+const PROMPT_OPTIMIZER_GGUF_ENDPOINT = "/minimax_h3_easy/gguf_models";
 const OPTIMIZER_FORMAT_OPENAI = "openai";
 const OPTIMIZER_FORMAT_GEMINI = "gemini";
 const OPTIMIZER_FORMAT_CLIP = "clip";
-const OPTIMIZER_FORMATS = [OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_CLIP];
-const CLIP_MAX_LENGTH_DEFAULT = 1024;
-const CLIP_MIN_LENGTH = 16;
-const CLIP_MAX_LENGTH_LIMIT = 32768;
+const OPTIMIZER_FORMAT_GGUF = "gguf";
+const OPTIMIZER_FORMATS = [OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_CLIP, OPTIMIZER_FORMAT_GGUF];
+const LOCAL_MAX_LENGTH_DEFAULT = 1024;
+const LOCAL_MIN_LENGTH = 16;
+const LOCAL_MAX_LENGTH_LIMIT = 32768;
+const GGUF_MMPROJ_AUTO = "auto";
+const GGUF_MMPROJ_NONE = "none";
+const GGUF_CONTEXT_DEFAULT = 16384;
+const GGUF_CONTEXT_MIN = 512;
+const GGUF_CONTEXT_LIMIT = 1048576;
 const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     api_format: OPTIMIZER_FORMAT_OPENAI,
     api_url: "",
     api_key: "",
     model: "",
     read_media: false,
-    clip_max_length: CLIP_MAX_LENGTH_DEFAULT,
+    local_max_length: LOCAL_MAX_LENGTH_DEFAULT,
+    gguf_model: "",
+    gguf_mmproj: GGUF_MMPROJ_AUTO,
+    gguf_context: GGUF_CONTEXT_DEFAULT,
+    gguf_gpu_layers: -1,
+    gguf_unload_after: false,
 });
 let promptOptimizerSettingsCache = { ...PROMPT_OPTIMIZER_SETTINGS_DEFAULTS };
 let promptOptimizerSettingsLoaded = false;
@@ -118,7 +130,19 @@ const TEXT = {
     apiUrl: ZH_BROWSER ? "API \u5730\u5740" : "API URL",
     apiKey: "API Key",
     apiModel: ZH_BROWSER ? "\u6a21\u578b\u540d" : "Model",
-    clipMaxLength: ZH_BROWSER ? "\u751f\u6210\u4e0a\u9650 (tokens)" : "Max generated tokens",
+    localMaxLength: ZH_BROWSER ? "\u751f\u6210\u4e0a\u9650 (tokens)" : "Max generated tokens",
+    ggufModel: ZH_BROWSER ? "GGUF \u6a21\u578b" : "GGUF model",
+    ggufMmproj: ZH_BROWSER ? "\u89c6\u89c9\u6295\u5f71 (mmproj)" : "Vision projector (mmproj)",
+    ggufContext: ZH_BROWSER ? "\u4e0a\u4e0b\u6587\u957f\u5ea6" : "Context length",
+    ggufGpuLayers: ZH_BROWSER ? "GPU \u5c42\u6570 (-1 = \u5168\u90e8)" : "GPU layers (-1 = all)",
+    ggufUnload: ZH_BROWSER ? "\u7528\u5b8c\u540e\u5378\u8f7d\u6a21\u578b" : "Unload the model after use",
+    ggufAuto: ZH_BROWSER ? "\u81ea\u52a8\uff08\u6a21\u578b\u65c1\u7684 mmproj\uff09" : "Auto (mmproj next to the model)",
+    ggufNone: ZH_BROWSER ? "\u4e0d\u4f7f\u7528" : "None",
+    ggufEmpty: ZH_BROWSER ? "\u672a\u627e\u5230 .gguf \u6587\u4ef6" : "No .gguf file found",
+    ggufMissing: ZH_BROWSER ? "\u8bf7\u5148\u5728\u8bbe\u7f6e\u4e2d\u9009\u62e9 GGUF \u6a21\u578b\u3002" : "Select a GGUF model in the settings first.",
+    ggufHint: ZH_BROWSER
+        ? "\u901a\u8fc7 llama-cpp-python \u52a0\u8f7d models/text_encoders \u6216 models/LLM \u4e0b\u7684 GGUF \u6a21\u578b\uff0c\u4e0d\u9700\u8981 API\u3002\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53\u9700\u8981\u914d\u5957\u7684 mmproj \u89c6\u89c9\u6295\u5f71\u6587\u4ef6\u3002"
+        : "Loads a GGUF from models/text_encoders or models/LLM through llama-cpp-python; no API involved. Reading connected media needs a matching mmproj vision projector.",
     optimizerClip: ZH_BROWSER ? "\u4f18\u5316\u5668\u6587\u672c\u7f16\u7801\u5668" : "Optimizer text encoder",
     optimizerClipHint: ZH_BROWSER
         ? "\u4f7f\u7528\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u7684\u6587\u672c\u7f16\u7801\u5668\u3002\u8be5\u7f16\u7801\u5668\u53ea\u5728\u5de5\u4f5c\u6d41\u8fd0\u884c\u65f6\u5b58\u5728\uff0c\u56e0\u6b64\u63d0\u793a\u8bcd\u4f18\u5316\u4f1a\u5728\u961f\u5217\u6267\u884c\u65f6\u8fdb\u884c\uff0c\u800c\u4e0d\u662f\u70b9\u51fb\u65f6\u3002\u5f00\u542f\u4e0b\u65b9\u5f00\u5173\u540e\uff0c\u6bcf\u4e2a\u5df2\u8fde\u63a5\u7d20\u6750\u4f1a\u5148\u7531\u8be5\u7f16\u7801\u5668\u9010\u4e2a\u751f\u6210\u63cf\u8ff0\uff0c\u518d\u4f5c\u4e3a\u6587\u672c\u968f\u63d0\u793a\u8bcd\u4e00\u8d77\u4f7f\u7528\u3002"
@@ -201,6 +225,7 @@ const OPTION_DEFS = {
         openai: ZH_BROWSER ? "OpenAI \u517c\u5bb9" : "OpenAI Compatible",
         gemini: ZH_BROWSER ? "Gemini \u539f\u751f" : "Gemini Native",
         clip: ZH_BROWSER ? "\u6587\u672c\u7f16\u7801\u5668\uff08clip \u8f93\u5165\uff09" : "Text encoder (clip input)",
+        gguf: ZH_BROWSER ? "GGUF\uff08llama-cpp-python\uff09" : "GGUF (llama-cpp-python)",
     },
     prompt_optimizer_scene_guide: {
         none: ZH_BROWSER ? "\u4ec5\u901a\u7528\u65b9\u6848" : "General only",
@@ -3670,22 +3695,46 @@ function normalizePromptOptimizerSettings(value) {
     const source = value && typeof value === "object" ? value : {};
     const requested = String(source.api_format || OPTIMIZER_FORMAT_OPENAI).toLowerCase();
     const apiFormat = OPTIMIZER_FORMATS.includes(requested) ? requested : OPTIMIZER_FORMAT_OPENAI;
-    const rawLength = Number(source.clip_max_length);
-    const clipMaxLength = Number.isFinite(rawLength)
-        ? Math.min(CLIP_MAX_LENGTH_LIMIT, Math.max(CLIP_MIN_LENGTH, Math.round(rawLength)))
-        : CLIP_MAX_LENGTH_DEFAULT;
+    const clamp = (raw, fallback, low, high) => {
+        const number = Number(raw);
+        return Number.isFinite(number) ? Math.min(high, Math.max(low, Math.round(number))) : fallback;
+    };
     return {
         api_format: apiFormat,
         api_url: String(source.api_url || "").trim(),
         api_key: String(source.api_key || ""),
         model: String(source.model || "").trim(),
         read_media: asBoolean(source.read_media, false),
-        clip_max_length: clipMaxLength,
+        // Named clip_max_length before the GGUF format shared the setting.
+        local_max_length: clamp(
+            source.local_max_length ?? source.clip_max_length,
+            LOCAL_MAX_LENGTH_DEFAULT, LOCAL_MIN_LENGTH, LOCAL_MAX_LENGTH_LIMIT,
+        ),
+        gguf_model: String(source.gguf_model || "").trim(),
+        gguf_mmproj: String(source.gguf_mmproj || GGUF_MMPROJ_AUTO).trim() || GGUF_MMPROJ_AUTO,
+        gguf_context: clamp(source.gguf_context, GGUF_CONTEXT_DEFAULT, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT),
+        gguf_gpu_layers: clamp(source.gguf_gpu_layers, -1, -1, 1024),
+        gguf_unload_after: asBoolean(source.gguf_unload_after, false),
     };
 }
 
 function isClipOptimizerFormat(value) {
     return String(value || "").toLowerCase() === OPTIMIZER_FORMAT_CLIP;
+}
+
+function isGgufOptimizerFormat(value) {
+    return String(value || "").toLowerCase() === OPTIMIZER_FORMAT_GGUF;
+}
+
+async function loadGgufModelCatalog() {
+    const response = await api.fetchApi(PROMPT_OPTIMIZER_GGUF_ENDPOINT);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+    return {
+        models: Array.isArray(data.models) ? data.models : [],
+        mmproj: Array.isArray(data.mmproj) ? data.mmproj : [],
+        roots: Array.isArray(data.roots) ? data.roots : [],
+    };
 }
 
 function optimizerClipInputSlot(node) {
@@ -3755,7 +3804,7 @@ function makePromptOptimizerSettingsRow(labelText, control) {
     return row;
 }
 
-function makePromptOptimizerSelect(initialValue, onChange = null) {
+function makePromptOptimizerSelect(initialValue, onChange = null, optionList = null) {
     const root = document.createElement("div");
     root.className = "h3-optimizer-settings-select-wrap";
     const trigger = document.createElement("button");
@@ -3771,8 +3820,9 @@ function makePromptOptimizerSelect(initialValue, onChange = null) {
     menu.className = "h3-optimizer-settings-select-menu";
     menu.setAttribute("role", "listbox");
     menu.hidden = true;
-    const options = Object.entries(OPTION_DEFS.prompt_optimizer_api_format).map(([value, label]) => ({ value, label }));
-    trigger.value = options.some((item) => item.value === initialValue) ? initialValue : options[0]?.value || "openai";
+    const options = optionList
+        || Object.entries(OPTION_DEFS.prompt_optimizer_api_format).map(([value, label]) => ({ value, label }));
+    trigger.value = options.some((item) => item.value === initialValue) ? initialValue : options[0]?.value || "";
     let activeIndex = Math.max(0, options.findIndex((item) => item.value === trigger.value));
 
     const close = () => {
@@ -3853,6 +3903,26 @@ function makePromptOptimizerSelect(initialValue, onChange = null) {
     });
     root.focus = () => trigger.focus();
     root.__h3CloseMenu = close;
+    // Lets a caller swap in options that are only known after a fetch.
+    root.setOptions = (next) => {
+        options.length = 0;
+        options.push(...next);
+        menu.textContent = "";
+        options.forEach((item, index) => {
+            const option = document.createElement("button");
+            option.type = "button";
+            option.className = "h3-optimizer-settings-select-option";
+            option.dataset.value = item.value;
+            option.setAttribute("role", "option");
+            option.textContent = item.label;
+            option.addEventListener("click", () => choose(item.value));
+            option.addEventListener("pointerenter", () => { activeIndex = index; });
+            menu.append(option);
+        });
+        if (!options.some((item) => item.value === trigger.value)) trigger.value = options[0]?.value || "";
+        activeIndex = Math.max(0, options.findIndex((item) => item.value === trigger.value));
+        render();
+    };
     render();
     return root;
 }
@@ -3935,13 +4005,33 @@ async function openPromptOptimizerSettings(node) {
     model.type = "text";
     model.autocomplete = "off";
     model.value = promptOptimizerSettingsCache.model;
-    const clipMaxLength = document.createElement("input");
-    clipMaxLength.className = "h3-optimizer-settings-control";
-    clipMaxLength.type = "number";
-    clipMaxLength.min = String(CLIP_MIN_LENGTH);
-    clipMaxLength.max = String(CLIP_MAX_LENGTH_LIMIT);
-    clipMaxLength.step = "16";
-    clipMaxLength.value = String(promptOptimizerSettingsCache.clip_max_length);
+    const makeNumberInput = (value, min, max, step) => {
+        const input = document.createElement("input");
+        input.className = "h3-optimizer-settings-control";
+        input.type = "number";
+        input.min = String(min);
+        input.max = String(max);
+        input.step = String(step);
+        input.value = String(value);
+        return input;
+    };
+    const localMaxLength = makeNumberInput(promptOptimizerSettingsCache.local_max_length, LOCAL_MIN_LENGTH, LOCAL_MAX_LENGTH_LIMIT, 16);
+    const ggufContext = makeNumberInput(promptOptimizerSettingsCache.gguf_context, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT, 512);
+    const ggufGpuLayers = makeNumberInput(promptOptimizerSettingsCache.gguf_gpu_layers, -1, 1024, 1);
+    const ggufModel = makePromptOptimizerSelect(promptOptimizerSettingsCache.gguf_model, null, [
+        { value: promptOptimizerSettingsCache.gguf_model, label: promptOptimizerSettingsCache.gguf_model || TEXT.ggufEmpty },
+    ]);
+    const ggufMmproj = makePromptOptimizerSelect(promptOptimizerSettingsCache.gguf_mmproj, null, [
+        { value: GGUF_MMPROJ_AUTO, label: TEXT.ggufAuto },
+        { value: GGUF_MMPROJ_NONE, label: TEXT.ggufNone },
+    ]);
+    const ggufUnloadLabel = document.createElement("div");
+    ggufUnloadLabel.className = "h3-optimizer-settings-check";
+    const ggufUnload = makePromptOptimizerSwitch(promptOptimizerSettingsCache.gguf_unload_after);
+    ggufUnload.setAttribute("aria-label", TEXT.ggufUnload);
+    const ggufUnloadText = document.createElement("span");
+    ggufUnloadText.textContent = TEXT.ggufUnload;
+    ggufUnloadLabel.append(ggufUnloadText, ggufUnload);
     const readMediaLabel = document.createElement("div");
     readMediaLabel.className = "h3-optimizer-settings-check";
     const readMedia = makePromptOptimizerSwitch(promptOptimizerSettingsCache.read_media);
@@ -3949,29 +4039,66 @@ async function openPromptOptimizerSettings(node) {
     const readMediaText = document.createElement("span");
     readMediaText.textContent = TEXT.readMedia;
     readMediaLabel.append(readMediaText, readMedia);
-    const clipHint = document.createElement("p");
-    clipHint.className = "h3-optimizer-settings-hint";
-    clipHint.textContent = TEXT.optimizerClipHint;
+    const hint = document.createElement("p");
+    hint.className = "h3-optimizer-settings-hint";
     const apiUrlRow = makePromptOptimizerSettingsRow(TEXT.apiUrl, apiUrl);
     const apiKeyRow = makePromptOptimizerSettingsRow(TEXT.apiKey, apiKey);
     const modelRow = makePromptOptimizerSettingsRow(TEXT.apiModel, model);
-    const clipMaxLengthRow = makePromptOptimizerSettingsRow(TEXT.clipMaxLength, clipMaxLength);
+    const localMaxLengthRow = makePromptOptimizerSettingsRow(TEXT.localMaxLength, localMaxLength);
+    const ggufModelRow = makePromptOptimizerSettingsRow(TEXT.ggufModel, ggufModel);
+    const ggufMmprojRow = makePromptOptimizerSettingsRow(TEXT.ggufMmproj, ggufMmproj);
+    const ggufContextRow = makePromptOptimizerSettingsRow(TEXT.ggufContext, ggufContext);
+    const ggufGpuLayersRow = makePromptOptimizerSettingsRow(TEXT.ggufGpuLayers, ggufGpuLayers);
     form.append(
         makePromptOptimizerSettingsRow(TEXT.apiFormat, apiFormat),
-        clipHint,
+        hint,
         apiUrlRow,
         apiKeyRow,
         modelRow,
-        clipMaxLengthRow,
+        ggufModelRow,
+        ggufMmprojRow,
+        ggufContextRow,
+        ggufGpuLayersRow,
+        localMaxLengthRow,
+        ggufUnloadLabel,
         readMediaLabel,
     );
-    // The HTTP credentials and the local generation limit never apply at the
-    // same time, so only the rows the selected format uses stay visible.
+    // Each format uses a different half of this form, so only its own rows stay
+    // visible. Read connected media applies to all of them.
     const syncFormatRows = () => {
-        const local = isClipOptimizerFormat(apiFormat.value);
+        const clip = isClipOptimizerFormat(apiFormat.value);
+        const gguf = isGgufOptimizerFormat(apiFormat.value);
+        const local = clip || gguf;
         for (const row of [apiUrlRow, apiKeyRow, modelRow]) row.hidden = local;
-        clipMaxLengthRow.hidden = !local;
-        clipHint.hidden = !local;
+        for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadLabel]) row.hidden = !gguf;
+        localMaxLengthRow.hidden = !local;
+        hint.hidden = !local;
+        hint.textContent = gguf ? TEXT.ggufHint : TEXT.optimizerClipHint;
+        if (gguf) refreshGgufOptions();
+    };
+    // The catalog is only worth fetching once the GGUF format is selected.
+    let ggufCatalogLoaded = false;
+    const refreshGgufOptions = () => {
+        if (ggufCatalogLoaded) return;
+        ggufCatalogLoaded = true;
+        loadGgufModelCatalog().then((catalog) => {
+            const selectedModel = ggufModel.value;
+            ggufModel.setOptions(catalog.models.length
+                ? catalog.models.map((value) => ({ value, label: value }))
+                : [{ value: "", label: TEXT.ggufEmpty }]);
+            ggufModel.value = selectedModel;
+            const selectedMmproj = ggufMmproj.value;
+            ggufMmproj.setOptions([
+                { value: GGUF_MMPROJ_AUTO, label: TEXT.ggufAuto },
+                { value: GGUF_MMPROJ_NONE, label: TEXT.ggufNone },
+                ...catalog.mmproj.map((value) => ({ value, label: value })),
+            ]);
+            ggufMmproj.value = selectedMmproj;
+        }).catch((catalogError) => {
+            ggufCatalogLoaded = false;
+            error.textContent = String(catalogError?.message || catalogError);
+            error.hidden = false;
+        });
     };
     syncFormatRows();
 
@@ -4019,7 +4146,12 @@ async function openPromptOptimizerSettings(node) {
                 api_key: apiKey.value,
                 model: model.value,
                 read_media: readMedia.checked,
-                clip_max_length: clipMaxLength.value,
+                local_max_length: localMaxLength.value,
+                gguf_model: ggufModel.value,
+                gguf_mmproj: ggufMmproj.value,
+                gguf_context: ggufContext.value,
+                gguf_gpu_layers: ggufGpuLayers.value,
+                gguf_unload_after: ggufUnload.checked,
             });
             notifyPromptOptimizer(TEXT.settingsSaved, "success");
             close();
@@ -4104,16 +4236,19 @@ function syncPromptOptimizerButton(node) {
     const button = node?.__h3PromptOptimizeButton;
     if (!button) return;
     const state = promptOptimizerState(node);
-    const local = isClipOptimizerFormat(state.api_format);
-    // The local format needs no credentials; it is configured as soon as a
-    // text encoder is wired to the optimizer CLIP input.
-    const configured = local
+    const clip = isClipOptimizerFormat(state.api_format);
+    // The local formats need no credentials: the CLIP one is configured as soon
+    // as an encoder is wired to the input, the GGUF one as soon as a model file
+    // is picked.
+    const configured = clip
         ? optimizerClipIsConnected(node)
-        : Boolean(state.api_url.trim() && state.model.trim() && state.api_key.trim());
+        : isGgufOptimizerFormat(state.api_format)
+            ? Boolean(state.gguf_model.trim())
+            : Boolean(state.api_url.trim() && state.model.trim() && state.api_key.trim());
     const external = promptInputIsConnected(node);
     const pending = Boolean(node.__h3OptimizerPending);
     const locked = external || pending;
-    button.title = external ? TEXT.promptExternalConnected : local ? TEXT.optimizerDeferred : TEXT.optimizePrompt;
+    button.title = external ? TEXT.promptExternalConnected : clip ? TEXT.optimizerDeferred : TEXT.optimizePrompt;
     button.setAttribute("aria-label", button.title);
     button.classList.toggle("is-configured", configured);
     button.classList.toggle("is-loading", pending);
@@ -4212,7 +4347,12 @@ async function optimizePromptFromEditor(node) {
         );
         return;
     }
-    if (!state.api_url.trim() || !state.model.trim() || !state.api_key.trim()) {
+    if (isGgufOptimizerFormat(state.api_format)) {
+        if (!state.gguf_model.trim()) {
+            notifyPromptOptimizer(TEXT.ggufMissing);
+            return;
+        }
+    } else if (!state.api_url.trim() || !state.model.trim() || !state.api_key.trim()) {
         notifyPromptOptimizer(TEXT.optimizerMissing);
         return;
     }

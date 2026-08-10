@@ -116,10 +116,22 @@ OPTIMIZER_FORMAT_OPENAI = "openai"
 OPTIMIZER_FORMAT_GEMINI = "gemini"
 # Local text generation through the CLIP input instead of an HTTP API.
 OPTIMIZER_FORMAT_CLIP = "clip"
-OPTIMIZER_FORMATS = (OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_CLIP)
+# Local text generation through a GGUF model loaded by llama-cpp-python.
+OPTIMIZER_FORMAT_GGUF = "gguf"
+OPTIMIZER_FORMATS = (OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_CLIP, OPTIMIZER_FORMAT_GGUF)
+OPTIMIZER_LOCAL_FORMATS = (OPTIMIZER_FORMAT_CLIP, OPTIMIZER_FORMAT_GGUF)
 PROMPT_OPTIMIZER_CLIP_MAX_LENGTH = 1024
 PROMPT_OPTIMIZER_CLIP_MIN_LENGTH = 16
 PROMPT_OPTIMIZER_CLIP_LENGTH_LIMIT = 32768
+# Same directories ComfyUI-QwenVL-F scans, so a GGUF installed for one is found
+# by the other.
+OPTIMIZER_GGUF_DIRS = ("text_encoders", "LLM")
+OPTIMIZER_GGUF_MMPROJ_AUTO = "auto"
+OPTIMIZER_GGUF_MMPROJ_NONE = "none"
+OPTIMIZER_GGUF_CONTEXT = 16384
+OPTIMIZER_GGUF_CONTEXT_MIN = 512
+OPTIMIZER_GGUF_CONTEXT_LIMIT = 1048576
+OPTIMIZER_GGUF_GPU_LAYERS = -1
 # Caps for the media handed to a local text encoder. Every still costs the
 # encoder a block of soft tokens, so reference sets are trimmed rather than
 # sent whole.
@@ -148,7 +160,12 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "api_key": "",
     "model": "",
     "read_media": False,
-    "clip_max_length": PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
+    "local_max_length": PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
+    "gguf_model": "",
+    "gguf_mmproj": OPTIMIZER_GGUF_MMPROJ_AUTO,
+    "gguf_context": OPTIMIZER_GGUF_CONTEXT,
+    "gguf_gpu_layers": OPTIMIZER_GGUF_GPU_LAYERS,
+    "gguf_unload_after": False,
 }
 
 
@@ -412,11 +429,27 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     read_media = source.get("read_media", False)
     if isinstance(read_media, str):
         read_media = read_media.strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        clip_max_length = int(float(source.get("clip_max_length", PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)))
-    except (TypeError, ValueError):
-        clip_max_length = PROMPT_OPTIMIZER_CLIP_MAX_LENGTH
-    clip_max_length = min(PROMPT_OPTIMIZER_CLIP_LENGTH_LIMIT, max(PROMPT_OPTIMIZER_CLIP_MIN_LENGTH, clip_max_length))
+    def integer(key: str, fallback: int, low: int, high: int, *legacy: str) -> int:
+        raw = source.get(key)
+        for name in legacy:
+            if raw is None:
+                raw = source.get(name)
+        try:
+            value = int(float(fallback if raw is None else raw))
+        except (TypeError, ValueError):
+            value = fallback
+        return min(high, max(low, value))
+
+    # "clip_max_length" is the name this setting shipped under before the GGUF
+    # format shared it.
+    local_max_length = integer(
+        "local_max_length", PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
+        PROMPT_OPTIMIZER_CLIP_MIN_LENGTH, PROMPT_OPTIMIZER_CLIP_LENGTH_LIMIT, "clip_max_length",
+    )
+    mmproj = str(source.get("gguf_mmproj") or OPTIMIZER_GGUF_MMPROJ_AUTO).strip() or OPTIMIZER_GGUF_MMPROJ_AUTO
+    unload = source.get("gguf_unload_after", False)
+    if isinstance(unload, str):
+        unload = unload.strip().lower() in {"1", "true", "yes", "on"}
     return {
         "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
         "api_format": api_format,
@@ -424,7 +457,12 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "api_key": str(source.get("api_key") or ""),
         "model": str(source.get("model") or "").strip(),
         "read_media": bool(read_media),
-        "clip_max_length": clip_max_length,
+        "local_max_length": local_max_length,
+        "gguf_model": str(source.get("gguf_model") or "").strip(),
+        "gguf_mmproj": mmproj,
+        "gguf_context": integer("gguf_context", OPTIMIZER_GGUF_CONTEXT, OPTIMIZER_GGUF_CONTEXT_MIN, OPTIMIZER_GGUF_CONTEXT_LIMIT),
+        "gguf_gpu_layers": integer("gguf_gpu_layers", OPTIMIZER_GGUF_GPU_LAYERS, -1, 1024),
+        "gguf_unload_after": bool(unload),
     }
 
 
@@ -964,6 +1002,204 @@ def _optimizer_clip_descriptions(clip, items: list[_MediaInput], labels: Mapping
     return "\n".join(lines), len(lines)
 
 
+def _optimizer_gguf_roots() -> list[str]:
+    roots = []
+    for name in OPTIMIZER_GGUF_DIRS:
+        for path in _category_paths(name):
+            if path and path not in roots:
+                roots.append(path)
+    return roots
+
+
+def _is_mmproj_name(name: str) -> bool:
+    return "mmproj" in os.path.basename(str(name or "")).lower()
+
+
+def _optimizer_gguf_catalog() -> tuple[dict[str, str], dict[str, str]]:
+    """Every .gguf under the text encoder / LLM folders, keyed by relative path.
+
+    Deliberately the same folders ComfyUI-QwenVL-F scans, so a model installed
+    for one is offered by the other. Vision projectors are split out by name.
+    """
+    models: dict[str, str] = {}
+    projectors: dict[str, str] = {}
+    for root in _optimizer_gguf_roots():
+        for directory, _dirs, filenames in os.walk(root):
+            for filename in filenames:
+                if not filename.lower().endswith(".gguf"):
+                    continue
+                full = os.path.join(directory, filename)
+                key = os.path.relpath(full, root).replace(os.sep, "/")
+                target = projectors if _is_mmproj_name(filename) else models
+                target.setdefault(key, full)
+    return models, projectors
+
+
+def _optimizer_gguf_lookup(catalog: Mapping[str, str], name: str) -> str:
+    wanted = str(name or "").strip().replace("\\", "/")
+    if not wanted:
+        return ""
+    if wanted in catalog:
+        return catalog[wanted]
+    lowered = wanted.lower()
+    for key, path in catalog.items():
+        if key.lower() == lowered or os.path.basename(key).lower() == lowered:
+            return path
+    return ""
+
+
+def _optimizer_gguf_mmproj_path(model_path: str, requested: str, projectors: Mapping[str, str]) -> str:
+    choice = str(requested or OPTIMIZER_GGUF_MMPROJ_AUTO).strip()
+    if choice.lower() == OPTIMIZER_GGUF_MMPROJ_NONE:
+        return ""
+    if choice and choice.lower() != OPTIMIZER_GGUF_MMPROJ_AUTO:
+        path = _optimizer_gguf_lookup(projectors, choice)
+        if not path:
+            raise ValueError(f"Vision projector not found: {choice}")
+        return path
+    # Auto: the first mmproj sitting next to the model.
+    directory = os.path.dirname(model_path)
+    for filename in sorted(os.listdir(directory) if os.path.isdir(directory) else []):
+        if filename.lower().endswith(".gguf") and _is_mmproj_name(filename):
+            return os.path.join(directory, filename)
+    return ""
+
+
+def _optimizer_gguf_chat_handler(model_name: str, mmproj_path: str):
+    """Pick the llama_cpp vision handler that matches the model family.
+
+    Handler classes differ between llama-cpp-python builds and forks, so the
+    candidates are tried in order and a missing one is simply skipped.
+    """
+    lowered = os.path.basename(model_name).lower().replace("_", "-")
+    if "gemma" in lowered:
+        candidates = ("Gemma4ChatHandler", "Gemma3ChatHandler")
+    elif "qwen3" in lowered:
+        candidates = ("Qwen3VLChatHandler", "Qwen25VLChatHandler")
+    elif "qwen2" in lowered or "qwen" in lowered:
+        candidates = ("Qwen25VLChatHandler", "Qwen3VLChatHandler")
+    elif "minicpm" in lowered:
+        candidates = ("MiniCPMv26ChatHandler", "Llava15ChatHandler")
+    else:
+        candidates = ("Llava16ChatHandler", "Llava15ChatHandler")
+    from llama_cpp import llama_chat_format
+
+    for name in (*candidates, "Llava15ChatHandler"):
+        handler = getattr(llama_chat_format, name, None)
+        if handler is None:
+            continue
+        try:
+            return handler(clip_model_path=mmproj_path, verbose=False)
+        except Exception as exc:
+            logging.warning("MiniMax H3 Easy: %s could not load the vision projector (%s).", name, exc)
+    return None
+
+
+_OPTIMIZER_GGUF_LOCK = threading.RLock()
+_OPTIMIZER_GGUF_STATE: dict[str, Any] = {"signature": None, "llm": None, "vision": False}
+
+
+def _optimizer_gguf_release() -> None:
+    with _OPTIMIZER_GGUF_LOCK:
+        llm = _OPTIMIZER_GGUF_STATE.get("llm")
+        _OPTIMIZER_GGUF_STATE["llm"] = None
+        _OPTIMIZER_GGUF_STATE["signature"] = None
+        _OPTIMIZER_GGUF_STATE["vision"] = False
+    if llm is not None:
+        try:
+            llm.close()
+        except Exception:
+            pass
+        del llm
+        try:
+            comfy.model_management.soft_empty_cache()
+        except Exception:
+            pass
+
+
+def _optimizer_gguf_model(settings: Mapping[str, Any], want_vision: bool):
+    """Load (or reuse) the configured GGUF through llama-cpp-python."""
+    try:
+        from llama_cpp import Llama
+    except ImportError as exc:
+        raise ValueError(
+            "llama-cpp-python is not installed. Install it in ComfyUI's Python environment "
+            "to use the GGUF prompt optimizer."
+        ) from exc
+
+    models, projectors = _optimizer_gguf_catalog()
+    requested = str(settings.get("gguf_model") or "").strip()
+    if not requested:
+        raise ValueError("Select a GGUF model in the prompt optimization settings")
+    model_path = _optimizer_gguf_lookup(models, requested)
+    if not model_path:
+        roots = "\n".join(f"  - {path}" for path in _optimizer_gguf_roots()) or "  - (no model folder found)"
+        raise ValueError(f"GGUF model not found: {requested}\nSearched:\n{roots}")
+    mmproj_path = _optimizer_gguf_mmproj_path(model_path, settings.get("gguf_mmproj"), projectors) if want_vision else ""
+    context = int(settings.get("gguf_context") or OPTIMIZER_GGUF_CONTEXT)
+    gpu_layers = int(settings.get("gguf_gpu_layers", OPTIMIZER_GGUF_GPU_LAYERS))
+    signature = (model_path, mmproj_path, context, gpu_layers)
+
+    with _OPTIMIZER_GGUF_LOCK:
+        if _OPTIMIZER_GGUF_STATE.get("llm") is not None and _OPTIMIZER_GGUF_STATE.get("signature") == signature:
+            # The cached flag matters: a projector that failed to load leaves a
+            # text-only model behind even though one was requested.
+            return _OPTIMIZER_GGUF_STATE["llm"], bool(_OPTIMIZER_GGUF_STATE.get("vision"))
+    _optimizer_gguf_release()
+
+    handler = _optimizer_gguf_chat_handler(requested, mmproj_path) if mmproj_path else None
+    kwargs: dict[str, Any] = {
+        "model_path": model_path,
+        "n_ctx": context,
+        "n_gpu_layers": gpu_layers,
+        "verbose": False,
+    }
+    if handler is not None:
+        kwargs["chat_handler"] = handler
+    logging.info(
+        "MiniMax H3 Easy: loading GGUF prompt optimizer %s (ctx=%d, gpu_layers=%d, vision=%s)",
+        os.path.basename(model_path), context, gpu_layers, bool(handler),
+    )
+    llm = Llama(**kwargs)
+    with _OPTIMIZER_GGUF_LOCK:
+        _OPTIMIZER_GGUF_STATE["llm"] = llm
+        _OPTIMIZER_GGUF_STATE["signature"] = signature
+        _OPTIMIZER_GGUF_STATE["vision"] = handler is not None
+    return llm, handler is not None
+
+
+def _optimizer_gguf_json(settings: Mapping[str, Any], system_prompt: str, user_prompt: str, media_parts: list[dict[str, Any]] | None = None) -> str:
+    """Run the prompt through a local GGUF and return the rewritten text."""
+    images = [part for part in (media_parts or []) if part.get("type") == "image_url"]
+    llm, vision = _optimizer_gguf_model(settings, bool(images))
+    if images and not vision:
+        logging.warning("MiniMax H3 Easy: no vision projector for this GGUF; optimizing from text only.")
+        images = []
+    content: Any = user_prompt
+    if images:
+        content = [{"type": "text", "text": user_prompt}, *images]
+    try:
+        result = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+            max_tokens=int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH),
+            temperature=0.7,
+            top_p=0.95,
+            seed=0,
+        )
+    finally:
+        if bool(settings.get("gguf_unload_after")):
+            _optimizer_gguf_release()
+    choices = result.get("choices") if isinstance(result, Mapping) else None
+    message = (choices or [{}])[0].get("message") if choices else None
+    text = _strip_optimizer_output((message or {}).get("content"))
+    if not text:
+        raise ValueError("The GGUF model returned an empty prompt")
+    return text
+
+
 def _notify_prompt_optimized(node_id: Any, prompt: str) -> None:
     """Mirror an execution-time optimization back into the node's editor.
 
@@ -1037,6 +1273,19 @@ def _register_prompt_optimizer_route() -> bool:
     async def _prompt_optimizer_settings_get(request):
         return web.json_response({"ok": True, "settings": _read_prompt_optimizer_config()})
 
+    @routes.get("/minimax_h3_easy/gguf_models")
+    async def _gguf_models_get(request):
+        try:
+            models, projectors = await asyncio.to_thread(_optimizer_gguf_catalog)
+            return web.json_response({
+                "ok": True,
+                "models": sorted(models),
+                "mmproj": sorted(projectors),
+                "roots": _optimizer_gguf_roots(),
+            })
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @routes.post("/minimax_h3_easy/prompt_optimizer_settings")
     async def _prompt_optimizer_settings_post(request):
         try:
@@ -1067,16 +1316,27 @@ def _register_prompt_optimizer_route() -> bool:
                     "error": "The text encoder format optimizes the prompt when the workflow runs.",
                     "deferred": True,
                 }, status=400)
-            if api_format not in {OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI}:
+            if api_format not in {OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_GGUF}:
                 return web.json_response({"ok": False, "error": "Unsupported API format"}, status=400)
-            if not prompt.strip() or not api_key.strip() or not api_url.strip() or not model.strip():
+            local = api_format == OPTIMIZER_FORMAT_GGUF
+            if not prompt.strip():
+                return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
+            if local and not str(settings.get("gguf_model") or "").strip():
+                return web.json_response({"ok": False, "error": "Select a GGUF model in the prompt optimization settings"}, status=400)
+            if not local and (not api_key.strip() or not api_url.strip() or not model.strip()):
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
             raw_counts = payload.get("media_counts") if isinstance(payload.get("media_counts"), dict) else {}
             counts = {kind: max(0, min(MAX_MEDIA, int(raw_counts.get(kind, 0) or 0))) for kind in ("image", "video", "audio")}
             resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
-            media_parts = _optimizer_media_parts(resources, api_format) if bool(settings.get("read_media")) else []
+            # llama-cpp takes the same OpenAI-shaped image parts as the HTTP
+            # chat-completions format, so the media builder is shared.
+            parts_format = OPTIMIZER_FORMAT_OPENAI if local else api_format
+            media_parts = _optimizer_media_parts(resources, parts_format) if bool(settings.get("read_media")) else []
             system = _optimizer_system_prompt(scene_guide, mode, seconds, counts, len(media_parts))
-            result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
+            if local:
+                result = await asyncio.to_thread(_optimizer_gguf_json, settings, system, prompt, media_parts)
+            else:
+                result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
             return web.json_response({"ok": True, "prompt": result})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
@@ -1734,7 +1994,7 @@ class MiniMaxH3Easy:
             if item.media_type in counts:
                 counts[item.media_type] += 1
         scene_guide = str(kwargs.get("prompt_optimizer_scene_guide") or "none")
-        max_length = int(settings.get("clip_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)
+        max_length = int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)
         read_media = bool(settings.get("read_media"))
         result: list[str] = []
 
