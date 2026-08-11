@@ -16,6 +16,7 @@ import threading
 import time
 import base64
 import asyncio
+import io
 import inspect
 import json
 import mimetypes
@@ -153,6 +154,16 @@ OPTIMIZER_CLIP_DESCRIBE_REQUESTS = {
     "video": "Describe this reference video.",
     "audio": "Describe this reference audio clip.",
 }
+# A chat API has no video channel, so a reference video is described from
+# evenly spaced stills instead.
+OPTIMIZER_VIDEO_STILLS = 4
+OPTIMIZER_VIDEO_STILL_MAX_SIDE = 768
+OPTIMIZER_VIDEO_STILLS_REQUEST = (
+    "Describe this reference video. The {count} attached images are frames sampled from it in "
+    "chronological order, not separate references: describe the clip as a whole, including the "
+    "action and camera movement the frames show."
+)
+OPTIMIZER_MEDIA_MAX_BYTES = 32 * 1024 * 1024
 PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized"
 PROMPT_OPTIMIZER_CANCEL_LIMIT = 64
 PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
@@ -763,8 +774,10 @@ def _optimizer_media_items(resources: list[Mapping[str, Any]], api_format: str) 
     """Resolve the editor's media list into taggable request parts.
 
     Every readable asset is kept, including the ones this format cannot carry:
-    their `part` is None so a caller can say what it skipped instead of quietly
-    dropping the reference. `tag` is the same `<Picture N>` the prompt uses.
+    their `parts` is empty so a caller can say what it skipped instead of
+    quietly dropping the reference. `tag` is the same `<Picture N>` the prompt
+    uses. A video that cannot be sent whole becomes `sampled` stills, which is
+    the only way it reaches a chat-completions API at all.
     """
     items: list[dict[str, Any]] = []
     ordinals: dict[str, int] = {}
@@ -776,25 +789,132 @@ def _optimizer_media_items(resources: list[Mapping[str, Any]], api_format: str) 
             continue
         ordinals[media_type] = ordinals.get(media_type, 0) + 1
         tag = str(resource.get("tag") or "").strip() or f"{media_type} {ordinals[media_type]}"
-        part = None
+        parts: list[dict[str, Any]] = []
         try:
-            if os.path.getsize(path) > 32 * 1024 * 1024:
-                continue
-            with open(path, "rb") as handle:
-                encoded = base64.b64encode(handle.read()).decode("ascii")
-            mime = mimetypes.guess_type(path)[0] or {"image": "image/jpeg", "video": "video/mp4", "audio": "audio/wav"}[media_type]
-            if api_format == "gemini":
-                part = {"inlineData": {"mimeType": mime, "data": encoded}}
-            elif media_type == "image":
-                part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
+            # Only whole-file embedding is size-capped. The item survives either
+            # way, so an oversized video can still be sampled into stills.
+            if os.path.getsize(path) <= OPTIMIZER_MEDIA_MAX_BYTES:
+                mime = mimetypes.guess_type(path)[0] or {"image": "image/jpeg", "video": "video/mp4", "audio": "audio/wav"}[media_type]
+                if api_format == "gemini" or media_type == "image":
+                    with open(path, "rb") as handle:
+                        encoded = base64.b64encode(handle.read()).decode("ascii")
+                    if api_format == "gemini":
+                        parts = [{"inlineData": {"mimeType": mime, "data": encoded}}]
+                    else:
+                        parts = [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}]
         except (OSError, ValueError):
-            continue
-        items.append({"tag": tag, "type": media_type, "part": part})
+            parts = []
+        sampled = not parts and media_type == "video"
+        if sampled:
+            parts = _optimizer_video_still_parts(path)
+            sampled = bool(parts)
+        items.append({"tag": tag, "type": media_type, "path": path, "parts": parts, "sampled": sampled})
     return items
 
 
+def _optimizer_media_manifest(items: Sequence[Mapping[str, Any]]) -> str:
+    """Name what each attached part actually is.
+
+    Without this the model receives an unlabelled pile of images and has to
+    guess which reference each one belongs to — and a sampled video looks like
+    several unrelated pictures rather than one clip.
+    """
+    lines = []
+    for item in items:
+        parts = item.get("parts") or []
+        if not parts:
+            continue
+        if item.get("sampled"):
+            lines.append(
+                f"- {item['tag']}: {len(parts)} still frames sampled in chronological order from one video "
+                "clip. They are that single video reference, not separate images."
+            )
+        else:
+            lines.append(f"- {item['tag']}: 1 {item['type']}")
+    if not lines:
+        return ""
+    return "Attached media parts, in order:\n" + "\n".join(lines)
+
+
+def _optimizer_video_still_parts(
+    path: str,
+    count: int = OPTIMIZER_VIDEO_STILLS,
+    max_side: int = OPTIMIZER_VIDEO_STILL_MAX_SIDE,
+) -> list[dict[str, Any]]:
+    """Sample evenly spaced frames from a video file as OpenAI image parts.
+
+    A chat completion has no video channel, so this is the only way a reference
+    video reaches the optimizer. Frames are seeked rather than decoded in full,
+    since a reference clip can be long and only a handful of stills are wanted;
+    files whose duration is unknown (or that refuse to seek) fall back to a
+    strided sequential decode.
+    """
+    if not path:
+        return []
+    try:
+        import av
+    except ImportError:
+        logging.warning("MiniMax H3 Easy: PyAV is unavailable, so reference videos cannot be sampled.")
+        return []
+    frames: list[Any] = []
+    try:
+        with av.open(path) as container:
+            streams = container.streams.video
+            if not streams:
+                return []
+            stream = streams[0]
+            stream.thread_type = "AUTO"
+            duration = 0.0
+            if stream.duration and stream.time_base:
+                duration = float(stream.duration * stream.time_base)
+            elif container.duration:
+                duration = float(container.duration) / float(av.time_base)
+            if duration > 0 and stream.time_base:
+                for index in range(count):
+                    # Aim at the middle of each slice so the first and last
+                    # frames (often black) are not what gets described.
+                    seconds = duration * (index + 0.5) / count
+                    try:
+                        container.seek(int(seconds / stream.time_base), stream=stream)
+                        frame = next(container.decode(stream), None)
+                    except Exception:
+                        frame = None
+                    if frame is not None:
+                        frames.append(frame)
+            if not frames:
+                container.seek(0)
+                total = int(stream.frames or 0)
+                stride = max(1, total // count) if total else 1
+                for index, frame in enumerate(container.decode(stream)):
+                    if index % stride == 0:
+                        frames.append(frame)
+                    if len(frames) >= count:
+                        break
+    except Exception as exc:
+        logging.warning("MiniMax H3 Easy: could not sample %s for the prompt optimizer (%s).", os.path.basename(path), exc)
+        return []
+    parts: list[dict[str, Any]] = []
+    for frame in frames:
+        try:
+            image = frame.to_image()
+            longest = max(image.width, image.height)
+            if longest > max_side:
+                scale = max_side / longest
+                image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
+            buffer = io.BytesIO()
+            image.convert("RGB").save(buffer, format="JPEG", quality=85)
+        except Exception as exc:
+            logging.warning("MiniMax H3 Easy: could not encode a sampled frame (%s).", exc)
+            continue
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+    if parts:
+        _optimizer_log("sampled %d frames from %s", len(parts), os.path.basename(path))
+    return parts
+
+
 def _optimizer_media_parts(resources: list[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
-    return [item["part"] for item in _optimizer_media_items(resources, api_format) if item["part"]]
+    return [part for item in _optimizer_media_items(resources, api_format) for part in item["parts"]]
 
 
 def _media_counts_from_kwargs(kwargs: Mapping[str, Any]) -> dict[str, int]:
@@ -816,6 +936,7 @@ def _optimizer_system_prompt(
     media_counts: Mapping[str, int],
     attached_media_count: int = 0,
     described_media_count: int = 0,
+    attached_manifest: str = "",
 ) -> str:
     prompt = _prompt_guide_bundle(scene_guide, mode, seconds, media_counts)
     actual_count = max(0, int(attached_media_count or 0))
@@ -831,9 +952,11 @@ def _optimizer_system_prompt(
             "For a media tag with no description, preserve the tag and infer only from the user's text and explicit instructions, never from an imagined asset."
         )
     if actual_count:
+        manifest = f"{attached_manifest.strip()}\n" if attached_manifest.strip() else ""
         prompt += (
             "\n\n=== MEDIA EVIDENCE RULE ===\n"
-            f"Actual media parts attached to this request: {actual_count}.\n"
+            f"Actual media references attached to this request: {actual_count}.\n"
+            f"{manifest}"
             "The presence of a media part in the request does not prove that you can perceive it. "
             "Use visual, video, or audio details only when they are directly observable to your model in the attached media parts. "
             "If your model or API does not support the media modality, treat that media as unavailable. "
@@ -1383,26 +1506,43 @@ def _optimizer_gguf_describe(
         return "", 0
     gemma = _is_gemma_gguf_name(str(settings.get("gguf_model") or ""))
     length = min(int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH), OPTIMIZER_CLIP_DESCRIBE_LENGTH)
-    lines: list[str] = []
     started = time.perf_counter()
     _optimizer_log("describing %d connected media with the GGUF, one at a time", len(describable))
+    try:
+        lines = _optimizer_gguf_describe_each(llm, describable, gemma, length, should_stop)
+    except _OptimizerCancelled:
+        _optimizer_gguf_release()
+        raise
+    _optimizer_log("described %d of %d connected media in %.1fs", len(lines), len(describable), time.perf_counter() - started)
+    return "\n".join(lines), len(lines)
+
+
+def _optimizer_gguf_describe_each(llm, describable, gemma: bool, length: int, should_stop) -> list[str]:
+    lines: list[str] = []
     for index, item in enumerate(describable, start=1):
         if should_stop is not None and should_stop():
             raise _OptimizerCancelled("Prompt optimization was cancelled")
         media_type = str(item.get("type"))
         label = str(item.get("tag") or f"{media_type} {index}")
-        part = item.get("part")
-        if not part:
-            # llama-cpp carries images only; saying nothing is better than
-            # letting the prompt writer imagine the content.
+        parts = list(item.get("parts") or [])
+        # llama-cpp has no video channel, so a clip arrives as ordered stills.
+        request = (
+            OPTIMIZER_VIDEO_STILLS_REQUEST.format(count=len(parts))
+            if item.get("sampled") else OPTIMIZER_CLIP_DESCRIBE_REQUESTS[media_type]
+        )
+        if not parts:
+            # Saying nothing is better than letting the prompt writer imagine
+            # the content.
             _optimizer_log("  %s (%d/%d): skipped, llama-cpp takes no %s", label, index, len(describable), media_type)
             continue
-        _optimizer_log("  %s (%d/%d): describing the %s...", label, index, len(describable), media_type)
+        _optimizer_log(
+            "  %s (%d/%d): describing the %s from %d image%s...",
+            label, index, len(describable), media_type, len(parts), "" if len(parts) == 1 else "s",
+        )
         step = time.perf_counter()
         try:
             description = _optimizer_gguf_chat(
-                llm, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, OPTIMIZER_CLIP_DESCRIBE_REQUESTS[media_type],
-                [part], length, gemma, should_stop,
+                llm, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, request, parts, length, gemma, should_stop,
             )
         except _OptimizerCancelled:
             raise
@@ -1414,8 +1554,7 @@ def _optimizer_gguf_describe(
             continue
         _optimizer_log("  %s (%d/%d): %.1fs, %d chars", label, index, len(describable), time.perf_counter() - step, len(description))
         lines.append(f"{label}: {description}")
-    _optimizer_log("described %d of %d connected media in %.1fs", len(lines), len(describable), time.perf_counter() - started)
-    return "\n".join(lines), len(lines)
+    return lines
 
 
 def _optimizer_gguf_json(
@@ -1448,6 +1587,11 @@ def _optimizer_gguf_json(
     _optimizer_log("generating (max_tokens=%d, images=%d)...", max_tokens, len(images))
     try:
         text = _optimizer_gguf_chat(llm, system_prompt, user_text, images, max_tokens, gemma, should_stop)
+    except _OptimizerCancelled:
+        # Stopping hands the VRAM back. Keeping a model resident for a
+        # generation the user abandoned is the opposite of what they asked for.
+        _optimizer_gguf_release()
+        raise
     finally:
         if bool(settings.get("gguf_unload_after")):
             _optimizer_gguf_release()
@@ -1614,8 +1758,14 @@ def _register_prompt_optimizer_route() -> bool:
                     _optimizer_gguf_describe, settings, media_items, should_stop,
                 )
                 _optimizer_raise_if_cancelled(request_id)
-            media_parts = [] if describe else [item["part"] for item in media_items if item["part"]]
-            system = _optimizer_system_prompt(scene_guide, mode, seconds, counts, len(media_parts), described_count)
+            attached = [] if describe else [item for item in media_items if item["parts"]]
+            media_parts = [part for item in attached for part in item["parts"]]
+            # Counted by reference, not by part: a sampled video is one
+            # reference even though it arrives as several frames.
+            system = _optimizer_system_prompt(
+                scene_guide, mode, seconds, counts, len(attached), described_count,
+                _optimizer_media_manifest(attached),
+            )
             if local:
                 result = await asyncio.to_thread(
                     _optimizer_gguf_json, settings, system, prompt, media_parts,
@@ -1628,11 +1778,16 @@ def _register_prompt_optimizer_route() -> bool:
             _optimizer_raise_if_cancelled(request_id)
             return web.json_response({"ok": True, "prompt": result})
         except _OptimizerCancelled as exc:
+            # Nothing is running in a worker thread at this point, so freeing a
+            # model the cancelled run had loaded is safe here.
+            _optimizer_gguf_release()
             _optimizer_log("prompt optimization cancelled")
             return web.json_response({"ok": False, "cancelled": True, "error": str(exc)}, status=409)
         except asyncio.CancelledError:
             # The editor went away (tab closed, page reloaded). Stop the work
-            # the same way an explicit cancel would.
+            # the same way an explicit cancel would. The model is *not* freed
+            # from here: the worker thread outlives this handler and does it
+            # itself once it sees the cancel.
             _optimizer_cancel(request_id)
             raise
         except Exception as exc:

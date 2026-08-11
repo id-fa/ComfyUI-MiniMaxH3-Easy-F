@@ -77,7 +77,9 @@ the previous optimizer result; that heuristic is removed.
 While a request is running, `✦` turns into a stop button (`■`). Pressing it ends
 the wait immediately and leaves the prompt untouched — no error is reported,
 since stopping is a choice rather than a failure. Closing the tab or removing
-the node stops it the same way.
+the node stops it the same way. A stopped **GGUF** run also unloads the model,
+so the VRAM comes back rather than staying reserved for a generation nobody is
+waiting for.
 
 How much actually stops depends on the format:
 
@@ -280,7 +282,8 @@ Selecting this format replaces the API rows with:
 - **GPU layers** — `n_gpu_layers`, default `-1` (all layers on the GPU).
 - **Max generated tokens** — shared with the text encoder format.
 - **Unload the model after use** — frees it as soon as the prompt comes back,
-  instead of keeping it resident for the next click.
+  instead of keeping it resident for the next click. A **stopped** run unloads
+  the model regardless of this setting.
 - **Describe media one at a time** — see below. Only shown while **Read
   connected media** is on.
 
@@ -308,32 +311,37 @@ text-encoder format additionally passes `thinking=False` to the tokenizer.
 
 ### Connected media
 
-**Read connected media** attaches the connected images exactly as the
-OpenAI-compatible format does, since llama-cpp takes the same message shape.
-This needs a multimodal GGUF **and** its mmproj projector; the handler is chosen
-from the model's filename (Qwen, Gemma, MiniCPM, LLaVA) against whatever
-`llama_cpp.llama_chat_format` provides in the installed build. With no projector
-resolved, the prompt is optimized from text alone and a warning is logged.
+**Read connected media** attaches the connected media exactly as the
+OpenAI-compatible format does, since llama-cpp takes the same message shape:
+images as-is, reference videos as sampled frames (see *Reference videos over a
+chat API* below). This needs a multimodal GGUF **and** its mmproj projector; the
+handler is chosen from the model's filename (Qwen, Gemma, MiniCPM, LLaVA)
+against whatever `llama_cpp.llama_chat_format` provides in the installed build.
+With no projector resolved, the prompt is optimized from text alone and a
+warning is logged.
 
-Video and audio references are not sent — only images, matching the
-OpenAI-compatible format.
+Audio references are not sent — llama-cpp has no channel for them.
 
 ### Describe media one at a time
 
 **Describe media one at a time** switches the GGUF format to the same two-stage
-shape the text encoder uses: each connected image is described in its own pass,
+shape the text encoder uses: each connected asset is described in its own pass,
 and the prompt-writing pass then receives those descriptions as text with no
 image attached.
 
 ```
 === CONNECTED MEDIA ===
 <Picture 1>: a woman in a red coat standing under a shop awning, overcast daylight...
-<Picture 2>: an empty road at night, wet asphalt reflecting neon signage...
+<Video 1>: a dog running left to right across wet asphalt, handheld camera following...
 ```
 
 Each description is labelled with the tag the prompt itself uses, capped at 256
 tokens, and produced with a two-line system prompt rather than the whole H3
 Prompt Guide.
+
+A reference video is described from its sampled frames as **one** asset. Audio
+is skipped: llama-cpp has no channel for it at all. Every skip is named in the
+log rather than passing silently.
 
 Why this helps a local model in particular:
 
@@ -341,24 +349,68 @@ Why this helps a local model in particular:
   the full guide makes one very long prompt-evaluation phase, and nothing in
   llama-cpp can interrupt that — the editor looks frozen. Split up, every phase
   is short, and cancelling lands between assets as well as inside generation.
-- **It fits in the context.** Images and the guide compete for `n_ctx` in a
+- **It fits in the context.** Media and the guide compete for `n_ctx` in a
   single request; separately, neither pass is close to the limit.
-- **Attention is not divided.** The describing pass sees one image and one
+- **Attention is not divided.** The describing pass sees one asset and one
   instruction; the writing pass sees text only.
 
-The cost is one extra generation per image. With one image and a fast model the
+The cost is one extra generation per asset. With one image and a fast model the
 combined format is often quicker anyway, because nothing has to evaluate a
 guide-sized multimodal prompt.
 
-It is **off by default**, so an existing setup keeps sending images with the
-prompt. Video and audio are skipped either way (llama-cpp carries images only),
-and each skip is named in the log instead of passing silently.
+It is **off by default**, so an existing setup keeps sending media with the
+prompt.
 
 ### Scope
 
 `nodes.py` and `web/minimax_h3_easy_ui.js`. Adds
 `GET /minimax_h3_easy/gguf_models` for the model dropdown. Python changed, so
 **restart ComfyUI**.
+
+---
+
+## Reference videos over a chat API
+
+This applies to the **OpenAI-compatible** and **GGUF** formats, which speak the
+chat-completions message shape. That shape has no video part, so upstream simply
+dropped every reference video: with **Read connected media** on, a workflow
+built around a video reference optimized its prompt as if nothing were attached.
+
+A reference video is now sampled into stills and sent as those:
+
+- **4 evenly spaced frames**, aimed at the middle of each quarter so the first
+  and last frames — often black — are not what the model sees.
+- **Long side capped at 768 px**, re-encoded as JPEG.
+- Frames are **seeked, not decoded in sequence**, so a long reference video
+  costs four decodes rather than a full pass. Files that report no duration or
+  refuse to seek fall back to a strided sequential decode.
+- Uses PyAV, which ComfyUI already requires. Without it, videos are skipped and
+  a warning is logged, as before.
+
+Gemini is unaffected: it takes video natively, so the file is sent whole. (An
+oversized video that cannot be inlined falls back to frames there too.)
+
+### Telling the model what it received
+
+Several frames of one clip look exactly like several unrelated images. The
+system prompt now ends with a manifest naming every attached part:
+
+```
+Actual media references attached to this request: 2.
+Attached media parts, in order:
+- <Picture 1>: 1 image
+- <Video 1>: 4 still frames sampled in chronological order from one video clip.
+  They are that single video reference, not separate images.
+```
+
+This also fixes a smaller problem that predates the video change: the model used
+to receive an unlabelled pile of images with no way to tell which `<Picture N>`
+each one was. The count is now **references**, not parts, so a sampled video
+counts once.
+
+### Scope
+
+`nodes.py` only. **Restart ComfyUI.**
 
 ---
 

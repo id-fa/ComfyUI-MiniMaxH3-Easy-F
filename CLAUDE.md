@@ -182,7 +182,7 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   uninterruptible prompt-evaluation phase — the reason the editor appears to freeze. Because that pass
   loads the projector, the final text-only pass takes `keep_vision=True`; without it the signature would
   change and the model would be reloaded between the two. `_optimizer_media_items` keeps unsendable
-  media with `part=None` so skips can be logged rather than silently dropped.
+  media with empty `parts` (and its `path`) so skips can be logged rather than silently dropped.
 - The editor-driven formats can be stopped: `✦` becomes a stop button while pending, aborting the fetch
   and calling `POST /minimax_h3_easy/prompt_optimize_cancel` with the request id it generated. The id
   registry (`_optimizer_cancel` / `_optimizer_is_cancelled`, capped) is polled by `_optimizer_gguf_stream`
@@ -203,6 +203,15 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   result is pushed to the editor with `PromptServer.send_sync(PROMPT_OPTIMIZER_EVENT)`. It only fires while
   the hidden `prompt_needs_optimization` transport input is true (frontend: "the open tab's Optimized
   field is empty"; default true so headless runs still optimize).
+- A chat-completions message has no video part, so `_optimizer_media_items` gives a reference video
+  `_optimizer_video_still_parts` instead: PyAV *seeks* `OPTIMIZER_VIDEO_STILLS` evenly spaced frames
+  (this is the editor route, where media are file paths, not the tensors `clip` gets). One item can
+  therefore hold several parts, which is why `_optimizer_media_manifest` exists — several frames of one
+  clip are otherwise indistinguishable from several unrelated images, and the attached count is by
+  reference, not by part. Gemini keeps sending video whole.
+- Cancelling a GGUF run releases the model (`_optimizer_gguf_release`) regardless of
+  `gguf_unload_after`, from inside the worker thread — never from the `asyncio.CancelledError` handler,
+  which returns while `asyncio.to_thread` is still generating.
 - `read_media` applies to all three formats. For `clip` it runs `_optimizer_clip_descriptions`: **one
   describe generation per connected asset**, then the final prompt pass gets those descriptions as text and
   no media at all. A text encoder has a single slot per modality, so sending a whole H3 reference set at
