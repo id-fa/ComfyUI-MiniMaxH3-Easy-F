@@ -687,6 +687,60 @@ def _optimizer_raise_if_cancelled(request_id: str) -> None:
         raise _OptimizerCancelled("Prompt optimization was cancelled")
 
 
+def _optimizer_thinking_off_payload(api_format: str) -> dict[str, Any]:
+    """The extra request fields that switch a reasoning model's thinking off.
+
+    There is no standard field for this. `chat_template_kwargs.enable_thinking`
+    is what llama.cpp's server, vLLM, SGLang, LM Studio and Ollama all read for
+    the Qwen family, and Gemini uses a zero thinking budget. Both are kept in a
+    *separate* dict so the request can be retried without them: an endpoint that
+    rejects unknown fields (OpenAI itself does) must still answer.
+    """
+    if api_format == "gemini":
+        return {"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}
+    return {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def _optimizer_merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in extra.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def _optimizer_http_post(url: str, headers: Mapping[str, str], payload: Mapping[str, Any], extra: Mapping[str, Any]) -> Any:
+    """POST the payload, retrying without `extra` if the endpoint rejects it.
+
+    The thinking switches are the only optional fields, and a server that has
+    never heard of them answers 400 rather than ignoring them. Dropping them and
+    trying again is better than failing outright — `_strip_optimizer_output` is
+    still there to catch a tagged reasoning block.
+    """
+    attempts: list[Mapping[str, Any]] = [_optimizer_merge_payload(payload, extra)] if extra else []
+    attempts.append(payload)
+    last: Exception | None = None
+    for index, body in enumerate(attempts):
+        request = urllib.request.Request(
+            url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=dict(headers), method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_TIMEOUT_SECONDS) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            last = RuntimeError(f"Prompt optimization API error ({exc.code}): {detail[:1000]}")
+            if index + 1 < len(attempts) and exc.code in {400, 404, 422}:
+                _optimizer_log("the endpoint rejected the thinking-off fields (%d); retrying without them", exc.code)
+                continue
+            raise last from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Prompt optimization request failed: {exc.reason}") from exc
+    raise last or RuntimeError("Prompt optimization request failed")
+
+
 def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str, system_prompt: str, user_prompt: str, media_parts: list[dict[str, Any]] | None = None) -> str:
     url = _normalize_optimizer_url(api_url, api_format, model)
     media_parts = list(media_parts or [])
@@ -720,15 +774,7 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
         else:
             content = user_prompt
         payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}], "stream": False, "temperature": 0.35, "max_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS}
-    request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_TIMEOUT_SECONDS) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Prompt optimization API error ({exc.code}): {detail[:1000]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Prompt optimization request failed: {exc.reason}") from exc
+    data = _optimizer_http_post(url, headers, payload, _optimizer_thinking_off_payload(api_format))
     if api_format == "gemini":
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates:
@@ -745,7 +791,9 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
     else:
         content = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "")
         text = content if isinstance(content, str) else "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
-    text = str(text or "").strip()
+    # The HTTP formats used to skip this entirely, so a reasoning block reached
+    # the H3 prompt verbatim even though the switches above ask for none.
+    text = _strip_optimizer_output(text)
     if not text:
         raise RuntimeError("Prompt optimization API returned an empty response")
     _optimizer_log("prompt optimization finished in %.1fs (%d chars)", time.perf_counter() - started, len(text))
@@ -972,8 +1020,17 @@ def _optimizer_system_prompt(
     return prompt
 
 
-_OPTIMIZER_THINK_RE = re.compile(r"^\s*<(think|thinking|reasoning)>.*?</\1>", flags=re.I | re.S)
-_OPTIMIZER_OPEN_THINK_RE = re.compile(r"^\s*<(think|thinking|reasoning)>", flags=re.I)
+_OPTIMIZER_THINK_TAGS = "think|thinking|reasoning|thought|analysis"
+# Greedy on purpose: everything up to and including the LAST closing tag goes.
+# The opening tag is optional because most Qwen-family chat templates *pre-open*
+# `<think>` in the assistant turn, so what the model actually returns starts with
+# bare reasoning prose and the only tag in the string is the closing one.
+# Requiring the opening tag let that whole reasoning block into the H3 prompt.
+_OPTIMIZER_THINK_CLOSE_RE = re.compile(rf"\A.*</(?:{_OPTIMIZER_THINK_TAGS})>", flags=re.I | re.S)
+_OPTIMIZER_OPEN_THINK_RE = re.compile(rf"\A\s*<(?:{_OPTIMIZER_THINK_TAGS})>", flags=re.I)
+# Harmony-style channel markers (gpt-oss and friends) put the answer last.
+_OPTIMIZER_FINAL_CHANNEL_RE = re.compile(r"\A.*<\|channel\|>final<\|message\|>", flags=re.I | re.S)
+_OPTIMIZER_TRAILING_TOKEN_RE = re.compile(r"<\|(?:return|end|endoftext|im_end)\|>\s*\Z", flags=re.I)
 
 
 def _strip_optimizer_output(text: Any) -> str:
@@ -981,10 +1038,16 @@ def _strip_optimizer_output(text: Any) -> str:
 
     Reasoning models emit a thinking block before the answer, and it must never
     reach the H3 prompt. Thinking is switched off per format where the backend
-    allows it; this is the backstop for models that ignore that.
+    allows it; this is the backstop for models that ignore that, or whose chat
+    template opens the block for them so only its closing tag is ever emitted.
+
+    Untagged reasoning cannot be removed here — nothing marks where it ends — so
+    the switches in the request are what actually has to work.
     """
     value = str(text or "").strip()
-    value = _OPTIMIZER_THINK_RE.sub("", value).strip()
+    value = _OPTIMIZER_FINAL_CHANNEL_RE.sub("", value).strip()
+    value = _OPTIMIZER_TRAILING_TOKEN_RE.sub("", value).strip()
+    value = _OPTIMIZER_THINK_CLOSE_RE.sub("", value).strip()
     if _OPTIMIZER_OPEN_THINK_RE.match(value):
         # An unterminated block means the answer was cut off mid-thought, so
         # there is no prompt in here at all.
@@ -1408,6 +1471,23 @@ def _optimizer_gguf_model(settings: Mapping[str, Any], want_vision: bool):
     return llm, handler is not None
 
 
+def _optimizer_gguf_call(llm, request: Mapping[str, Any], **extra):
+    """Call llama-cpp, dropping the template kwargs an old build cannot take.
+
+    `chat_template_kwargs` only reaches the Jinja renderer on recent builds;
+    older ones raise `TypeError` for the unknown argument instead of ignoring
+    it. Losing the thinking switch is better than losing the prompt.
+    """
+    try:
+        return llm.create_chat_completion(**request, **extra)
+    except TypeError:
+        if "chat_template_kwargs" not in request:
+            raise
+        _optimizer_log("this llama-cpp build does not accept chat_template_kwargs; retrying without it")
+        fallback = {key: value for key, value in request.items() if key != "chat_template_kwargs"}
+        return llm.create_chat_completion(**fallback, **extra)
+
+
 def _optimizer_gguf_stream(llm, request: dict[str, Any], should_stop) -> str:
     """Generate token by token so a cancel lands within one token.
 
@@ -1419,7 +1499,7 @@ def _optimizer_gguf_stream(llm, request: dict[str, Any], should_stop) -> str:
     pieces: list[str] = []
     tokens = 0
     started = time.perf_counter()
-    stream = llm.create_chat_completion(**request, stream=True)
+    stream = _optimizer_gguf_call(llm, request, stream=True)
     try:
         for chunk in stream:
             choice = ((chunk.get("choices") or [{}])[0]) if isinstance(chunk, Mapping) else {}
@@ -1468,11 +1548,16 @@ def _optimizer_gguf_chat(
         "top_p": 0.95,
         "seed": 0,
         "stop": stop,
+        # Newer Qwen templates dropped the `/no_think` token for a template
+        # variable. llama-cpp only forwards this when it renders a Jinja
+        # template, and ignores it otherwise, so sending both is the only way to
+        # cover the whole family.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if should_stop is not None:
         return _strip_optimizer_output(_optimizer_gguf_stream(llm, request, should_stop))
     step = time.perf_counter()
-    result = llm.create_chat_completion(**request)
+    result = _optimizer_gguf_call(llm, request)
     generated = time.perf_counter() - step
     usage = result.get("usage") if isinstance(result, Mapping) else None
     tokens = (usage or {}).get("completion_tokens") if isinstance(usage, Mapping) else None

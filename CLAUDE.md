@@ -192,9 +192,23 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   answer that arrives after a cancel is discarded instead. A client disconnect raises
   `asyncio.CancelledError` in the route and is treated as a cancel.
 - Reasoning is always off — the answer *is* the prompt. Each backend suppresses it its own way (`clip`:
-  `thinking=False`; `gguf`: `/no_think` for Qwen, `force_reasoning=False` on the handler, family-specific
-  `stop` markers), and `_strip_optimizer_output` removes any leading think block as the shared backstop.
+  `thinking=False`; `gguf` and the HTTP pair: `chat_template_kwargs.enable_thinking=false`, plus
+  `/no_think` and `force_reasoning=False` for Qwen and family-specific `stop` markers; Gemini:
+  `thinkingConfig.thinkingBudget=0`), and `_strip_optimizer_output` is the shared backstop.
   Don't add a "reasoning" toggle without deciding what the leftover block should do to the H3 prompt.
+  Two mistakes were made here already — do not reintroduce either:
+  1. **The HTTP formats sent no switch and never called `_strip_optimizer_output`**, so a reasoning
+     model behind an OpenAI-compatible endpoint wrote its thoughts straight into the H3 prompt while
+     this file claimed otherwise. The switches now go through `_optimizer_thinking_off_payload`, and
+     `_optimizer_http_post` retries once **without** them on 400/404/422 because an endpoint that has
+     never heard of `chat_template_kwargs` errors rather than ignoring it. `_optimizer_gguf_call` does
+     the same for llama-cpp builds too old to accept the argument.
+  2. **`_strip_optimizer_output` required an opening `<think>`.** Most Qwen chat templates *pre-open*
+     the tag in the assistant turn, so the response begins with bare reasoning prose and the only tag
+     in it is the closing one — the whole block leaked. `_OPTIMIZER_THINK_CLOSE_RE` therefore makes the
+     opening tag optional and is greedy to the **last** closing tag.
+  Untagged reasoning cannot be removed: nothing marks where it ends. Don't add heuristics that guess at
+  prose preambles — they will eat real prompts. The switches are what has to work.
 - `clip` runs locally through the node's optional `optimizer_clip` CLIP input using ComfyUI's
   `clip.tokenize` → `clip.generate` → `clip.decode` (same as the built-in `TextGenerate` node). That object
   only exists during execution, so the HTTP route rejects this format and `MiniMaxH3Easy.generate` does the

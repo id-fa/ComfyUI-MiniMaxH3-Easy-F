@@ -297,17 +297,33 @@ switched off — there is no toggle for it:
 
 - Qwen-family models get the inline `/no_think` switch, and Qwen chat handlers
   are constructed with `force_reasoning=False`.
-- Gemma takes neither (its handler rejects the flag), so it relies on the
+- Every chat request also carries `chat_template_kwargs.enable_thinking=false`,
+  which newer Qwen templates read instead of `/no_think`. OpenAI-compatible
+  servers (llama.cpp, vLLM, SGLang, LM Studio, Ollama) read the same field;
+  Gemini gets `thinkingConfig.thinkingBudget=0` instead.
+- An endpoint that rejects that unknown field (400/404/422) — or a llama-cpp
+  build too old to accept the argument — gets the request again without it, so a
+  stricter API still answers.
+- Gemma takes none of them (its handler rejects the flag), so it relies on the
   cleanup below.
 - Turn markers (`<|im_end|>`, `<end_of_turn>`, …) are passed as stop strings.
-- Any `<think>` / `<thinking>` / `<reasoning>` block that still comes back is
-  stripped from the front of the answer. An answer that is *only* an
-  unterminated thought counts as empty and reports an error rather than feeding
-  half a thought into the prompt.
+- Whatever a model emits anyway is cleaned up: everything up to and including
+  the **last** closing `</think>` / `</thinking>` / `</reasoning>` is removed.
+  The closing tag alone is enough on purpose — most Qwen chat templates
+  *pre-open* `<think>` in the assistant turn, so the response starts with bare
+  reasoning prose and the opening tag never appears in it. Harmony-style
+  `<|channel|>final<|message|>` markers are handled the same way. An answer that
+  is *only* an unterminated thought counts as empty and reports an error rather
+  than feeding half a thought into the prompt.
 
 The same cleanup applies to the HTTP and text-encoder formats, so a reasoning
 model behind an OpenAI-compatible endpoint cannot leak its thoughts either. The
 text-encoder format additionally passes `thinking=False` to the tokenizer.
+
+Reasoning that carries **no marker at all** ("Here's a thinking process: 1.
+Analyze user input…" as plain text) cannot be separated from the prompt —
+nothing says where it stops. If a model leaks like that despite the switches,
+use its non-thinking variant.
 
 ### Connected media
 

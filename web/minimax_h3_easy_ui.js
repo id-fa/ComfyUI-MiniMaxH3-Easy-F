@@ -3809,6 +3809,22 @@ function makePromptOptimizerSettingsRow(labelText, control) {
     return row;
 }
 
+/** The two fixed projector choices, plus `selected` when it is a real filename. */
+function mmprojOptionList(selected, catalog = []) {
+    const options = [
+        { value: GGUF_MMPROJ_AUTO, label: TEXT.ggufAuto },
+        { value: GGUF_MMPROJ_NONE, label: TEXT.ggufNone },
+        ...catalog.map((value) => ({ value, label: value })),
+    ];
+    const wanted = String(selected || "").trim();
+    // A configured file the scan no longer finds stays listed rather than
+    // silently becoming a different projector; the server reports it clearly.
+    if (wanted && !options.some((item) => item.value === wanted)) {
+        options.push({ value: wanted, label: wanted });
+    }
+    return options;
+}
+
 function makePromptOptimizerSelect(initialValue, onChange = null, optionList = null) {
     const root = document.createElement("div");
     root.className = "h3-optimizer-settings-select-wrap";
@@ -4026,10 +4042,15 @@ async function openPromptOptimizerSettings(node) {
     const ggufModel = makePromptOptimizerSelect(promptOptimizerSettingsCache.gguf_model, null, [
         { value: promptOptimizerSettingsCache.gguf_model, label: promptOptimizerSettingsCache.gguf_model || TEXT.ggufEmpty },
     ]);
-    const ggufMmproj = makePromptOptimizerSelect(promptOptimizerSettingsCache.gguf_mmproj, null, [
-        { value: GGUF_MMPROJ_AUTO, label: TEXT.ggufAuto },
-        { value: GGUF_MMPROJ_NONE, label: TEXT.ggufNone },
-    ]);
+    // The saved projector has to be in the list from the start. The select drops
+    // an initial value it cannot find and falls back to the first option, so
+    // seeding only auto/none silently reset a configured projector to auto — and
+    // the catalog fetch below then "restored" that reset value.
+    const ggufMmproj = makePromptOptimizerSelect(
+        promptOptimizerSettingsCache.gguf_mmproj,
+        null,
+        mmprojOptionList(promptOptimizerSettingsCache.gguf_mmproj),
+    );
     const ggufUnloadLabel = document.createElement("div");
     ggufUnloadLabel.className = "h3-optimizer-settings-check";
     const ggufUnload = makePromptOptimizerSwitch(promptOptimizerSettingsCache.gguf_unload_after);
@@ -4098,17 +4119,17 @@ async function openPromptOptimizerSettings(node) {
         if (ggufCatalogLoaded) return;
         ggufCatalogLoaded = true;
         loadGgufModelCatalog().then((catalog) => {
+            // Read the current choices first: setOptions drops a value the new
+            // list does not contain, so both lists are built to include it.
             const selectedModel = ggufModel.value;
-            ggufModel.setOptions(catalog.models.length
-                ? catalog.models.map((value) => ({ value, label: value }))
-                : [{ value: "", label: TEXT.ggufEmpty }]);
+            const models = catalog.models.map((value) => ({ value, label: value }));
+            if (selectedModel && !catalog.models.includes(selectedModel)) {
+                models.push({ value: selectedModel, label: selectedModel });
+            }
+            ggufModel.setOptions(models.length ? models : [{ value: "", label: TEXT.ggufEmpty }]);
             ggufModel.value = selectedModel;
             const selectedMmproj = ggufMmproj.value;
-            ggufMmproj.setOptions([
-                { value: GGUF_MMPROJ_AUTO, label: TEXT.ggufAuto },
-                { value: GGUF_MMPROJ_NONE, label: TEXT.ggufNone },
-                ...catalog.mmproj.map((value) => ({ value, label: value })),
-            ]);
+            ggufMmproj.setOptions(mmprojOptionList(selectedMmproj, catalog.mmproj));
             ggufMmproj.value = selectedMmproj;
         }).catch((catalogError) => {
             ggufCatalogLoaded = false;
@@ -6050,7 +6071,8 @@ function install() {
         font-family: "Google Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
       }
       .h3-optimizer-settings-dialog {
-        width: min(440px, calc(100vw - 32px)); max-height: calc(100vh - 32px); box-sizing: border-box; overflow: auto; border: 1px solid rgba(255,255,255,.15); border-radius: 16px;
+        width: min(440px, calc(100vw - 32px)); max-height: calc(100vh - 32px); box-sizing: border-box;
+        overflow-x: hidden; overflow-y: auto; border: 1px solid rgba(255,255,255,.15); border-radius: 16px;
         background: var(--h3-settings-bg-base); color: var(--h3-settings-text); box-shadow: 0 24px 64px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.05);
       }
       .h3-optimizer-settings-header { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px 20px 12px; border-bottom: 1px solid var(--h3-settings-border); }
@@ -6061,10 +6083,13 @@ function install() {
         color: rgba(227,227,227,.56); cursor: pointer; font: inherit; font-size: 17px; font-weight: 500; line-height: 1; transition: background .2s, border-color .2s, color .2s;
       }
       .h3-optimizer-settings-close:hover, .h3-optimizer-settings-close:focus-visible { border-color: rgba(168,199,250,.32); background: rgba(168,199,250,.1); color: #dce7fa; outline: none; }
-      .h3-optimizer-settings-form { display: grid; gap: 10px; padding: 14px 20px 12px; }
-      .h3-optimizer-settings-row { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-height: 0; }
-      .h3-optimizer-settings-label { color: var(--h3-settings-muted); font-size: 13px; font-weight: 500; }
-      .h3-optimizer-settings-hint { margin: -2px 0 2px; color: var(--h3-settings-muted); font-size: 12px; line-height: 1.5; }
+      /* minmax(0, 1fr) rather than the default: a grid item refuses to shrink
+         below its content's min-content width, and a number input or a long
+         model path is enough to push the dialog into a horizontal scrollbar. */
+      .h3-optimizer-settings-form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 14px 20px 12px; }
+      .h3-optimizer-settings-row { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-width: 0; min-height: 0; }
+      .h3-optimizer-settings-label { color: var(--h3-settings-muted); font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+      .h3-optimizer-settings-hint { min-width: 0; margin: -2px 0 2px; color: var(--h3-settings-muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
       .h3-optimizer-settings-hint[hidden] { display: none !important; }
       .h3-optimizer-settings-row[hidden] { display: none !important; }
       .h3-optimizer-settings-check[hidden] { display: none !important; }
@@ -6091,7 +6116,8 @@ function install() {
       .h3-optimizer-settings-select-option:hover { background: rgba(255,255,255,.06); }
       .h3-optimizer-settings-select-option.is-selected { background: rgba(168,199,250,.1); color: var(--h3-settings-accent); font-weight: 500; }
       .h3-optimizer-settings-select-option.is-selected::after { content: "\\2713"; margin-left: auto; color: currentColor; font-size: 14px; }
-      .h3-optimizer-settings-check { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 26px; color: var(--h3-settings-text); font-size: 13px; cursor: pointer; }
+      .h3-optimizer-settings-check { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; min-height: 26px; color: var(--h3-settings-text); font-size: 13px; cursor: pointer; }
+      .h3-optimizer-settings-check > span { min-width: 0; overflow-wrap: anywhere; }
       .h3-optimizer-settings-switch { position: relative; display: inline-block; width: 40px; height: 22px; flex: 0 0 40px; padding: 0; border: 0; background: transparent; cursor: pointer; }
       .h3-optimizer-settings-switch-track { position: absolute; inset: 0; display: block; border: 1px solid rgba(255,255,255,.1); border-radius: 22px; background: #22252a; transition: background-color .2s, border-color .2s; }
       .h3-optimizer-settings-switch-thumb { position: absolute; left: 3px; bottom: 3px; width: 16px; height: 16px; border-radius: 50%; background: #747a83; box-shadow: 0 1px 3px rgba(0,0,0,.32); transition: transform .2s, background-color .2s; }
@@ -6099,7 +6125,7 @@ function install() {
       .h3-optimizer-settings-switch.is-on .h3-optimizer-settings-switch-thumb { background: #969ca5; }
       .h3-optimizer-settings-switch.is-on .h3-optimizer-settings-switch-thumb { transform: translateX(18px); }
       .h3-optimizer-settings-switch:focus-visible { outline: 2px solid var(--h3-settings-accent); outline-offset: 3px; border-radius: 12px; }
-      .h3-optimizer-settings-error { margin: -3px 20px 2px; color: #f28b82; font-size: 12px; line-height: 1.5; }
+      .h3-optimizer-settings-error { margin: -3px 20px 2px; color: #f28b82; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
       .h3-optimizer-settings-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 0 20px 14px; }
       .h3-optimizer-settings-button {
         appearance: none; min-width: 76px; height: 34px; padding: 0 14px; border: 1px solid rgba(255,255,255,.1); border-radius: 9px; cursor: pointer; font: inherit; font-size: 13px; font-weight: 500; transition: all .2s cubic-bezier(.2,0,0,1);
