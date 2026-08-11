@@ -82,6 +82,10 @@ the node stops it the same way.
 How much actually stops depends on the format:
 
 - **GGUF** — generation stops mid-run, so the model releases the GPU right away.
+  Loading the model and reading the prompt still run to completion first;
+  llama-cpp offers no way to interrupt either, so a stop pressed during those
+  phases takes effect once the first token is produced. **Describe media one at
+  a time** shortens each of those phases considerably.
 - **OpenAI-compatible / Gemini** — an HTTP request already in flight cannot be
   interrupted, so the remote call finishes and may still be billed. Its answer
   is discarded.
@@ -277,6 +281,8 @@ Selecting this format replaces the API rows with:
 - **Max generated tokens** — shared with the text encoder format.
 - **Unload the model after use** — frees it as soon as the prompt comes back,
   instead of keeping it resident for the next click.
+- **Describe media one at a time** — see below. Only shown while **Read
+  connected media** is on.
 
 The model stays loaded between optimizations and is released automatically when
 any of these settings change.
@@ -311,6 +317,42 @@ resolved, the prompt is optimized from text alone and a warning is logged.
 
 Video and audio references are not sent — only images, matching the
 OpenAI-compatible format.
+
+### Describe media one at a time
+
+**Describe media one at a time** switches the GGUF format to the same two-stage
+shape the text encoder uses: each connected image is described in its own pass,
+and the prompt-writing pass then receives those descriptions as text with no
+image attached.
+
+```
+=== CONNECTED MEDIA ===
+<Picture 1>: a woman in a red coat standing under a shop awning, overcast daylight...
+<Picture 2>: an empty road at night, wet asphalt reflecting neon signage...
+```
+
+Each description is labelled with the tag the prompt itself uses, capped at 256
+tokens, and produced with a two-line system prompt rather than the whole H3
+Prompt Guide.
+
+Why this helps a local model in particular:
+
+- **It responds to the stop button.** Attaching the whole reference set behind
+  the full guide makes one very long prompt-evaluation phase, and nothing in
+  llama-cpp can interrupt that — the editor looks frozen. Split up, every phase
+  is short, and cancelling lands between assets as well as inside generation.
+- **It fits in the context.** Images and the guide compete for `n_ctx` in a
+  single request; separately, neither pass is close to the limit.
+- **Attention is not divided.** The describing pass sees one image and one
+  instruction; the writing pass sees text only.
+
+The cost is one extra generation per image. With one image and a fast model the
+combined format is often quicker anyway, because nothing has to evaluate a
+guide-sized multimodal prompt.
+
+It is **off by default**, so an existing setup keeps sending images with the
+prompt. Video and audio are skipped either way (llama-cpp carries images only),
+and each skip is named in the log instead of passing silently.
 
 ### Scope
 

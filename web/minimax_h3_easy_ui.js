@@ -47,6 +47,7 @@ const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     gguf_context: GGUF_CONTEXT_DEFAULT,
     gguf_gpu_layers: -1,
     gguf_unload_after: false,
+    gguf_describe_media: false,
 });
 let promptOptimizerSettingsCache = { ...PROMPT_OPTIMIZER_SETTINGS_DEFAULTS };
 let promptOptimizerSettingsLoaded = false;
@@ -136,6 +137,7 @@ const TEXT = {
     ggufContext: ZH_BROWSER ? "\u4e0a\u4e0b\u6587\u957f\u5ea6" : "Context length",
     ggufGpuLayers: ZH_BROWSER ? "GPU \u5c42\u6570 (-1 = \u5168\u90e8)" : "GPU layers (-1 = all)",
     ggufUnload: ZH_BROWSER ? "\u7528\u5b8c\u540e\u5378\u8f7d\u6a21\u578b" : "Unload the model after use",
+    ggufDescribe: ZH_BROWSER ? "\u9010\u4e2a\u63cf\u8ff0\u5a92\u4f53" : "Describe media one at a time",
     ggufAuto: ZH_BROWSER ? "\u81ea\u52a8\uff08\u6a21\u578b\u65c1\u7684 mmproj\uff09" : "Auto (mmproj next to the model)",
     ggufNone: ZH_BROWSER ? "\u4e0d\u4f7f\u7528" : "None",
     ggufEmpty: ZH_BROWSER ? "\u672a\u627e\u5230 .gguf \u6587\u4ef6" : "No .gguf file found",
@@ -3717,6 +3719,7 @@ function normalizePromptOptimizerSettings(value) {
         gguf_context: clamp(source.gguf_context, GGUF_CONTEXT_DEFAULT, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT),
         gguf_gpu_layers: clamp(source.gguf_gpu_layers, -1, -1, 1024),
         gguf_unload_after: asBoolean(source.gguf_unload_after, false),
+        gguf_describe_media: asBoolean(source.gguf_describe_media, false),
     };
 }
 
@@ -4034,10 +4037,18 @@ async function openPromptOptimizerSettings(node) {
     const ggufUnloadText = document.createElement("span");
     ggufUnloadText.textContent = TEXT.ggufUnload;
     ggufUnloadLabel.append(ggufUnloadText, ggufUnload);
+    const ggufDescribeLabel = document.createElement("div");
+    ggufDescribeLabel.className = "h3-optimizer-settings-check";
+    const ggufDescribe = makePromptOptimizerSwitch(promptOptimizerSettingsCache.gguf_describe_media);
+    ggufDescribe.setAttribute("aria-label", TEXT.ggufDescribe);
+    const ggufDescribeText = document.createElement("span");
+    ggufDescribeText.textContent = TEXT.ggufDescribe;
+    ggufDescribeLabel.append(ggufDescribeText, ggufDescribe);
     const readMediaLabel = document.createElement("div");
     readMediaLabel.className = "h3-optimizer-settings-check";
     const readMedia = makePromptOptimizerSwitch(promptOptimizerSettingsCache.read_media);
     readMedia.setAttribute("aria-label", TEXT.readMedia);
+    readMedia.addEventListener("click", () => syncFormatRows());
     const readMediaText = document.createElement("span");
     readMediaText.textContent = TEXT.readMedia;
     readMediaLabel.append(readMediaText, readMedia);
@@ -4064,6 +4075,7 @@ async function openPromptOptimizerSettings(node) {
         localMaxLengthRow,
         ggufUnloadLabel,
         readMediaLabel,
+        ggufDescribeLabel,
     );
     // Each format uses a different half of this form, so only its own rows stay
     // visible. Read connected media applies to all of them.
@@ -4073,6 +4085,8 @@ async function openPromptOptimizerSettings(node) {
         const local = clip || gguf;
         for (const row of [apiUrlRow, apiKeyRow, modelRow]) row.hidden = local;
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadLabel]) row.hidden = !gguf;
+        // Describing media one at a time only means something once media is read.
+        ggufDescribeLabel.hidden = !gguf || !readMedia.checked;
         localMaxLengthRow.hidden = !local;
         hint.hidden = !local;
         hint.textContent = gguf ? TEXT.ggufHint : TEXT.optimizerClipHint;
@@ -4154,6 +4168,7 @@ async function openPromptOptimizerSettings(node) {
                 gguf_context: ggufContext.value,
                 gguf_gpu_layers: ggufGpuLayers.value,
                 gguf_unload_after: ggufUnload.checked,
+                gguf_describe_media: ggufDescribe.checked,
             });
             notifyPromptOptimizer(TEXT.settingsSaved, "success");
             close();

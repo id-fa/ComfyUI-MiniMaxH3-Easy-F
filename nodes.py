@@ -23,7 +23,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -168,6 +168,7 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "gguf_context": OPTIMIZER_GGUF_CONTEXT,
     "gguf_gpu_layers": OPTIMIZER_GGUF_GPU_LAYERS,
     "gguf_unload_after": False,
+    "gguf_describe_media": False,
 }
 
 
@@ -452,6 +453,9 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     unload = source.get("gguf_unload_after", False)
     if isinstance(unload, str):
         unload = unload.strip().lower() in {"1", "true", "yes", "on"}
+    describe = source.get("gguf_describe_media", False)
+    if isinstance(describe, str):
+        describe = describe.strip().lower() in {"1", "true", "yes", "on"}
     return {
         "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
         "api_format": api_format,
@@ -465,6 +469,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "gguf_context": integer("gguf_context", OPTIMIZER_GGUF_CONTEXT, OPTIMIZER_GGUF_CONTEXT_MIN, OPTIMIZER_GGUF_CONTEXT_LIMIT),
         "gguf_gpu_layers": integer("gguf_gpu_layers", OPTIMIZER_GGUF_GPU_LAYERS, -1, 1024),
         "gguf_unload_after": bool(unload),
+        "gguf_describe_media": bool(describe),
     }
 
 
@@ -754,14 +759,24 @@ def _optimizer_asset_path(asset: Mapping[str, Any]) -> str | None:
     return candidate if os.path.isfile(candidate) else None
 
 
-def _optimizer_media_parts(resources: list[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
-    parts: list[dict[str, Any]] = []
+def _optimizer_media_items(resources: list[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
+    """Resolve the editor's media list into taggable request parts.
+
+    Every readable asset is kept, including the ones this format cannot carry:
+    their `part` is None so a caller can say what it skipped instead of quietly
+    dropping the reference. `tag` is the same `<Picture N>` the prompt uses.
+    """
+    items: list[dict[str, Any]] = []
+    ordinals: dict[str, int] = {}
     for resource in resources[:MAX_MEDIA]:
         asset = resource.get("asset") if isinstance(resource.get("asset"), Mapping) else {}
         path = _optimizer_asset_path(asset)
         media_type = str(resource.get("type") or "").lower()
         if not path or media_type not in {"image", "video", "audio"}:
             continue
+        ordinals[media_type] = ordinals.get(media_type, 0) + 1
+        tag = str(resource.get("tag") or "").strip() or f"{media_type} {ordinals[media_type]}"
+        part = None
         try:
             if os.path.getsize(path) > 32 * 1024 * 1024:
                 continue
@@ -769,12 +784,17 @@ def _optimizer_media_parts(resources: list[Mapping[str, Any]], api_format: str) 
                 encoded = base64.b64encode(handle.read()).decode("ascii")
             mime = mimetypes.guess_type(path)[0] or {"image": "image/jpeg", "video": "video/mp4", "audio": "audio/wav"}[media_type]
             if api_format == "gemini":
-                parts.append({"inlineData": {"mimeType": mime, "data": encoded}})
+                part = {"inlineData": {"mimeType": mime, "data": encoded}}
             elif media_type == "image":
-                parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+                part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
         except (OSError, ValueError):
             continue
-    return parts
+        items.append({"tag": tag, "type": media_type, "part": part})
+    return items
+
+
+def _optimizer_media_parts(resources: list[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
+    return [item["part"] for item in _optimizer_media_items(resources, api_format) if item["part"]]
 
 
 def _media_counts_from_kwargs(kwargs: Mapping[str, Any]) -> dict[str, int]:
@@ -1265,73 +1285,71 @@ def _optimizer_gguf_model(settings: Mapping[str, Any], want_vision: bool):
     return llm, handler is not None
 
 
-def _optimizer_gguf_stopping_criteria(should_stop):
-    """Wrap the cancel check in what llama-cpp expects, when it supports one."""
-    if should_stop is None:
-        return None
+def _optimizer_gguf_stream(llm, request: dict[str, Any], should_stop) -> str:
+    """Generate token by token so a cancel lands within one token.
+
+    llama-cpp's `stopping_criteria` exists on `create_completion` but not on
+    `create_chat_completion`, so the chat API can only be interrupted by walking
+    its stream and closing it. Prompt evaluation still runs to completion before
+    the first token arrives; nothing in llama-cpp interrupts that.
+    """
+    pieces: list[str] = []
+    tokens = 0
+    started = time.perf_counter()
+    stream = llm.create_chat_completion(**request, stream=True)
     try:
-        from llama_cpp import StoppingCriteriaList
-    except ImportError:
-        return None
-    return StoppingCriteriaList([lambda input_ids, logits: bool(should_stop())])
+        for chunk in stream:
+            choice = ((chunk.get("choices") or [{}])[0]) if isinstance(chunk, Mapping) else {}
+            delta = choice.get("delta") if isinstance(choice.get("delta"), Mapping) else choice.get("message")
+            piece = (delta or {}).get("content") if isinstance(delta, Mapping) else None
+            if piece:
+                pieces.append(str(piece))
+                tokens += 1
+            if should_stop():
+                raise _OptimizerCancelled("Prompt optimization was cancelled")
+    finally:
+        # Closing the generator unwinds llama-cpp's own sampling loop, which is
+        # what actually frees the GPU when the user stops early.
+        try:
+            stream.close()
+        except Exception:
+            pass
+    elapsed = time.perf_counter() - started
+    _optimizer_log("generated %d tokens in %.1fs (%.1f tok/s)", tokens, elapsed, tokens / max(elapsed, 1e-6))
+    return "".join(pieces)
 
 
-def _optimizer_gguf_json(
-    settings: Mapping[str, Any],
+def _optimizer_gguf_chat(
+    llm,
     system_prompt: str,
-    user_prompt: str,
-    media_parts: list[dict[str, Any]] | None = None,
+    user_text: str,
+    parts: list[dict[str, Any]],
+    max_tokens: int,
+    gemma: bool,
     should_stop=None,
 ) -> str:
-    """Run the prompt through a local GGUF and return the rewritten text."""
-    images = [part for part in (media_parts or []) if part.get("type") == "image_url"]
-    started = time.perf_counter()
-    # Announced once the model resolves, so a misconfigured run reports the
-    # problem instead of claiming to start. Loading its own progress line.
-    llm, vision = _optimizer_gguf_model(settings, bool(images))
-    _optimizer_log(
-        "optimizing the prompt with GGUF %s (guide=%d chars, prompt=%d chars, images=%d)",
-        str(settings.get("gguf_model") or ""), len(system_prompt), len(user_prompt), len(images),
-    )
-    if images and not vision:
-        logging.warning("MiniMax H3 Easy: no vision projector for this GGUF; optimizing from text only.")
-        images = []
-    gemma = _is_gemma_gguf_name(str(settings.get("gguf_model") or ""))
+    """One llama-cpp turn with reasoning off and cancellation wired in."""
     # Qwen switches reasoning off with an inline token; Gemma has no equivalent
     # and relies on the handler flag plus the output cleanup. The optimizer's
     # answer is used as the prompt verbatim, so a thinking block is never wanted.
-    text = user_prompt if gemma else f"/no_think\n{user_prompt}"
+    text = user_text if gemma else f"/no_think\n{user_text}"
     stop = ["<|turn>", "<|channel>", "<end_of_turn>", "<start_of_turn>"] if gemma else ["<|im_end|>", "<|im_start|>"]
-    content: Any = text
-    if images:
-        content = [{"type": "text", "text": text}, *images]
-    max_tokens = int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)
-    _optimizer_log("generating (max_tokens=%d, images=%d)...", max_tokens, len(images))
-    step = time.perf_counter()
+    content: Any = [{"type": "text", "text": text}, *parts] if parts else text
     request = {
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ],
-        "max_tokens": max_tokens,
+        "max_tokens": int(max_tokens),
         "temperature": 0.7,
         "top_p": 0.95,
         "seed": 0,
         "stop": stop,
     }
-    criteria = _optimizer_gguf_stopping_criteria(should_stop)
-    try:
-        try:
-            result = llm.create_chat_completion(**request, stopping_criteria=criteria) if criteria else llm.create_chat_completion(**request)
-        except TypeError:
-            # Builds without stopping_criteria support run to completion; the
-            # editor has already stopped waiting either way.
-            result = llm.create_chat_completion(**request)
-    finally:
-        if bool(settings.get("gguf_unload_after")):
-            _optimizer_gguf_release()
-    if should_stop is not None and should_stop():
-        raise _OptimizerCancelled("Prompt optimization was cancelled")
+    if should_stop is not None:
+        return _strip_optimizer_output(_optimizer_gguf_stream(llm, request, should_stop))
+    step = time.perf_counter()
+    result = llm.create_chat_completion(**request)
     generated = time.perf_counter() - step
     usage = result.get("usage") if isinstance(result, Mapping) else None
     tokens = (usage or {}).get("completion_tokens") if isinstance(usage, Mapping) else None
@@ -1341,7 +1359,98 @@ def _optimizer_gguf_json(
         _optimizer_log("generation finished in %.1fs", generated)
     choices = result.get("choices") if isinstance(result, Mapping) else None
     message = (choices or [{}])[0].get("message") if choices else None
-    text = _strip_optimizer_output((message or {}).get("content"))
+    return _strip_optimizer_output((message or {}).get("content"))
+
+
+def _optimizer_gguf_describe(
+    settings: Mapping[str, Any],
+    media_items: Sequence[Mapping[str, Any]],
+    should_stop=None,
+) -> tuple[str, int]:
+    """Describe every attachable media on its own, then return one text block.
+
+    Same reasoning as the text-encoder path, plus two benefits that matter for a
+    local model: each pass carries one image and a two-line system prompt instead
+    of the whole reference set behind the entire prompt guide, and cancellation
+    is honoured between assets as well as during generation.
+    """
+    describable = [item for item in media_items if str(item.get("type")) in OPTIMIZER_CLIP_DESCRIBE_REQUESTS]
+    if not describable:
+        return "", 0
+    llm, vision = _optimizer_gguf_model(settings, True)
+    if not vision:
+        logging.warning("MiniMax H3 Easy: no vision projector for this GGUF; optimizing from text only.")
+        return "", 0
+    gemma = _is_gemma_gguf_name(str(settings.get("gguf_model") or ""))
+    length = min(int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH), OPTIMIZER_CLIP_DESCRIBE_LENGTH)
+    lines: list[str] = []
+    started = time.perf_counter()
+    _optimizer_log("describing %d connected media with the GGUF, one at a time", len(describable))
+    for index, item in enumerate(describable, start=1):
+        if should_stop is not None and should_stop():
+            raise _OptimizerCancelled("Prompt optimization was cancelled")
+        media_type = str(item.get("type"))
+        label = str(item.get("tag") or f"{media_type} {index}")
+        part = item.get("part")
+        if not part:
+            # llama-cpp carries images only; saying nothing is better than
+            # letting the prompt writer imagine the content.
+            _optimizer_log("  %s (%d/%d): skipped, llama-cpp takes no %s", label, index, len(describable), media_type)
+            continue
+        _optimizer_log("  %s (%d/%d): describing the %s...", label, index, len(describable), media_type)
+        step = time.perf_counter()
+        try:
+            description = _optimizer_gguf_chat(
+                llm, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, OPTIMIZER_CLIP_DESCRIBE_REQUESTS[media_type],
+                [part], length, gemma, should_stop,
+            )
+        except _OptimizerCancelled:
+            raise
+        except Exception as exc:
+            logging.warning("MiniMax H3 Easy: could not describe %s for the prompt optimizer (%s).", label, exc)
+            continue
+        if not description:
+            _optimizer_log("  %s (%d/%d): skipped, the model returned nothing", label, index, len(describable))
+            continue
+        _optimizer_log("  %s (%d/%d): %.1fs, %d chars", label, index, len(describable), time.perf_counter() - step, len(description))
+        lines.append(f"{label}: {description}")
+    _optimizer_log("described %d of %d connected media in %.1fs", len(lines), len(describable), time.perf_counter() - started)
+    return "\n".join(lines), len(lines)
+
+
+def _optimizer_gguf_json(
+    settings: Mapping[str, Any],
+    system_prompt: str,
+    user_prompt: str,
+    media_parts: list[dict[str, Any]] | None = None,
+    should_stop=None,
+    context: str = "",
+    keep_vision: bool = False,
+) -> str:
+    """Run the prompt through a local GGUF and return the rewritten text."""
+    images = [part for part in (media_parts or []) if part.get("type") == "image_url"]
+    started = time.perf_counter()
+    # Announced once the model resolves, so a misconfigured run reports the
+    # problem instead of claiming to start. Loading has its own progress line.
+    # keep_vision holds the projector in the signature after a describe pass, so
+    # the text-only final pass reuses that model instead of reloading it.
+    llm, vision = _optimizer_gguf_model(settings, bool(images) or keep_vision)
+    _optimizer_log(
+        "optimizing the prompt with GGUF %s (guide=%d chars, prompt=%d chars, images=%d, descriptions=%d chars)",
+        str(settings.get("gguf_model") or ""), len(system_prompt), len(user_prompt), len(images), len(context),
+    )
+    if images and not vision:
+        logging.warning("MiniMax H3 Easy: no vision projector for this GGUF; optimizing from text only.")
+        images = []
+    gemma = _is_gemma_gguf_name(str(settings.get("gguf_model") or ""))
+    user_text = f"=== CONNECTED MEDIA ===\n{context.strip()}\n\n=== USER PROMPT ===\n{user_prompt}" if context.strip() else user_prompt
+    max_tokens = int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)
+    _optimizer_log("generating (max_tokens=%d, images=%d)...", max_tokens, len(images))
+    try:
+        text = _optimizer_gguf_chat(llm, system_prompt, user_text, images, max_tokens, gemma, should_stop)
+    finally:
+        if bool(settings.get("gguf_unload_after")):
+            _optimizer_gguf_release()
     if not text:
         raise ValueError("The GGUF model returned an empty prompt")
     _optimizer_log("prompt optimization finished in %.1fs (%d chars)", time.perf_counter() - started, len(text))
@@ -1493,15 +1602,24 @@ def _register_prompt_optimizer_route() -> bool:
             # llama-cpp takes the same OpenAI-shaped image parts as the HTTP
             # chat-completions format, so the media builder is shared.
             parts_format = OPTIMIZER_FORMAT_OPENAI if local else api_format
-            media_parts = _optimizer_media_parts(resources, parts_format) if bool(settings.get("read_media")) else []
-            system = _optimizer_system_prompt(scene_guide, mode, seconds, counts, len(media_parts))
+            media_items = _optimizer_media_items(resources, parts_format) if bool(settings.get("read_media")) else []
+            # The GGUF loop polls this, so cancelling actually stops the
+            # generation instead of only freeing the editor.
+            should_stop = (lambda: _optimizer_is_cancelled(request_id)) if request_id else None
+            describe = local and bool(settings.get("gguf_describe_media")) and bool(media_items)
+            described, described_count = "", 0
             _optimizer_raise_if_cancelled(request_id)
+            if describe:
+                described, described_count = await asyncio.to_thread(
+                    _optimizer_gguf_describe, settings, media_items, should_stop,
+                )
+                _optimizer_raise_if_cancelled(request_id)
+            media_parts = [] if describe else [item["part"] for item in media_items if item["part"]]
+            system = _optimizer_system_prompt(scene_guide, mode, seconds, counts, len(media_parts), described_count)
             if local:
-                # The GGUF loop polls this, so cancelling actually stops the
-                # generation instead of only freeing the editor.
                 result = await asyncio.to_thread(
                     _optimizer_gguf_json, settings, system, prompt, media_parts,
-                    (lambda: _optimizer_is_cancelled(request_id)) if request_id else None,
+                    should_stop, described, describe,
                 )
             else:
                 result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
