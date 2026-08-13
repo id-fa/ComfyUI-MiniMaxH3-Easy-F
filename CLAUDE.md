@@ -196,7 +196,7 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   `/no_think` and `force_reasoning=False` for Qwen and family-specific `stop` markers; Gemini:
   `thinkingConfig.thinkingBudget=0`), and `_strip_optimizer_output` is the shared backstop.
   Don't add a "reasoning" toggle without deciding what the leftover block should do to the H3 prompt.
-  Two mistakes were made here already — do not reintroduce either:
+  Three mistakes were made here already — do not reintroduce any of them:
   1. **The HTTP formats sent no switch and never called `_strip_optimizer_output`**, so a reasoning
      model behind an OpenAI-compatible endpoint wrote its thoughts straight into the H3 prompt while
      this file claimed otherwise. The switches now go through `_optimizer_thinking_off_payload`, and
@@ -207,6 +207,14 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
      the tag in the assistant turn, so the response begins with bare reasoning prose and the only tag
      in it is the closing one — the whole block leaked. `_OPTIMIZER_THINK_CLOSE_RE` therefore makes the
      opening tag optional and is greedy to the **last** closing tag.
+  3. **Only Harmony's exact `<|channel|>final<|message|>` was recognised.** Gemma 4 marks its
+     reasoning with the same idea but different pipes — `<|channel>thought` … `<channel|>`, the
+     closing marker carrying no role and no `<|message|>` — so the whole thought leaked into the H3
+     prompt, and `/no_think` is not sent to Gemma in the first place (`_optimizer_gguf_chat`).
+     `_OPTIMIZER_CHANNEL_MARK` therefore accepts every spelling, and `_OPTIMIZER_THOUGHT_CHANNEL_RE`
+     cuts to the last marker when the block opens on a thinking role. Note that `<|channel>` is
+     *also* in the gemma `stop` list in `_optimizer_gguf_chat`; it evidently does not fire through
+     the vision chat handler, but do not add the closing marker there — the prompt is what follows it.
   Untagged reasoning cannot be removed: nothing marks where it ends. Don't add heuristics that guess at
   prose preambles — they will eat real prompts. The switches are what has to work.
 - `clip` runs locally through the node's optional `optimizer_clip` CLIP input using ComfyUI's

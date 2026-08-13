@@ -1028,8 +1028,25 @@ _OPTIMIZER_THINK_TAGS = "think|thinking|reasoning|thought|analysis"
 # Requiring the opening tag let that whole reasoning block into the H3 prompt.
 _OPTIMIZER_THINK_CLOSE_RE = re.compile(rf"\A.*</(?:{_OPTIMIZER_THINK_TAGS})>", flags=re.I | re.S)
 _OPTIMIZER_OPEN_THINK_RE = re.compile(rf"\A\s*<(?:{_OPTIMIZER_THINK_TAGS})>", flags=re.I)
-# Harmony-style channel markers (gpt-oss and friends) put the answer last.
-_OPTIMIZER_FINAL_CHANNEL_RE = re.compile(r"\A.*<\|channel\|>final<\|message\|>", flags=re.I | re.S)
+# Channel markers instead of tags. gpt-oss writes Harmony's `<|channel|>`, but the
+# pipes move: Gemma 4 opens with `<|channel>thought` and closes with `<channel|>`,
+# so every spelling of the same marker has to be accepted.
+_OPTIMIZER_CHANNEL_MARK = r"<\|?channel\|?>"
+_OPTIMIZER_MESSAGE_MARK = r"<\|?message\|?>"
+# Both are greedy: the prompt is whatever follows the LAST marker.
+_OPTIMIZER_FINAL_CHANNEL_RE = re.compile(
+    rf"\A.*{_OPTIMIZER_CHANNEL_MARK}\s*final\s*{_OPTIMIZER_MESSAGE_MARK}", flags=re.I | re.S
+)
+# A thinking channel that is closed by a bare marker, with no `final` role and no
+# `<|message|>` after it — the prompt simply starts there.
+_OPTIMIZER_THOUGHT_CHANNEL_RE = re.compile(
+    rf"\A.*{_OPTIMIZER_CHANNEL_MARK}\s*(?:{_OPTIMIZER_THINK_TAGS})\b.*"
+    rf"{_OPTIMIZER_CHANNEL_MARK}\s*(?:{_OPTIMIZER_MESSAGE_MARK})?",
+    flags=re.I | re.S,
+)
+_OPTIMIZER_OPEN_CHANNEL_RE = re.compile(
+    rf"\A\s*{_OPTIMIZER_CHANNEL_MARK}\s*(?:{_OPTIMIZER_THINK_TAGS})\b", flags=re.I
+)
 _OPTIMIZER_TRAILING_TOKEN_RE = re.compile(r"<\|(?:return|end|endoftext|im_end)\|>\s*\Z", flags=re.I)
 
 
@@ -1046,9 +1063,10 @@ def _strip_optimizer_output(text: Any) -> str:
     """
     value = str(text or "").strip()
     value = _OPTIMIZER_FINAL_CHANNEL_RE.sub("", value).strip()
+    value = _OPTIMIZER_THOUGHT_CHANNEL_RE.sub("", value).strip()
     value = _OPTIMIZER_TRAILING_TOKEN_RE.sub("", value).strip()
     value = _OPTIMIZER_THINK_CLOSE_RE.sub("", value).strip()
-    if _OPTIMIZER_OPEN_THINK_RE.match(value):
+    if _OPTIMIZER_OPEN_THINK_RE.match(value) or _OPTIMIZER_OPEN_CHANNEL_RE.match(value):
         # An unterminated block means the answer was cut off mid-thought, so
         # there is no prompt in here at all.
         return ""
