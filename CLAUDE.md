@@ -165,9 +165,14 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
 - Settings are **installation-global** (`prompt_optimizer.json`), not per-node; only
   `prompt_optimizer_scene_guide` is a saved node widget. The `prompt_optimizer_settings` boolean is a
   momentary trigger that the frontend resets to `false` and `graphToPrompt` always forces to `false`.
-- Four `api_format`s: OpenAI-compatible chat completions, Gemini native `generateContent`, `clip`, and
-  `gguf`. URL handling for the HTTP pair is forgiving (`_normalize_optimizer_url` appends/strips
-  endpoints, injects the Gemini model path and `key=`).
+- Five `api_format`s (`OPTIMIZER_FORMATS`, duplicated in the JS): OpenAI-compatible chat completions,
+  OpenAI `responses`, Gemini native `generateContent`, `clip`, and `gguf`. URL handling for the three
+  HTTP ones is forgiving (`_normalize_optimizer_url` appends/strips endpoints, injects the Gemini model
+  path and `key=`). `responses` differs from `openai` in endpoint, payload and reply shape only — it is
+  otherwise the same servers, which is why `_optimizer_image_part` centralises the one thing all three
+  spell differently. It is also the one format that sends **no** thinking switch: the Responses API
+  rejects `chat_template_kwargs`, and it keeps reasoning in its own output items that
+  `_optimizer_responses_text` never reads.
 - `gguf` loads a local model with llama-cpp-python and therefore runs from the **editor route**, like the
   HTTP formats — only `clip` has to wait for execution. `_optimizer_gguf_catalog` scans `text_encoders`
   and `LLM` (the folders ComfyUI-QwenVL-F uses) and `GET /minimax_h3_easy/gguf_models` feeds the dropdown.
@@ -258,8 +263,12 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
 ## Conventions
 
 - All user-visible node/UI text is bilingual EN/ZH via the JS tables; Python error messages are English.
-- `IS_CHANGED` returns `NaN` on the executing nodes so media/prompt edits always re-run; the loader
-  returns its filename tuple so model choices cache correctly.
+- `IS_CHANGED` returns `NaN` on `MiniMaxH3EasyModelAdapter` and `MiniMaxH3PromptOptimizer`; the loader
+  returns its filename tuple so model choices cache correctly. `MiniMaxH3Easy` deliberately has **no**
+  `IS_CHANGED`: upstream removed it so an unchanged graph reuses its conditioning instead of re-encoding
+  every reference. Everything the node reads is a real input — the prompt widget is kept in sync by
+  `syncPromptWidgetFromDocs` — so edits still invalidate the cache. Do not add it back to make a UI
+  change take effect; make that change reach an input instead.
 - This repo is a fork. `README.md` and `README_CN.md` are kept byte-identical to upstream — do **not**
   edit them. Document every fork-only change in `README_fork.md` instead, and say there which upstream
   section it supersedes.

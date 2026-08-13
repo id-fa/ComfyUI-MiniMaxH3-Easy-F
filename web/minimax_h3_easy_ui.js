@@ -23,10 +23,17 @@ const PROMPT_OPTIMIZER_SETTINGS_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_se
 const PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized";
 const PROMPT_OPTIMIZER_GGUF_ENDPOINT = "/minimax_h3_easy/gguf_models";
 const OPTIMIZER_FORMAT_OPENAI = "openai";
+const OPTIMIZER_FORMAT_RESPONSES = "responses";
 const OPTIMIZER_FORMAT_GEMINI = "gemini";
 const OPTIMIZER_FORMAT_CLIP = "clip";
 const OPTIMIZER_FORMAT_GGUF = "gguf";
-const OPTIMIZER_FORMATS = [OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_CLIP, OPTIMIZER_FORMAT_GGUF];
+const OPTIMIZER_FORMATS = [
+    OPTIMIZER_FORMAT_OPENAI,
+    OPTIMIZER_FORMAT_RESPONSES,
+    OPTIMIZER_FORMAT_GEMINI,
+    OPTIMIZER_FORMAT_CLIP,
+    OPTIMIZER_FORMAT_GGUF,
+];
 const LOCAL_MAX_LENGTH_DEFAULT = 1024;
 const LOCAL_MIN_LENGTH = 16;
 const LOCAL_MAX_LENGTH_LIMIT = 32768;
@@ -160,6 +167,9 @@ const TEXT = {
     optimizerMissing: ZH_BROWSER ? "\u8bf7\u5148\u6253\u5f00 API \u8bbe\u7f6e\u5e76\u586b\u5199 API \u5730\u5740\u3001API Key \u548c\u6a21\u578b\u540d\u3002" : "Open API settings and enter the API URL, API key, and model first.",
     optimizerFailed: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u5931\u8d25" : "Prompt optimization failed",
     optimizerRunning: ZH_BROWSER ? "\u6b63\u5728\u4f18\u5316" : "Optimizing",
+    // Upstream's `optimizerCancel` is deliberately absent: its status-strip stop
+    // button only aborts the fetch, while this fork's \u2726 toggle also tells the
+    // server, so two stop controls would differ in what they actually stop.
     optimizerStop: ZH_BROWSER ? "\u505c\u6b62\u63d0\u793a\u8bcd\u4f18\u5316" : "Stop prompt optimization",
     optimizerCancelled: ZH_BROWSER ? "\u5df2\u505c\u6b62\u63d0\u793a\u8bcd\u4f18\u5316" : "Prompt optimization stopped",
     optimizerDone: ZH_BROWSER ? "\u4f18\u5316\u5b8c\u6210" : "Optimization complete",
@@ -227,6 +237,7 @@ const OPTION_DEFS = {
     },
     prompt_optimizer_api_format: {
         openai: ZH_BROWSER ? "OpenAI \u517c\u5bb9" : "OpenAI Compatible",
+        responses: "OpenAI Responses",
         gemini: ZH_BROWSER ? "Gemini \u539f\u751f" : "Gemini Native",
         clip: ZH_BROWSER ? "\u6587\u672c\u7f16\u7801\u5668\uff08clip \u8f93\u5165\uff09" : "Text encoder (clip input)",
         gguf: ZH_BROWSER ? "GGUF\uff08llama-cpp-python\uff09" : "GGUF (llama-cpp-python)",
@@ -1530,6 +1541,23 @@ function buildRuntimePrompt(node, runtimeLinks) {
     }).join("");
 }
 
+function preserveLinkedPromptInput(promptNode, node, name, fallbackValue) {
+    const input = node?.inputs?.find((slot) => String(slot?.name || "") === name);
+    if (input?.link != null) {
+        const link = getNativeGraphLink(node.graph || app.graph, input.link);
+        const originId = link?.origin_id ?? link?.originId;
+        const originSlot = link?.origin_slot ?? link?.originSlot ?? 0;
+        if (originId != null) {
+            promptNode.inputs[name] = [String(originId), Number(originSlot) || 0];
+            return;
+        }
+    }
+
+    const existing = promptNode?.inputs?.[name];
+    if (Array.isArray(existing) && existing.length >= 2) return;
+    promptNode.inputs[name] = fallbackValue;
+}
+
 function patchGraphToPrompt() {
     if (patchedPrompt || typeof app.graphToPrompt !== "function") return;
     patchedPrompt = true;
@@ -1573,8 +1601,8 @@ function patchGraphToPrompt() {
             promptNode.inputs.mode = canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE));
             promptNode.inputs.resolution = canonicalOption("resolution", getWidgetValue(node, "resolution", "480P"));
             promptNode.inputs.aspect_ratio = canonicalOption("aspect_ratio", getWidgetValue(node, "aspect_ratio", "16:9"));
-            promptNode.inputs.width = Number(getWidgetValue(node, "width", 1344));
-            promptNode.inputs.height = Number(getWidgetValue(node, "height", 768));
+            preserveLinkedPromptInput(promptNode, node, "width", Number(getWidgetValue(node, "width", 1344)));
+            preserveLinkedPromptInput(promptNode, node, "height", Number(getWidgetValue(node, "height", 768)));
             promptNode.inputs.seconds = Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 5)) || 5));
             promptNode.inputs.advanced = asBoolean(getWidgetValue(node, "advanced", false));
             promptNode.inputs.prompt_optimizer_settings = false;
@@ -3357,7 +3385,7 @@ function hideConditionalWidget(widget) {
     const originalType = widget.type;
     const originalComputeSize = widget.computeSize;
     const originalHidden = widget.hidden;
-    if (widget.type !== "hidden" && widget.type !== "converted-widget") widget.__h3ConditionalOrigType = widget.type;
+    if (widget.type !== "hidden") widget.__h3ConditionalOrigType = widget.type;
     if (!Object.prototype.hasOwnProperty.call(widget, "__h3ConditionalOrigComputeSize")) {
         widget.__h3ConditionalOrigComputeSize = originalComputeSize;
         widget.__h3ConditionalHadComputeSize = Object.prototype.hasOwnProperty.call(widget, "computeSize");
@@ -4412,6 +4440,11 @@ async function optimizePromptFromEditor(node) {
     const resources = promptOptimizerResources(node);
     const mediaCounts = { image: 0, video: 0, audio: 0 };
     resources.forEach((item) => { mediaCounts[item.type] = (mediaCounts[item.type] || 0) + 1; });
+    // Read once, up front: the widget can be changed while the request is in
+    // flight, and the answer has to match the mode that was actually asked for.
+    const requestMode = canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE));
+    // A string rather than upstream's Symbol, because the server needs it too:
+    // this id is what `prompt_optimize_cancel` stops.
     const requestId = `${node.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     node.__h3OptimizerPending = true;
@@ -4429,7 +4462,7 @@ async function optimizePromptFromEditor(node) {
                 request_id: requestId,
                 prompt: sourcePrompt,
                 scene_guide: state.scene_guide,
-                mode: canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE)),
+                mode: requestMode,
                 seconds: Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 5)) || 5)),
                 media_counts: mediaCounts,
                 resources,
@@ -4438,9 +4471,15 @@ async function optimizePromptFromEditor(node) {
         const data = await response.json().catch(() => ({}));
         if (data?.cancelled) throw new DOMException("cancelled", "AbortError");
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        // Every branch below is guarded by the id: a stopped request whose answer
+        // arrives late, or one the user superseded by starting another, must not
+        // write into the editor or reset the state of the run that replaced it.
+        // `cancelPromptOptimization` has already cleared the id and the status.
+        if (node.__h3OptimizerRequestId !== requestId) return;
         setPromptFromOptimizedText(node, String(data.prompt || ""));
         setPromptOptimizerStatus(node, "success");
     } catch (error) {
+        if (node.__h3OptimizerRequestId !== requestId) return;
         if (error?.name === "AbortError") {
             // Stopping is something the user asked for, not a failure.
             setPromptOptimizerStatus(node, "idle");
@@ -4449,10 +4488,12 @@ async function optimizePromptFromEditor(node) {
             notifyPromptOptimizer(error?.message || error);
         }
     } finally {
-        node.__h3OptimizerPending = false;
-        node.__h3OptimizerRequestId = "";
-        node.__h3OptimizerAbort = null;
-        syncPromptOptimizerButton(node);
+        if (node.__h3OptimizerRequestId === requestId) {
+            node.__h3OptimizerPending = false;
+            node.__h3OptimizerRequestId = "";
+            node.__h3OptimizerAbort = null;
+            syncPromptOptimizerButton(node);
+        }
     }
 }
 
@@ -5288,6 +5329,10 @@ function ensurePromptEditor(node) {
     const optimizerStatusSpinner = document.createElement("span");
     optimizerStatusSpinner.className = "h3-prompt-editor-status-spinner";
     const optimizerStatusText = document.createElement("span");
+    // Upstream moved the dimming off the container and onto the two children so
+    // its stop button could sit at full strength. That button is not built here,
+    // but the class still has to be set or the label renders undimmed.
+    optimizerStatusText.className = "h3-prompt-editor-status-text";
     optimizerStatus.append(optimizerStatusSpinner, optimizerStatusText);
     const viewButton = document.createElement("button");
     viewButton.type = "button";
@@ -5991,13 +6036,14 @@ function install() {
       .h3-prompt-editor:empty::before { content: attr(data-placeholder); color: var(--h3-native-widget-muted, rgba(255,255,255,.38)); pointer-events: none; }
       .h3-prompt-editor-status {
         position: absolute; left: 12px; bottom: 4px; z-index: 3; display: inline-flex; align-items: center; gap: 5px; max-width: calc(100% - 92px);
-        overflow: hidden; color: var(--h3-native-widget-text, rgba(255,255,255,.78)); opacity: .56; pointer-events: none; user-select: none;
+        overflow: hidden; color: var(--h3-native-widget-text, rgba(255,255,255,.78)); pointer-events: none; user-select: none;
         font: 600 9px/18px Consolas, "Courier New", monospace; letter-spacing: 0; white-space: nowrap; text-overflow: ellipsis;
       }
       .h3-prompt-editor-status[hidden] { display: none !important; }
       .h3-prompt-editor-status-spinner {
-        display: inline-block; width: 8px; height: 8px; flex: 0 0 8px; box-sizing: border-box; border: 1px solid currentColor; border-radius: 50%;
+        display: inline-block; width: 8px; height: 8px; flex: 0 0 8px; box-sizing: border-box; border: 1px solid currentColor; border-radius: 50%; opacity: .56;
       }
+      .h3-prompt-editor-status-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; opacity: .56; }
       .h3-prompt-editor-status.is-loading .h3-prompt-editor-status-spinner { border-right-color: transparent; animation: h3-prompt-status-spin .72s linear infinite; }
       @keyframes h3-prompt-status-spin { to { transform: rotate(360deg); } }
       .h3-prompt-editor-tools {

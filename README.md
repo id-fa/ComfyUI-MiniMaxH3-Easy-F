@@ -110,6 +110,7 @@ elapsed time.
 The optimizer supports:
 
 - OpenAI-compatible Chat Completions APIs;
+- OpenAI Responses APIs;
 - Gemini Native `generateContent` APIs;
 - configurable API URL, API key, and model name;
 - mode-aware MiniMax H3 Prompt Guides;
@@ -129,7 +130,7 @@ the popup closes.
 
 The popup contains:
 
-- API format: OpenAI Compatible or Gemini Native;
+- API format: OpenAI Compatible, OpenAI Responses, or Gemini Native;
 - API URL;
 - API Key;
 - model name;
@@ -168,7 +169,7 @@ When **Read connected media** is enabled, locally resolvable files up to 32 MiB
 each may be attached to the optimization request:
 
 - Gemini Native can receive image, video, and audio inline parts.
-- OpenAI-compatible requests currently attach images only.
+- OpenAI-compatible Chat Completions and OpenAI Responses requests currently attach images only.
 - Unsupported, missing, or oversized files are skipped.
 
 The system prompt explicitly tells the optimizer not to invent media content.
@@ -251,6 +252,11 @@ This node expands `H3 Context` into standard workflow outputs:
 - Two images: first/last-frame generation.
 - Video and audio inputs are rejected in this mode.
 - Maximum: two images.
+
+First/last-frame inputs are adapted to the fixed generation canvas. When their
+aspect ratio differs from the selected video size, the node uses a centered crop
+instead of stretching the source image, keeping subjects and proportions
+natural.
 
 ### Reference Video
 

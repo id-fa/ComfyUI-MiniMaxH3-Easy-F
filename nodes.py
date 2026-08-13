@@ -115,12 +115,24 @@ PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
 PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
 PROMPT_OPTIMIZER_CONFIG_VERSION = 1
 OPTIMIZER_FORMAT_OPENAI = "openai"
+# OpenAI's Responses API. Same servers as `openai` but a different endpoint,
+# payload and reply shape, which is why it is a format rather than a URL.
+OPTIMIZER_FORMAT_RESPONSES = "responses"
 OPTIMIZER_FORMAT_GEMINI = "gemini"
 # Local text generation through the CLIP input instead of an HTTP API.
 OPTIMIZER_FORMAT_CLIP = "clip"
 # Local text generation through a GGUF model loaded by llama-cpp-python.
 OPTIMIZER_FORMAT_GGUF = "gguf"
-OPTIMIZER_FORMATS = (OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_CLIP, OPTIMIZER_FORMAT_GGUF)
+OPTIMIZER_FORMATS = (
+    OPTIMIZER_FORMAT_OPENAI,
+    OPTIMIZER_FORMAT_RESPONSES,
+    OPTIMIZER_FORMAT_GEMINI,
+    OPTIMIZER_FORMAT_CLIP,
+    OPTIMIZER_FORMAT_GGUF,
+)
+# The formats `_optimizer_http_json` can serve, i.e. everything that is a remote
+# call rather than a model this process has to load.
+OPTIMIZER_HTTP_FORMATS = (OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_RESPONSES, OPTIMIZER_FORMAT_GEMINI)
 OPTIMIZER_LOCAL_FORMATS = (OPTIMIZER_FORMAT_CLIP, OPTIMIZER_FORMAT_GGUF)
 PROMPT_OPTIMIZER_CLIP_MAX_LENGTH = 1024
 PROMPT_OPTIMIZER_CLIP_MIN_LENGTH = 16
@@ -211,6 +223,22 @@ def _reference_aligned_size(image_w: int, image_h: int, scale: float) -> tuple[i
                 best = candidate
 
     return best[3], best[4]
+
+
+def _original_reference_size(image_w: int, image_h: int) -> tuple[int, int]:
+    """Keep original references unscaled, except for H3's required grid alignment."""
+    multiple = h3.CANVAS_MULTIPLE
+    target_w = (image_w // multiple) * multiple
+    target_h = (image_h // multiple) * multiple
+    if target_w >= multiple and target_h >= multiple:
+        return target_w, target_h
+
+    # A smaller-than-grid source cannot be crop-aligned. Scale it uniformly to
+    # the smallest usable H3 size rather than rejecting an otherwise valid input.
+    scale = max(multiple / max(1, image_w), multiple / max(1, image_h))
+    return _reference_aligned_size(image_w, image_h, scale)
+
+
 _PROMPT_OPTIMIZER_CONFIG_LOCK = threading.RLock()
 REFERENCE_PLACEHOLDER_RE = re.compile(r"__MINIMAX_H3_REF_(\d+)__")
 UNRESOLVED_REFERENCE_RE = re.compile(r"__MINIMAX_H3_UNRESOLVED_REF_[^_]+__")
@@ -290,8 +318,14 @@ def _filesystem_weight_names(categories: tuple[str, ...]) -> list[str]:
     return names
 
 
-@lru_cache(maxsize=16)
 def _collect_weight_names(categories: tuple[str, ...]) -> list[str]:
+    """Collect the current model filenames advertised by ComfyUI.
+
+    Model folders can be refreshed while ComfyUI is running. Keeping this
+    result cached made the Easy Loader retain the first snapshot for the
+    lifetime of the process, so newly downloaded models did not appear even
+    after ComfyUI refreshed its own filename lists.
+    """
     names: list[str] = []
     seen: set[str] = set()
     for category in categories:
@@ -526,6 +560,8 @@ def _write_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str,
 _OPTIMIZER_KNOWN_ENDPOINT_SUFFIXES = (
     "/v1/chat/completions",
     "/chat/completions",
+    "/v1/responses",
+    "/responses",
 )
 _OPTIMIZER_GEMINI_ENDPOINT_RE = re.compile(
     r"/(v1beta|v1)/models/[^/?:#]+?:(generateContent|streamGenerateContent)$",
@@ -534,18 +570,21 @@ _OPTIMIZER_GEMINI_ENDPOINT_RE = re.compile(
 
 
 def _normalize_optimizer_base_url(api_url: str) -> str:
-    base = str(api_url or "").strip().rstrip("/")
+    base = str(api_url or "").strip()
     if not base:
         raise ValueError("Prompt optimization API URL is required")
     if not re.match(r"^https?://", base, flags=re.I):
         base = "https://" + base
-    return base.rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), parsed.query, ""))
 
 
 def _optimizer_endpoint_kind(value: str) -> str:
-    lower = str(value or "").lower()
+    lower = urllib.parse.urlsplit(str(value or "")).path.rstrip("/").lower()
     if lower.endswith("/chat/completions"):
         return "chat"
+    if lower.endswith("/responses"):
+        return "responses"
     if _OPTIMIZER_GEMINI_ENDPOINT_RE.search(lower):
         return "gemini"
     return ""
@@ -617,25 +656,61 @@ def _strip_optimizer_endpoint(base: str) -> str:
     return base
 
 
+def _optimizer_url_with_query(url: str, query: str) -> str:
+    return url + (f"?{query}" if query else "")
+
+
 def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
     if api_format == "gemini":
         return _normalize_gemini_optimizer_url(api_url, model)
     base = _normalize_optimizer_base_url(api_url)
-    endpoint = "/v1/chat/completions"
-    base_kind = _optimizer_endpoint_kind(base)
+    parsed = urllib.parse.urlsplit(base)
+    clean = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    endpoint = "/v1/responses" if api_format == "responses" else "/v1/chat/completions"
+    base_kind = _optimizer_endpoint_kind(clean)
     endpoint_kind = _optimizer_endpoint_kind(endpoint)
     if base_kind == endpoint_kind == "chat":
-        return base
-    if base_kind == endpoint_kind == "gemini":
-        base_match = _OPTIMIZER_GEMINI_ENDPOINT_RE.search(base.lower())
-        if base_match and base.lower().endswith(base_match.group(0)) and base_match.group(0) == endpoint.lower():
-            return base
-    base = _strip_optimizer_endpoint(base)
+        return _optimizer_url_with_query(clean, parsed.query)
+    if base_kind == endpoint_kind == "responses":
+        return _optimizer_url_with_query(clean, parsed.query)
+    base = _strip_optimizer_endpoint(clean)
     if base.lower().endswith("/v1") and endpoint.lower().startswith("/v1/"):
         endpoint = endpoint[3:]
-    if base.lower().endswith("/v1beta") and endpoint.lower().startswith("/v1beta/"):
-        endpoint = endpoint[7:]
-    return base + endpoint
+    return _optimizer_url_with_query(base + endpoint, parsed.query)
+
+
+def _optimizer_responses_text(data: Any) -> str:
+    if not isinstance(data, Mapping):
+        return ""
+    direct = data.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    output = data.get("output")
+    chunks: list[str] = []
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, Mapping):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, Mapping):
+                    continue
+                value = part.get("text")
+                if isinstance(value, str):
+                    chunks.append(value)
+                elif isinstance(value, Mapping) and isinstance(value.get("value"), str):
+                    chunks.append(value["value"])
+    if chunks:
+        return "".join(chunks)
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {}) if isinstance(choices[0], Mapping) else {}
+        content = message.get("content", "") if isinstance(message, Mapping) else ""
+        if isinstance(content, str):
+            return content
+    return ""
 
 
 def _optimizer_log(message: str, *args: Any) -> None:
@@ -696,8 +771,15 @@ def _optimizer_thinking_off_payload(api_format: str) -> dict[str, Any]:
     *separate* dict so the request can be retried without them: an endpoint that
     rejects unknown fields (OpenAI itself does) must still answer.
     """
-    if api_format == "gemini":
+    if api_format == OPTIMIZER_FORMAT_GEMINI:
         return {"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}
+    if api_format == OPTIMIZER_FORMAT_RESPONSES:
+        # Nothing to send. `chat_template_kwargs` is a chat-completions extension
+        # that the Responses API does not accept, and the Responses API keeps a
+        # model's reasoning in its own `reasoning` output items, which
+        # `_optimizer_responses_text` never reads. Sending the chat switch here
+        # would only cost every request a rejected first attempt.
+        return {}
     return {"chat_template_kwargs": {"enable_thinking": False}}
 
 
@@ -766,6 +848,19 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"temperature": 0.35, "maxOutputTokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS},
         }
+    elif api_format == "responses":
+        headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {api_key}"}
+        user_content: list[dict[str, Any]] = [{"type": "input_text", "text": user_prompt}]
+        user_content.extend(media_parts)
+        payload = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": [{"role": "user", "content": user_content}],
+            "store": False,
+            "stream": False,
+            "temperature": 0.35,
+            "max_output_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS,
+        }
     else:
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
         content: str | list[dict[str, Any]]
@@ -788,6 +883,8 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
         if not text.strip():
             finish_reason = candidate.get("finishReason") or candidate.get("finish_reason") or "unknown"
             raise RuntimeError(f"Gemini API returned no text (finish reason: {finish_reason})")
+    elif api_format == "responses":
+        text = _optimizer_responses_text(data)
     else:
         content = ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "")
         text = content if isinstance(content, str) else "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
@@ -818,6 +915,23 @@ def _optimizer_asset_path(asset: Mapping[str, Any]) -> str | None:
     return candidate if os.path.isfile(candidate) else None
 
 
+def _optimizer_inline_part(mime: str, encoded: str, api_format: str) -> dict[str, Any]:
+    """One base64 asset in whatever shape this format expects.
+
+    The three HTTP formats spell the same thing three ways, and both the
+    whole-file path and the sampled-video path have to produce it, so the
+    spelling lives here rather than at either call site. Only Gemini takes a
+    mime other than an image one: the two OpenAI shapes have no part for video
+    or audio, so their callers only ever reach this with a still.
+    """
+    if api_format == OPTIMIZER_FORMAT_GEMINI:
+        return {"inlineData": {"mimeType": mime, "data": encoded}}
+    data_url = f"data:{mime};base64,{encoded}"
+    if api_format == OPTIMIZER_FORMAT_RESPONSES:
+        return {"type": "input_image", "image_url": data_url}
+    return {"type": "image_url", "image_url": {"url": data_url}}
+
+
 def _optimizer_media_items(resources: list[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
     """Resolve the editor's media list into taggable request parts.
 
@@ -843,18 +957,15 @@ def _optimizer_media_items(resources: list[Mapping[str, Any]], api_format: str) 
             # way, so an oversized video can still be sampled into stills.
             if os.path.getsize(path) <= OPTIMIZER_MEDIA_MAX_BYTES:
                 mime = mimetypes.guess_type(path)[0] or {"image": "image/jpeg", "video": "video/mp4", "audio": "audio/wav"}[media_type]
-                if api_format == "gemini" or media_type == "image":
+                if api_format == OPTIMIZER_FORMAT_GEMINI or media_type == "image":
                     with open(path, "rb") as handle:
                         encoded = base64.b64encode(handle.read()).decode("ascii")
-                    if api_format == "gemini":
-                        parts = [{"inlineData": {"mimeType": mime, "data": encoded}}]
-                    else:
-                        parts = [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}]
+                    parts = [_optimizer_inline_part(mime, encoded, api_format)]
         except (OSError, ValueError):
             parts = []
         sampled = not parts and media_type == "video"
         if sampled:
-            parts = _optimizer_video_still_parts(path)
+            parts = _optimizer_video_still_parts(path, api_format=api_format)
             sampled = bool(parts)
         items.append({"tag": tag, "type": media_type, "path": path, "parts": parts, "sampled": sampled})
     return items
@@ -888,8 +999,9 @@ def _optimizer_video_still_parts(
     path: str,
     count: int = OPTIMIZER_VIDEO_STILLS,
     max_side: int = OPTIMIZER_VIDEO_STILL_MAX_SIDE,
+    api_format: str = OPTIMIZER_FORMAT_OPENAI,
 ) -> list[dict[str, Any]]:
-    """Sample evenly spaced frames from a video file as OpenAI image parts.
+    """Sample evenly spaced frames from a video file as image parts.
 
     A chat completion has no video channel, so this is the only way a reference
     video reaches the optimizer. Frames are seeked rather than decoded in full,
@@ -955,7 +1067,7 @@ def _optimizer_video_still_parts(
             logging.warning("MiniMax H3 Easy: could not encode a sampled frame (%s).", exc)
             continue
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+        parts.append(_optimizer_inline_part("image/jpeg", encoded, api_format))
     if parts:
         _optimizer_log("sampled %d frames from %s", len(parts), os.path.basename(path))
     return parts
@@ -1742,7 +1854,7 @@ class MiniMaxH3PromptOptimizer:
                 "mode": ([MODE_IMAGE, MODE_REFERENCE], {"default": MODE_IMAGE}),
                 "seconds": ("FLOAT", {"default": 5.0, "min": MIN_SECONDS, "max": MAX_SECONDS, "step": 0.1}),
                 "scene_guide": (choices, {"default": "none"}),
-                "api_format": (["openai", "gemini"], {"default": "openai"}),
+                "api_format": (list(OPTIMIZER_HTTP_FORMATS), {"default": OPTIMIZER_FORMAT_OPENAI}),
                 "api_url": ("STRING", {"default": ""}),
                 "api_key": ("STRING", {"default": "", "multiline": False, "password": True}),
                 "model": ("STRING", {"default": ""}),
@@ -1834,7 +1946,7 @@ def _register_prompt_optimizer_route() -> bool:
                     "error": "The text encoder format optimizes the prompt when the workflow runs.",
                     "deferred": True,
                 }, status=400)
-            if api_format not in {OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_GEMINI, OPTIMIZER_FORMAT_GGUF}:
+            if api_format not in {*OPTIMIZER_HTTP_FORMATS, OPTIMIZER_FORMAT_GGUF}:
                 return web.json_response({"ok": False, "error": "Unsupported API format"}, status=400)
             local = api_format == OPTIMIZER_FORMAT_GGUF
             if not prompt.strip():
@@ -2297,7 +2409,7 @@ def _empty_image_conditioning(bundle, prompt, width, height, length, first_frame
     images = []
     keyframes = []
     if first_frame is not None:
-        image = h3._resize(first_frame[:1], width, height, "disabled")
+        image = h3._resize(first_frame[:1], width, height, "center")
         images.append(image)
         keyframes.append({"resolved_frame_index": 0, "image": image})
     if last_frame is not None:
@@ -2337,10 +2449,19 @@ def _reference_conditioning(bundle, prompt, width, height, length, ref_image_siz
         image_h, image_w = image.shape[1], image.shape[2]
         size_mode = str(ref_image_size or REF_IMAGE_1K)
         if size_mode == REF_IMAGE_ORIGINAL:
-            # The explicit original mode keeps the incoming pixels untouched.
-            # The VAE reports the latent grid actually produced for arbitrary
-            # source dimensions, so no image-side 32-pixel resampling is needed.
-            resized = image[:1]
+            # H3 patchifies reference latents in 2x2 blocks, so their source
+            # pixels must land on a 32-pixel grid. Preserve the original image
+            # without padding or stretching by center-cropping only the small
+            # remainder; already aligned images pass through unchanged.
+            target_w, target_h = _original_reference_size(image_w, image_h)
+            if target_w == image_w and target_h == image_h:
+                resized = image[:1]
+            elif image_w >= h3.CANVAS_MULTIPLE and image_h >= h3.CANVAS_MULTIPLE:
+                top = (image_h - target_h) // 2
+                left = (image_w - target_w) // 2
+                resized = image[:1, top:top + target_h, left:left + target_w, :]
+            else:
+                resized = h3._resize(image[:1], target_w, target_h, "disabled")
             z = bundle.video_vae.encode(resized)
             ref_items.append({"type": "image", "data": resized})
             ref_blocks.append({
@@ -2492,10 +2613,6 @@ class MiniMaxH3Easy:
             "optional": optional,
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        return float("nan")
 
     @staticmethod
     def _collect_media(kwargs: dict) -> list[_MediaInput]:

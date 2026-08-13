@@ -88,11 +88,16 @@ How much actually stops depends on the format:
   llama-cpp offers no way to interrupt either, so a stop pressed during those
   phases takes effect once the first token is produced. **Describe media one at
   a time** shortens each of those phases considerably.
-- **OpenAI-compatible / Gemini** — an HTTP request already in flight cannot be
-  interrupted, so the remote call finishes and may still be billed. Its answer
-  is discarded.
+- **OpenAI-compatible / OpenAI Responses / Gemini** — an HTTP request already in
+  flight cannot be interrupted, so the remote call finishes and may still be
+  billed. Its answer is discarded.
 - **Text encoder (clip input)** — no stop button, because it runs inside the
   workflow; use ComfyUI's own cancel instead.
+
+This supersedes the stop button upstream places in the status strip. That one
+only aborts the browser's fetch; it never tells the server, so a local GGUF run
+would keep generating on a released-looking GPU. There is deliberately just the
+one control, on `✦`.
 
 ### Editor details
 
@@ -132,8 +137,8 @@ required.
 
 ## Prompt optimization with a local text encoder
 
-**Prompt optimization settings → API format** gains a third choice next to
-OpenAI Compatible and Gemini Native:
+**Prompt optimization settings → API format** gains a choice next to the HTTP
+ones upstream provides (OpenAI Compatible, OpenAI Responses, Gemini Native):
 
 > **Text encoder (clip input)**
 
@@ -247,7 +252,7 @@ are stored in the same shared `prompt_optimizer.json`.
 
 ## Prompt optimization with a GGUF model
 
-**Prompt optimization settings → API format** gains a fourth choice:
+**Prompt optimization settings → API format** gains a second local choice:
 
 > **GGUF (llama-cpp-python)**
 
