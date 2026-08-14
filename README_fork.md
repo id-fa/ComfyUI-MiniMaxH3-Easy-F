@@ -319,7 +319,10 @@ switched off — there is no toggle for it:
   reasoning prose and the opening tag never appears in it. Harmony-style
   `<|channel|>final<|message|>` markers are handled the same way. An answer that
   is *only* an unterminated thought counts as empty and reports an error rather
-  than feeding half a thought into the prompt.
+  than feeding half a thought into the prompt. For the GGUF format that error
+  now says what happened — the model spent the whole budget reasoning and never
+  reached an answer — because "raise the answer length" is something the user
+  can act on, and "empty" is not.
 
 The same cleanup applies to the HTTP and text-encoder formats, so a reasoning
 model behind an OpenAI-compatible endpoint cannot leak its thoughts either. The
@@ -381,6 +384,18 @@ guide-sized multimodal prompt.
 
 It is **off by default**, so an existing setup keeps sending media with the
 prompt.
+
+The describing pass has a token budget of its own. A model whose reasoning
+**cannot be switched off** — Gemma has no `/no_think` and its chat handler
+rejects the flag — spends that budget on the thought, and an output cut off
+mid-thought contains no description at all, since the closing marker never
+arrives. Gemma-family models therefore get extra headroom on top of the 256
+tokens (separate from the answer length, because it pays for text that is
+discarded anyway).
+
+If every description fails regardless, the run does **not** pretend no media was
+connected: it logs a warning and falls back to attaching the media to the
+prompt request, the way the format does when this switch is off.
 
 ### Scope
 

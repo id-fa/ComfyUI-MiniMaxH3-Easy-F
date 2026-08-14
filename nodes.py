@@ -153,6 +153,14 @@ OPTIMIZER_CLIP_MAX_STILLS = 12
 OPTIMIZER_CLIP_FRAMES_PER_VIDEO = 4
 OPTIMIZER_CLIP_MAX_VIDEO_FRAMES = 8
 OPTIMIZER_CLIP_DESCRIBE_LENGTH = 256
+# Gemma has no switch for its reasoning — no `/no_think`, and its chat handler
+# rejects `force_reasoning` — so the thought is generated whether it is wanted or
+# not, out of the same budget as the description. 256 tokens is enough for one or
+# the other, and a run that stops mid-thought yields *nothing*: the block never
+# closes, so `_strip_optimizer_output` has no prompt to separate out. The
+# headroom is spent on text that is thrown away, which is why only the models
+# that cannot be told to skip it get it.
+OPTIMIZER_DESCRIBE_THINKING_HEADROOM = 768
 OPTIMIZER_CLIP_DESCRIBE_SYSTEM = (
     "You describe one reference asset for a video generation prompt.\n"
     "Report only what is actually present in the attached media: subject, appearance, clothing, pose, "
@@ -1162,6 +1170,17 @@ _OPTIMIZER_OPEN_CHANNEL_RE = re.compile(
 _OPTIMIZER_TRAILING_TOKEN_RE = re.compile(r"<\|(?:return|end|endoftext|im_end)\|>\s*\Z", flags=re.I)
 
 
+def _opens_with_thinking(text: Any) -> bool:
+    """Whether the text begins inside a reasoning block.
+
+    On a value `_strip_optimizer_output` has already worked through, this means
+    the block was never closed: the model was still thinking when it ran out of
+    tokens, so there is no prompt anywhere in it.
+    """
+    value = str(text or "").strip()
+    return bool(_OPTIMIZER_OPEN_THINK_RE.match(value) or _OPTIMIZER_OPEN_CHANNEL_RE.match(value))
+
+
 def _strip_optimizer_output(text: Any) -> str:
     """Reduce a model's answer to the prompt text itself.
 
@@ -1684,8 +1703,21 @@ def _optimizer_gguf_chat(
         # cover the whole family.
         "chat_template_kwargs": {"enable_thinking": False},
     }
+
+    def finish(raw: Any) -> str:
+        text = _strip_optimizer_output(raw)
+        if not text and _opens_with_thinking(raw):
+            # Distinguishable from "the model said nothing": the block is there,
+            # it simply never closed. Naming it is the difference between a
+            # setting the user can raise and an unexplained empty prompt.
+            raise ValueError(
+                f"The model spent all {int(max_tokens)} tokens reasoning and never reached an answer. "
+                "Raise the local answer length, or use a model whose thinking can be switched off."
+            )
+        return text
+
     if should_stop is not None:
-        return _strip_optimizer_output(_optimizer_gguf_stream(llm, request, should_stop))
+        return finish(_optimizer_gguf_stream(llm, request, should_stop))
     step = time.perf_counter()
     result = _optimizer_gguf_call(llm, request)
     generated = time.perf_counter() - step
@@ -1697,7 +1729,7 @@ def _optimizer_gguf_chat(
         _optimizer_log("generation finished in %.1fs", generated)
     choices = result.get("choices") if isinstance(result, Mapping) else None
     message = (choices or [{}])[0].get("message") if choices else None
-    return _strip_optimizer_output((message or {}).get("content"))
+    return finish((message or {}).get("content"))
 
 
 def _optimizer_gguf_describe(
@@ -1721,8 +1753,17 @@ def _optimizer_gguf_describe(
         return "", 0
     gemma = _is_gemma_gguf_name(str(settings.get("gguf_model") or ""))
     length = min(int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH), OPTIMIZER_CLIP_DESCRIBE_LENGTH)
+    if gemma:
+        # The answer length caps the *prompt*, and this pass is not the prompt:
+        # what the extra buys is room for a thought that is discarded either
+        # way. Without it Gemma stops mid-thought and every description comes
+        # back empty, which used to leave the final pass writing a prompt about
+        # no media at all.
+        length += OPTIMIZER_DESCRIBE_THINKING_HEADROOM
     started = time.perf_counter()
-    _optimizer_log("describing %d connected media with the GGUF, one at a time", len(describable))
+    _optimizer_log(
+        "describing %d connected media with the GGUF, one at a time (max_tokens=%d)", len(describable), length,
+    )
     try:
         lines = _optimizer_gguf_describe_each(llm, describable, gemma, length, should_stop)
     except _OptimizerCancelled:
@@ -1973,6 +2014,18 @@ def _register_prompt_optimizer_route() -> bool:
                     _optimizer_gguf_describe, settings, media_items, should_stop,
                 )
                 _optimizer_raise_if_cancelled(request_id)
+                if not described_count and any(item["parts"] for item in media_items):
+                    # Every description failed. Carrying on would write the
+                    # prompt with no media and no media rule, and the model
+                    # would describe nothing at all — the one outcome this pack
+                    # does not allow. Fall back to attaching the media to the
+                    # request instead, which is slower to start but at least
+                    # sees the images.
+                    logging.warning(
+                        "MiniMax H3 Easy: the describe pass produced no descriptions; "
+                        "attaching the media to the prompt request instead."
+                    )
+                    describe = False
             attached = [] if describe else [item for item in media_items if item["parts"]]
             media_parts = [part for item in attached for part in item["parts"]]
             # Counted by reference, not by part: a sampled video is one

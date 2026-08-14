@@ -188,6 +188,22 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   loads the projector, the final text-only pass takes `keep_vision=True`; without it the signature would
   change and the model would be reloaded between the two. `_optimizer_media_items` keeps unsendable
   media with empty `parts` (and its `path`) so skips can be logged rather than silently dropped.
+  Two things that mode gets wrong if you are not careful, both found with Gemma 4:
+  - **The describe pass has its own token budget, and a model that cannot be told to stop reasoning
+    spends it on the thought.** `OPTIMIZER_CLIP_DESCRIBE_LENGTH` alone left Gemma stopping
+    mid-thought, so `_strip_optimizer_output` correctly returned nothing and *every* description came
+    back empty. `OPTIMIZER_DESCRIBE_THINKING_HEADROOM` is added for the families with no working
+    switch (gemma), and is deliberately not tied to the answer length: it buys room for text that is
+    discarded either way.
+  - **A describe pass that produced nothing must not be treated as "no media was connected".** The
+    route falls back to the single-request path (`describe = False`) and logs it. Without that the
+    final pass got no parts *and* no media rule, and the model wrote — reasonably — a prompt about
+    nothing. Same principle as the empty-`parts` item in `_optimizer_media_items`: never write about
+    media as if it had not been there.
+- A thinking block that never closes means the model ran out of tokens while thinking, and
+  `_strip_optimizer_output` returns `""` because there genuinely is no prompt in it. `finish()` inside
+  `_optimizer_gguf_chat` turns that specific case into an error that says so (`_opens_with_thinking`)
+  instead of an unexplained empty prompt: the user can act on "raise the answer length", not on "empty".
 - The editor-driven formats can be stopped: `✦` becomes a stop button while pending, aborting the fetch
   and calling `POST /minimax_h3_easy/prompt_optimize_cancel` with the request id it generated. The id
   registry (`_optimizer_cancel` / `_optimizer_is_cancelled`, capped) is polled by `_optimizer_gguf_stream`
