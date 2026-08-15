@@ -430,6 +430,18 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     }
 
 
+def _prompt_optimizer_api_key_required(api_format: str) -> bool:
+    return str(api_format or "openai").strip().lower() == "gemini"
+
+
+def _prompt_optimizer_settings_complete(api_url: str, api_key: str, model: str, api_format: str) -> bool:
+    return bool(
+        str(api_url or "").strip()
+        and str(model or "").strip()
+        and (str(api_key or "").strip() or not _prompt_optimizer_api_key_required(api_format))
+    )
+
+
 def _read_prompt_optimizer_config() -> dict[str, Any]:
     path = _prompt_optimizer_config_path()
     with _PROMPT_OPTIMIZER_CONFIG_LOCK:
@@ -636,8 +648,11 @@ def _optimizer_http_json(
     timeout_seconds: float = PROMPT_OPTIMIZER_TIMEOUT_SECONDS,
 ) -> str:
     url = _normalize_optimizer_url(api_url, api_format, model)
+    api_key = str(api_key or "").strip()
     media_parts = list(media_parts or [])
     if api_format == "gemini":
+        if not api_key:
+            raise ValueError("Prompt optimization API key is required for Gemini Native")
         headers = {"Content-Type": "application/json", "Accept": "application/json", "x-goog-api-key": api_key}
         # Some Gemini-compatible channels accept the native payload and return
         # candidates but silently ignore systemInstruction. Keep the complete
@@ -655,7 +670,9 @@ def _optimizer_http_json(
             "generationConfig": {"temperature": 0.35, "maxOutputTokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS},
         }
     elif api_format == "responses":
-        headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {api_key}"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         user_content: list[dict[str, Any]] = [{"type": "input_text", "text": user_prompt}]
         user_content.extend(media_parts)
         payload = {
@@ -668,7 +685,9 @@ def _optimizer_http_json(
             "max_output_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS,
         }
     else:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         content: str | list[dict[str, Any]]
         if media_parts:
             content = [{"type": "text", "text": user_prompt}, *media_parts]
@@ -923,7 +942,8 @@ def _optimize_prompt_on_run(
     api_url = str(settings.get("api_url") or "").strip()
     api_key = str(settings.get("api_key") or "").strip()
     model = str(settings.get("model") or "").strip()
-    if not api_url or not api_key or not model:
+    api_format = str(settings.get("api_format") or "openai").lower()
+    if not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
         return _RuntimePromptOptimization(source_prompt)
 
     counts = {"image": 0, "video": 0, "audio": 0}
@@ -931,7 +951,6 @@ def _optimize_prompt_on_run(
         if item.media_type in counts:
             counts[item.media_type] += 1
 
-    api_format = str(settings.get("api_format") or "openai").lower()
     try:
         resources = _runtime_optimizer_resources(resource_payload)
         context_hash = _runtime_optimizer_context_hash(
@@ -1018,13 +1037,14 @@ class MiniMaxH3PromptOptimizer:
         return float("nan")
 
     def optimize(self, prompt, mode, seconds, scene_guide, api_format, api_url, api_key, model):
-        if not str(api_key or "").strip():
-            raise ValueError("Prompt optimization API key is required")
+        api_format = str(api_format or "openai").strip().lower()
+        if _prompt_optimizer_api_key_required(api_format) and not str(api_key or "").strip():
+            raise ValueError("Prompt optimization API key is required for Gemini Native")
         if not str(model or "").strip():
             raise ValueError("Prompt optimization model is required")
         counts = {"image": 0, "video": 0, "audio": 0}
         system = _optimizer_system_prompt(str(scene_guide or "none"), str(mode or MODE_IMAGE), float(seconds), counts)
-        return (_optimizer_http_json(str(api_url), str(api_key), str(model), str(api_format or "openai"), system, str(prompt or "")),)
+        return (_optimizer_http_json(str(api_url), str(api_key), str(model), api_format, system, str(prompt or "")),)
 
 
 def _register_prompt_optimizer_route() -> bool:
@@ -1065,7 +1085,7 @@ def _register_prompt_optimizer_route() -> bool:
             seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(payload.get("seconds") or 5.0)))
             if api_format not in {"openai", "responses", "gemini"}:
                 return web.json_response({"ok": False, "error": "Unsupported API format"}, status=400)
-            if not prompt.strip() or not api_key.strip() or not api_url.strip() or not model.strip():
+            if not prompt.strip() or not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
             raw_counts = payload.get("media_counts") if isinstance(payload.get("media_counts"), dict) else {}
             counts = {kind: max(0, min(MAX_MEDIA, int(raw_counts.get(kind, 0) or 0))) for kind in ("image", "video", "audio")}

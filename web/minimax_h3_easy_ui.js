@@ -84,7 +84,7 @@ const TEXT = {
     promptGuide: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u65b9\u6848" : "Prompt Guide",
     readMedia: ZH_BROWSER ? "\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53" : "Read connected media",
     optimizeOnRun: ZH_BROWSER ? "\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u81ea\u52a8\u4f18\u5316" : "Optimize when workflow runs",
-    optimizerMissing: ZH_BROWSER ? "\u8bf7\u5148\u6253\u5f00 API \u8bbe\u7f6e\u5e76\u586b\u5199 API \u5730\u5740\u3001API Key \u548c\u6a21\u578b\u540d\u3002" : "Open API settings and enter the API URL, API key, and model first.",
+    optimizerMissing: ZH_BROWSER ? "\u8bf7\u586b\u5199 API \u5730\u5740\u548c\u6a21\u578b\u540d\uff1bGemini \u539f\u751f\u8fd8\u9700\u8981 API Key\u3002" : "Enter the API URL and model; Gemini Native also requires an API key.",
     optimizerFailed: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u5931\u8d25" : "Prompt optimization failed",
     optimizerRunning: ZH_BROWSER ? "\u6b63\u5728\u4f18\u5316" : "Optimizing",
     optimizerCancel: ZH_BROWSER ? "\u4e2d\u65ad\u4f18\u5316" : "Stop optimization",
@@ -3642,6 +3642,18 @@ function promptOptimizerState(node) {
     };
 }
 
+function promptOptimizerApiKeyRequired(apiFormat) {
+    return String(apiFormat || "openai").trim().toLowerCase() === "gemini";
+}
+
+function promptOptimizerConfigured(state) {
+    return Boolean(
+        state?.api_url?.trim()
+        && state?.model?.trim()
+        && (state?.api_key?.trim() || !promptOptimizerApiKeyRequired(state?.api_format))
+    );
+}
+
 function notifyPromptOptimizer(message, severity = "error") {
     const detail = String(message || "");
     const toast = app.extensionManager?.toast;
@@ -3718,7 +3730,7 @@ function syncPromptOptimizerButton(node) {
     const button = node?.__h3PromptOptimizeButton;
     if (!button) return;
     const state = promptOptimizerState(node);
-    const configured = Boolean(state.api_url.trim() && state.model.trim() && state.api_key.trim());
+    const configured = promptOptimizerConfigured(state);
     const external = promptInputIsConnected(node);
     const pending = Boolean(node.__h3OptimizerPending);
     const locked = external || pending;
@@ -3855,7 +3867,7 @@ async function optimizePromptFromEditor(node) {
         return;
     }
     const state = promptOptimizerState(node);
-    if (!state.api_url.trim() || !state.model.trim() || !state.api_key.trim()) {
+    if (!promptOptimizerConfigured(state)) {
         notifyPromptOptimizer(TEXT.optimizerMissing);
         return;
     }

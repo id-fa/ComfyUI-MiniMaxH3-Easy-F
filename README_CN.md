@@ -119,6 +119,9 @@
 - 模型名；
 - 是否读取已连接媒体。
 
+对于无需鉴权的 OpenAI 兼容或 Responses 接口（例如本地 LM Studio），API Key
+可以留空；Gemini 原生接口仍必须填写 API Key。
+
 这些设置保存在：
 
 ```text

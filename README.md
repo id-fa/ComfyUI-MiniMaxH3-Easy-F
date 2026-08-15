@@ -136,6 +136,10 @@ The popup contains:
 - model name;
 - Read connected media.
 
+The API key may be left empty for OpenAI-compatible and Responses endpoints
+that do not require authentication, such as a local LM Studio server. Gemini
+Native always requires an API key.
+
 These settings are stored in:
 
 ```text
