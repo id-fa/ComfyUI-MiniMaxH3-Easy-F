@@ -14,6 +14,7 @@ import sys
 import threading
 import base64
 import asyncio
+import hashlib
 import json
 import mimetypes
 import tempfile
@@ -118,8 +119,10 @@ MAX_SECONDS = 30.0
 PROMPT_GUIDES_DIR = os.path.join(os.path.dirname(__file__), "prompt_guides")
 PROMPT_GUIDE_MANIFEST = os.path.join(PROMPT_GUIDES_DIR, "manifest.json")
 PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
+PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS = 120
 PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
-PROMPT_OPTIMIZER_CONFIG_VERSION = 1
+PROMPT_OPTIMIZER_MARKER_VERSION = 1
+PROMPT_OPTIMIZER_CONFIG_VERSION = 2
 PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
     "api_format": "openai",
@@ -127,6 +130,7 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "api_key": "",
     "model": "",
     "read_media": False,
+    "optimize_on_run": False,
 }
 
 
@@ -412,6 +416,9 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     read_media = source.get("read_media", False)
     if isinstance(read_media, str):
         read_media = read_media.strip().lower() in {"1", "true", "yes", "on"}
+    optimize_on_run = source.get("optimize_on_run", False)
+    if isinstance(optimize_on_run, str):
+        optimize_on_run = optimize_on_run.strip().lower() in {"1", "true", "yes", "on"}
     return {
         "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
         "api_format": api_format,
@@ -419,6 +426,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "api_key": str(source.get("api_key") or ""),
         "model": str(source.get("model") or "").strip(),
         "read_media": bool(read_media),
+        "optimize_on_run": bool(optimize_on_run),
     }
 
 
@@ -617,7 +625,16 @@ def _optimizer_responses_text(data: Any) -> str:
     return ""
 
 
-def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str, system_prompt: str, user_prompt: str, media_parts: list[dict[str, Any]] | None = None) -> str:
+def _optimizer_http_json(
+    api_url: str,
+    api_key: str,
+    model: str,
+    api_format: str,
+    system_prompt: str,
+    user_prompt: str,
+    media_parts: list[dict[str, Any]] | None = None,
+    timeout_seconds: float = PROMPT_OPTIMIZER_TIMEOUT_SECONDS,
+) -> str:
     url = _normalize_optimizer_url(api_url, api_format, model)
     media_parts = list(media_parts or [])
     if api_format == "gemini":
@@ -660,7 +677,7 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
         payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}], "stream": False, "temperature": 0.35, "max_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS}
     request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=max(1.0, float(timeout_seconds))) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -774,6 +791,200 @@ def _optimizer_system_prompt(
             "Preserve media reference tags when needed, but infer only from the original user prompt and explicit instructions. Never fabricate a subject, appearance, action, setting, sound, or other media detail."
         )
     return prompt
+
+
+def _runtime_optimizer_resources(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value[:MAX_MEDIA] if isinstance(item, Mapping)]
+
+
+def _runtime_optimizer_marker(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def _optimizer_sha256(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _runtime_optimizer_resource_signature(
+    resources: list[Mapping[str, Any]],
+    items: list[_MediaInput],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    count = max(len(resources), len(items))
+    for index in range(count):
+        resource = resources[index] if index < len(resources) else {}
+        item = items[index] if index < len(items) else None
+        asset = resource.get("asset") if isinstance(resource.get("asset"), Mapping) else {}
+        entry: dict[str, Any] = {
+            "type": str(resource.get("type") or getattr(item, "media_type", "") or ""),
+            "tag": str(resource.get("tag") or ""),
+            "name": str(resource.get("name") or ""),
+            "asset": {
+                "filename": str(asset.get("filename") or ""),
+                "subfolder": str(asset.get("subfolder") or ""),
+                "storage": str(asset.get("storage") or ""),
+            },
+        }
+        path = _optimizer_asset_path(asset) if asset else None
+        if path:
+            try:
+                stat = os.stat(path)
+                entry["file"] = {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+            except OSError:
+                pass
+        result.append(entry)
+    return result
+
+
+def _runtime_optimizer_context_hash(
+    settings: Mapping[str, Any],
+    mode: str,
+    seconds: float,
+    scene_guide: str,
+    counts: Mapping[str, int],
+    resources: list[Mapping[str, Any]],
+    items: list[_MediaInput],
+) -> str:
+    guide_fingerprint = _optimizer_sha256(
+        _optimizer_system_prompt(scene_guide, mode, seconds, counts, 0)
+    )
+    payload = {
+        "version": PROMPT_OPTIMIZER_MARKER_VERSION,
+        "guide": guide_fingerprint,
+        "api_format": str(settings.get("api_format") or "openai").lower(),
+        "api_url": str(settings.get("api_url") or "").strip(),
+        "model": str(settings.get("model") or "").strip(),
+        "read_media": bool(settings.get("read_media")),
+        "resources": _runtime_optimizer_resource_signature(resources, items),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _optimizer_sha256(canonical)
+
+
+def _runtime_optimizer_prompt(
+    prompt: str,
+    resources: list[Mapping[str, Any]],
+    items: list[_MediaInput],
+) -> str:
+    fallback_counts = {"image": 0, "video": 0, "audio": 0}
+    fallback_tags: list[str] = []
+    tag_prefixes = {"image": "Picture", "video": "Video", "audio": "Audio"}
+    for item in items:
+        media_type = item.media_type if item.media_type in fallback_counts else "video"
+        fallback_counts[media_type] += 1
+        fallback_tags.append(f"<{tag_prefixes[media_type]} {fallback_counts[media_type]}>")
+
+    def replace(match: re.Match) -> str:
+        index = int(match.group(1)) - 1
+        if 0 <= index < len(resources):
+            tag = str(resources[index].get("tag") or "").strip()
+            if tag:
+                return tag
+        if 0 <= index < len(fallback_tags):
+            return fallback_tags[index]
+        return match.group(0)
+
+    return REFERENCE_PLACEHOLDER_RE.sub(replace, str(prompt or ""))
+
+
+@dataclass(frozen=True)
+class _RuntimePromptOptimization:
+    prompt: str
+    marker: Mapping[str, Any] | None = None
+
+
+def _optimize_prompt_on_run(
+    prompt: str,
+    mode: str,
+    seconds: float,
+    scene_guide: str,
+    items: list[_MediaInput],
+    resource_payload: Any,
+    marker_payload: Any,
+    prompt_connected: bool,
+) -> _RuntimePromptOptimization:
+    source_prompt = str(prompt or "")
+    settings = _read_prompt_optimizer_config()
+    if not bool(settings.get("optimize_on_run")) or not source_prompt.strip() or bool(prompt_connected):
+        return _RuntimePromptOptimization(source_prompt)
+
+    api_url = str(settings.get("api_url") or "").strip()
+    api_key = str(settings.get("api_key") or "").strip()
+    model = str(settings.get("model") or "").strip()
+    if not api_url or not api_key or not model:
+        return _RuntimePromptOptimization(source_prompt)
+
+    counts = {"image": 0, "video": 0, "audio": 0}
+    for item in items:
+        if item.media_type in counts:
+            counts[item.media_type] += 1
+
+    api_format = str(settings.get("api_format") or "openai").lower()
+    try:
+        resources = _runtime_optimizer_resources(resource_payload)
+        context_hash = _runtime_optimizer_context_hash(
+            settings,
+            str(mode or MODE_IMAGE),
+            float(seconds),
+            str(scene_guide or "none"),
+            counts,
+            resources,
+            items,
+        )
+        marker = _runtime_optimizer_marker(marker_payload)
+        if (
+            int(marker.get("version") or 0) == PROMPT_OPTIMIZER_MARKER_VERSION
+            and str(marker.get("prompt_sha256") or "") == _optimizer_sha256(source_prompt)
+            and str(marker.get("context_sha256") or "") == context_hash
+        ):
+            return _RuntimePromptOptimization(source_prompt)
+
+        media_parts = _optimizer_media_parts(resources, api_format) if bool(settings.get("read_media")) else []
+        request_prompt = _runtime_optimizer_prompt(source_prompt, resources, items)
+        system = _optimizer_system_prompt(
+            str(scene_guide or "none"),
+            str(mode or MODE_IMAGE),
+            float(seconds),
+            counts,
+            len(media_parts),
+        )
+        optimized = _optimizer_http_json(
+            api_url,
+            api_key,
+            model,
+            api_format,
+            system,
+            request_prompt,
+            media_parts,
+            timeout_seconds=PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS,
+        )
+        cleaned = re.sub(r"^```(?:text)?\s*", "", str(optimized or ""), flags=re.I)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        if not cleaned:
+            return _RuntimePromptOptimization(source_prompt)
+        return _RuntimePromptOptimization(
+            cleaned,
+            {
+                "version": PROMPT_OPTIMIZER_MARKER_VERSION,
+                "prompt_sha256": _optimizer_sha256(cleaned),
+                "context_sha256": context_hash,
+            },
+        )
+    except Exception as exc:
+        print(f"[MiniMax H3 Easy] Prompt optimization skipped; using the original prompt: {exc}")
+        return _RuntimePromptOptimization(source_prompt)
 
 
 class MiniMaxH3PromptOptimizer:
@@ -1412,7 +1623,12 @@ class MiniMaxH3Easy:
 
     @classmethod
     def INPUT_TYPES(cls):
-        optional = {"media": ("*",)}
+        optional = {
+            "media": ("*",),
+            "prompt_optimizer_resources": ("STRING", {"default": "", "hidden": True}),
+            "prompt_optimizer_marker": ("STRING", {"default": "", "hidden": True}),
+            "prompt_optimizer_prompt_connected": ("BOOLEAN", {"default": False, "hidden": True}),
+        }
         for index in range(1, MAX_MEDIA + 1):
             # Transport-only inputs used by the virtual multi-wire frontend.
             # Keep them in INPUT_TYPES so ComfyUI execution can resolve the
@@ -1460,6 +1676,12 @@ class MiniMaxH3Easy:
             items.append(_MediaInput(index, resolved_type, value))
         return items
 
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        if bool(_read_prompt_optimizer_config().get("optimize_on_run")):
+            return float("nan")
+        return False
+
     @staticmethod
     def _keyframes(items, role):
         images = [item.value for item in items if item.media_type == "image"]
@@ -1487,6 +1709,17 @@ class MiniMaxH3Easy:
         seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(seconds)))
         length = _frame_length(seconds, fps)
         items = cls._collect_media(kwargs)
+        optimization = _optimize_prompt_on_run(
+            prompt,
+            mode,
+            seconds,
+            str(kwargs.get("prompt_optimizer_scene_guide") or "none"),
+            items,
+            kwargs.get("prompt_optimizer_resources"),
+            kwargs.get("prompt_optimizer_marker"),
+            bool(kwargs.get("prompt_optimizer_prompt_connected", False)),
+        )
+        prompt = optimization.prompt
         if mode == MODE_REFERENCE and items:
             if len(items) > MAX_MEDIA:
                 raise ValueError("Reference mode accepts at most fifteen media resources")
@@ -1523,7 +1756,16 @@ class MiniMaxH3Easy:
             aspect_ratio=aspect_ratio,
             keyframe_sources=keyframe_sources,
         )
-        return model, context
+        result = (model, context)
+        if optimization.marker:
+            return {
+                "ui": {
+                    "auto_optimized_prompt": [prompt],
+                    "auto_optimization_marker": [json.dumps(optimization.marker, sort_keys=True, separators=(",", ":"))],
+                },
+                "result": result,
+            }
+        return result
 
 
 class MiniMaxH3EasyOutput:

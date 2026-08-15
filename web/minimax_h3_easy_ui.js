@@ -8,6 +8,7 @@ const OUTPUT_CLASS = "MiniMaxH3EasyOutput";
 const LINKS_PROP = "minimax_h3_virtual_media_links";
 const PROMPT_DOC_PROP = "minimax_h3_prompt_reference_doc";
 const PROMPT_VIEW_PROP = "minimax_h3_prompt_view_mode";
+const PROMPT_AUTO_MARKER_PROP = "minimax_h3_auto_prompt_marker";
 const PROMPT_OPTIMIZER_SETTINGS_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_settings";
 const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     api_format: "openai",
@@ -15,6 +16,7 @@ const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     api_key: "",
     model: "",
     read_media: false,
+    optimize_on_run: false,
 });
 let promptOptimizerSettingsCache = { ...PROMPT_OPTIMIZER_SETTINGS_DEFAULTS };
 let promptOptimizerSettingsLoaded = false;
@@ -81,6 +83,7 @@ const TEXT = {
     apiModel: ZH_BROWSER ? "\u6a21\u578b\u540d" : "Model",
     promptGuide: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u65b9\u6848" : "Prompt Guide",
     readMedia: ZH_BROWSER ? "\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53" : "Read connected media",
+    optimizeOnRun: ZH_BROWSER ? "\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u81ea\u52a8\u4f18\u5316" : "Optimize when workflow runs",
     optimizerMissing: ZH_BROWSER ? "\u8bf7\u5148\u6253\u5f00 API \u8bbe\u7f6e\u5e76\u586b\u5199 API \u5730\u5740\u3001API Key \u548c\u6a21\u578b\u540d\u3002" : "Open API settings and enter the API URL, API key, and model first.",
     optimizerFailed: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u5931\u8d25" : "Prompt optimization failed",
     optimizerRunning: ZH_BROWSER ? "\u6b63\u5728\u4f18\u5316" : "Optimizing",
@@ -1515,6 +1518,9 @@ function patchGraphToPrompt() {
             promptNode.inputs.advanced = asBoolean(getWidgetValue(node, "advanced", false));
             promptNode.inputs.prompt_optimizer_settings = false;
             promptNode.inputs.prompt_optimizer_scene_guide = canonicalPromptGuide(getWidgetValue(node, "prompt_optimizer_scene_guide", "none"));
+            promptNode.inputs.prompt_optimizer_resources = JSON.stringify(promptOptimizerResources(node));
+            promptNode.inputs.prompt_optimizer_marker = JSON.stringify(node.properties?.[PROMPT_AUTO_MARKER_PROP] || {});
+            promptNode.inputs.prompt_optimizer_prompt_connected = hasPromptConnection;
             promptNode.inputs.fps = Number(getWidgetValue(node, "fps", 24));
             promptNode.inputs.keyframe_role = canonicalOption("keyframe_role", getWidgetValue(node, "keyframe_role", KEYFRAME_FIRST));
             promptNode.inputs.ref_image_size = canonicalOption("ref_image_size", getWidgetValue(node, "ref_image_size", REF_IMAGE_1K));
@@ -3307,6 +3313,7 @@ function normalizePromptOptimizerSettings(value) {
         api_key: String(source.api_key || ""),
         model: String(source.model || "").trim(),
         read_media: asBoolean(source.read_media, false),
+        optimize_on_run: asBoolean(source.optimize_on_run, false),
     };
 }
 
@@ -3555,12 +3562,20 @@ async function openPromptOptimizerSettings(node) {
     const readMediaText = document.createElement("span");
     readMediaText.textContent = TEXT.readMedia;
     readMediaLabel.append(readMediaText, readMedia);
+    const optimizeOnRunLabel = document.createElement("div");
+    optimizeOnRunLabel.className = "h3-optimizer-settings-check";
+    const optimizeOnRun = makePromptOptimizerSwitch(promptOptimizerSettingsCache.optimize_on_run);
+    optimizeOnRun.setAttribute("aria-label", TEXT.optimizeOnRun);
+    const optimizeOnRunText = document.createElement("span");
+    optimizeOnRunText.textContent = TEXT.optimizeOnRun;
+    optimizeOnRunLabel.append(optimizeOnRunText, optimizeOnRun);
     form.append(
         makePromptOptimizerSettingsRow(TEXT.apiFormat, apiFormat),
         makePromptOptimizerSettingsRow(TEXT.apiUrl, apiUrl),
         makePromptOptimizerSettingsRow(TEXT.apiKey, apiKey),
         makePromptOptimizerSettingsRow(TEXT.apiModel, model),
         readMediaLabel,
+        optimizeOnRunLabel,
     );
 
     const error = document.createElement("div");
@@ -3607,6 +3622,7 @@ async function openPromptOptimizerSettings(node) {
                 api_key: apiKey.value,
                 model: model.value,
                 read_media: readMedia.checked,
+                optimize_on_run: optimizeOnRun.checked,
             });
             notifyPromptOptimizer(TEXT.settingsSaved, "success");
             close();
@@ -3767,11 +3783,18 @@ function promptOptimizerResources(node) {
     });
 }
 
-function setPromptFromOptimizedText(node, value) {
+function clearAutomaticPromptMarker(node) {
+    if (!node?.properties || !Object.prototype.hasOwnProperty.call(node.properties, PROMPT_AUTO_MARKER_PROP)) return false;
+    delete node.properties[PROMPT_AUTO_MARKER_PROP];
+    return true;
+}
+
+function setPromptFromOptimizedText(node, value, { preserveAutoMarker = false, notifyGraphChange = true } = {}) {
     const text = String(value || "").replace(/^```(?:text)?\s*/i, "").replace(/\s*```$/, "").trim();
     const doc = { version: 1, text, parts: promptPartsFromText(node, text) };
     const widget = getWidget(node, "prompt");
     node.properties ||= {};
+    if (!preserveAutoMarker) clearAutomaticPromptMarker(node);
     node.properties[PROMPT_DOC_PROP] = doc;
     if (widget) {
         widget.value = text;
@@ -3782,7 +3805,43 @@ function setPromptFromOptimizedText(node, value) {
     syncPromptFromEditor(node, false);
     pushPromptHistory(node);
     node.setDirtyCanvas?.(true, true);
-    app.graph?.change?.();
+    app.graph?.setDirtyCanvas?.(true, true);
+    if (notifyGraphChange) app.graph?.change?.();
+}
+
+function promptOptimizerUiValue(message, name) {
+    const output = message?.output && typeof message.output === "object" ? message.output : message;
+    const value = output?.[name];
+    return Array.isArray(value) ? value[0] : value;
+}
+
+function applyRuntimePromptOptimization(node, message) {
+    if (!node || promptInputIsConnected(node)) return;
+    const prompt = String(promptOptimizerUiValue(message, "auto_optimized_prompt") || "").trim();
+    const markerValue = promptOptimizerUiValue(message, "auto_optimization_marker");
+    if (!prompt || markerValue == null) return;
+
+    let marker;
+    try {
+        marker = typeof markerValue === "string" ? JSON.parse(markerValue) : markerValue;
+    } catch {
+        return;
+    }
+    if (!marker || typeof marker !== "object") return;
+
+    const currentPrompt = String(getWidget(node, "prompt")?.value || "");
+    const currentMarker = node.properties?.[PROMPT_AUTO_MARKER_PROP];
+    if (currentPrompt === prompt && JSON.stringify(currentMarker || {}) === JSON.stringify(marker)) return;
+
+    if (node.__h3Editor) syncPromptFromEditor(node, false);
+    pushPromptHistory(node);
+    setPromptFromOptimizedText(node, prompt, { preserveAutoMarker: true, notifyGraphChange: false });
+    node.properties ||= {};
+    node.properties[PROMPT_AUTO_MARKER_PROP] = marker;
+    node.__h3OptimizerSourcePrompt = null;
+    node.__h3OptimizerLastResult = null;
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
 }
 
 async function optimizePromptFromEditor(node) {
@@ -4769,7 +4828,12 @@ function updatePromptEditor(node) {
 }
 
 function isTransportInputName(name) {
-    return /^media_[0-9]+$/i.test(String(name || "")) || /^media_type_[0-9]+$/i.test(String(name || ""));
+    const value = String(name || "");
+    return /^media_[0-9]+$/i.test(value)
+        || /^media_type_[0-9]+$/i.test(value)
+        || value === "prompt_optimizer_resources"
+        || value === "prompt_optimizer_marker"
+        || value === "prompt_optimizer_prompt_connected";
 }
 
 function removeInputSlot(node, index) {
@@ -5021,6 +5085,13 @@ function installNode(nodeType, nodeData) {
         return result;
     };
 
+    const originalExecuted = nodeType.prototype.onExecuted;
+    nodeType.prototype.onExecuted = function onExecutedH3Easy(message) {
+        const result = originalExecuted?.apply(this, arguments);
+        applyRuntimePromptOptimization(this, message);
+        return result;
+    };
+
     const originalAdded = nodeType.prototype.onAdded;
     nodeType.prototype.onAdded = function onAddedH3Easy(graph) {
         const result = originalAdded?.apply(this, arguments);
@@ -5059,6 +5130,10 @@ function installNode(nodeType, nodeData) {
         if (info?.properties?.[PROMPT_VIEW_PROP]) {
             this.properties ||= {};
             this.properties[PROMPT_VIEW_PROP] = info.properties[PROMPT_VIEW_PROP];
+        }
+        if (info?.properties?.[PROMPT_AUTO_MARKER_PROP]) {
+            this.properties ||= {};
+            this.properties[PROMPT_AUTO_MARKER_PROP] = info.properties[PROMPT_AUTO_MARKER_PROP];
         }
         repairConfiguredWidgetValues(this, info);
         normalizeLinks(this);
@@ -5107,6 +5182,10 @@ function installNode(nodeType, nodeData) {
         if (info && this.properties?.[PROMPT_VIEW_PROP]) {
             info.properties ||= {};
             info.properties[PROMPT_VIEW_PROP] = this.properties[PROMPT_VIEW_PROP];
+        }
+        if (info && this.properties?.[PROMPT_AUTO_MARKER_PROP]) {
+            info.properties ||= {};
+            info.properties[PROMPT_AUTO_MARKER_PROP] = this.properties[PROMPT_AUTO_MARKER_PROP];
         }
         return result;
     };
@@ -5367,7 +5446,7 @@ function install() {
       .h3-optimizer-settings-select-option:hover { background: rgba(255,255,255,.06); }
       .h3-optimizer-settings-select-option.is-selected { background: rgba(168,199,250,.1); color: var(--h3-settings-accent); font-weight: 500; }
       .h3-optimizer-settings-select-option.is-selected::after { content: "\\2713"; margin-left: auto; color: currentColor; font-size: 14px; }
-      .h3-optimizer-settings-check { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 26px; color: var(--h3-settings-text); font-size: 13px; cursor: pointer; }
+      .h3-optimizer-settings-check { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 26px; color: var(--h3-settings-muted); font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
       .h3-optimizer-settings-switch { position: relative; display: inline-block; width: 40px; height: 22px; flex: 0 0 40px; padding: 0; border: 0; background: transparent; cursor: pointer; }
       .h3-optimizer-settings-switch-track { position: absolute; inset: 0; display: block; border: 1px solid rgba(255,255,255,.1); border-radius: 22px; background: #22252a; transition: background-color .2s, border-color .2s; }
       .h3-optimizer-settings-switch-thumb { position: absolute; left: 3px; bottom: 3px; width: 16px; height: 16px; border-radius: 50%; background: #747a83; box-shadow: 0 1px 3px rgba(0,0,0,.32); transition: transform .2s, background-color .2s; }
