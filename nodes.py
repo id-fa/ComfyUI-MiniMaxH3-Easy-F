@@ -962,16 +962,16 @@ def _optimize_prompt_on_run(
             resources,
             items,
         )
+        request_prompt = _runtime_optimizer_prompt(source_prompt, resources, items)
         marker = _runtime_optimizer_marker(marker_payload)
         if (
             int(marker.get("version") or 0) == PROMPT_OPTIMIZER_MARKER_VERSION
-            and str(marker.get("prompt_sha256") or "") == _optimizer_sha256(source_prompt)
+            and str(marker.get("prompt_sha256") or "") == _optimizer_sha256(request_prompt)
             and str(marker.get("context_sha256") or "") == context_hash
         ):
             return _RuntimePromptOptimization(source_prompt)
 
         media_parts = _optimizer_media_parts(resources, api_format) if bool(settings.get("read_media")) else []
-        request_prompt = _runtime_optimizer_prompt(source_prompt, resources, items)
         system = _optimizer_system_prompt(
             str(scene_guide or "none"),
             str(mode or MODE_IMAGE),
@@ -997,7 +997,7 @@ def _optimize_prompt_on_run(
             cleaned,
             {
                 "version": PROMPT_OPTIMIZER_MARKER_VERSION,
-                "prompt_sha256": _optimizer_sha256(cleaned),
+                "prompt_sha256": _optimizer_sha256(_runtime_optimizer_prompt(cleaned, resources, items)),
                 "context_sha256": context_hash,
             },
         )
