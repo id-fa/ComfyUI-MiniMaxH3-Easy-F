@@ -165,6 +165,17 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
 - Settings are **installation-global** (`prompt_optimizer.json`), not per-node; only
   `prompt_optimizer_scene_guide` is a saved node widget. The `prompt_optimizer_settings` boolean is a
   momentary trigger that the frontend resets to `false` and `graphToPrompt` always forces to `false`.
+- There are **three** places a prompt can be optimized, and each one checks the configured `api_format`
+  itself so only one of them ever fires:
+  - the editor route, for the HTTP formats and `gguf` (the `✦` button);
+  - `_clip_prompt_transform` inside `MiniMaxH3Easy.generate`, for `clip` only;
+  - `_optimize_prompt_on_run`, upstream's `optimize_on_run` setting, **restricted in this fork to
+    `OPTIMIZER_HTTP_FORMATS`**. It calls `_optimizer_http_json` directly, so handing it `clip` or
+    `gguf` would POST the request to whatever URL was last left in the shared settings. The
+    `optimizeOnRunLabel` switch is hidden in the settings modal for the local formats to match.
+  `_optimize_prompt_on_run` skips its own work when the marker transported in
+  `prompt_optimizer_marker` still matches the prompt and the context hash, which is why the node's
+  `IS_CHANGED` may return `NaN` without re-optimizing on every queue.
 - Five `api_format`s (`OPTIMIZER_FORMATS`, duplicated in the JS): OpenAI-compatible chat completions,
   OpenAI `responses`, Gemini native `generateContent`, `clip`, and `gguf`. URL handling for the three
   HTTP ones is forgiving (`_normalize_optimizer_url` appends/strips endpoints, injects the Gemini model
@@ -280,11 +291,13 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
 
 - All user-visible node/UI text is bilingual EN/ZH via the JS tables; Python error messages are English.
 - `IS_CHANGED` returns `NaN` on `MiniMaxH3EasyModelAdapter` and `MiniMaxH3PromptOptimizer`; the loader
-  returns its filename tuple so model choices cache correctly. `MiniMaxH3Easy` deliberately has **no**
-  `IS_CHANGED`: upstream removed it so an unchanged graph reuses its conditioning instead of re-encoding
-  every reference. Everything the node reads is a real input — the prompt widget is kept in sync by
-  `syncPromptWidgetFromDocs` — so edits still invalidate the cache. Do not add it back to make a UI
-  change take effect; make that change reach an input instead.
+  returns its filename tuple so model choices cache correctly. `MiniMaxH3Easy` returns a **constant**
+  `False` unless `optimize_on_run` is set, in which case it returns `NaN` — upstream reintroduced it for
+  exactly that reason, and only that reason. The default path is therefore still "no `IS_CHANGED`": an
+  unchanged graph reuses its conditioning instead of re-encoding every reference. Everything the node
+  reads is a real input — the prompt widget is kept in sync by `syncPromptWidgetFromDocs` — so edits
+  still invalidate the cache. Do not widen the `NaN` branch to make a UI change take effect; make that
+  change reach an input instead.
 - This repo is a fork. `README.md` and `README_CN.md` are kept byte-identical to upstream — do **not**
   edit them. Document every fork-only change in `README_fork.md` instead, and say there which upstream
   section it supersedes.

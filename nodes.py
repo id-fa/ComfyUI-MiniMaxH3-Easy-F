@@ -18,6 +18,7 @@ import base64
 import asyncio
 import io
 import inspect
+import hashlib
 import json
 import mimetypes
 import tempfile
@@ -103,6 +104,16 @@ ASPECT_RATIOS = {
     ASPECT_WIDESCREEN: (16, 9),
     ASPECT_ULTRAWIDE: (21, 9),
 }
+ASPECT_SELECTOR_LABELS = {
+    ASPECT_SQUARE: "1:1 (Square)",
+    ASPECT_PHOTO_PORTRAIT: "2:3 (Portrait Photo)",
+    ASPECT_PHOTO: "3:2 (Photo)",
+    ASPECT_STANDARD_PORTRAIT: "3:4 (Portrait Standard)",
+    ASPECT_STANDARD: "4:3 (Standard)",
+    ASPECT_WIDESCREEN_PORTRAIT: "9:16 (Portrait Widescreen)",
+    ASPECT_WIDESCREEN: "16:9 (Widescreen)",
+    ASPECT_ULTRAWIDE: "21:9 (Ultrawide)",
+}
 MAX_MEDIA = 15
 MAX_IMAGES = 9
 MAX_VIDEOS = 3
@@ -112,8 +123,10 @@ MAX_SECONDS = 30.0
 PROMPT_GUIDES_DIR = os.path.join(os.path.dirname(__file__), "prompt_guides")
 PROMPT_GUIDE_MANIFEST = os.path.join(PROMPT_GUIDES_DIR, "manifest.json")
 PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
+PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS = 120
 PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
-PROMPT_OPTIMIZER_CONFIG_VERSION = 1
+PROMPT_OPTIMIZER_MARKER_VERSION = 1
+PROMPT_OPTIMIZER_CONFIG_VERSION = 2
 OPTIMIZER_FORMAT_OPENAI = "openai"
 # OpenAI's Responses API. Same servers as `openai` but a different endpoint,
 # payload and reply shape, which is why it is a format rather than a URL.
@@ -193,6 +206,7 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "api_key": "",
     "model": "",
     "read_media": False,
+    "optimize_on_run": False,
     "local_max_length": PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
     "gguf_model": "",
     "gguf_mmproj": OPTIMIZER_GGUF_MMPROJ_AUTO,
@@ -485,6 +499,10 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     read_media = source.get("read_media", False)
     if isinstance(read_media, str):
         read_media = read_media.strip().lower() in {"1", "true", "yes", "on"}
+    optimize_on_run = source.get("optimize_on_run", False)
+    if isinstance(optimize_on_run, str):
+        optimize_on_run = optimize_on_run.strip().lower() in {"1", "true", "yes", "on"}
+
     def integer(key: str, fallback: int, low: int, high: int, *legacy: str) -> int:
         raw = source.get(key)
         for name in legacy:
@@ -516,6 +534,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "api_key": str(source.get("api_key") or ""),
         "model": str(source.get("model") or "").strip(),
         "read_media": bool(read_media),
+        "optimize_on_run": bool(optimize_on_run),
         "local_max_length": local_max_length,
         "gguf_model": str(source.get("gguf_model") or "").strip(),
         "gguf_mmproj": mmproj,
@@ -524,6 +543,18 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "gguf_unload_after": bool(unload),
         "gguf_describe_media": bool(describe),
     }
+
+
+def _prompt_optimizer_api_key_required(api_format: str) -> bool:
+    return str(api_format or "openai").strip().lower() == "gemini"
+
+
+def _prompt_optimizer_settings_complete(api_url: str, api_key: str, model: str, api_format: str) -> bool:
+    return bool(
+        str(api_url or "").strip()
+        and str(model or "").strip()
+        and (str(api_key or "").strip() or not _prompt_optimizer_api_key_required(api_format))
+    )
 
 
 def _read_prompt_optimizer_config() -> dict[str, Any]:
@@ -801,7 +832,13 @@ def _optimizer_merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) 
     return merged
 
 
-def _optimizer_http_post(url: str, headers: Mapping[str, str], payload: Mapping[str, Any], extra: Mapping[str, Any]) -> Any:
+def _optimizer_http_post(
+    url: str,
+    headers: Mapping[str, str],
+    payload: Mapping[str, Any],
+    extra: Mapping[str, Any],
+    timeout_seconds: float = PROMPT_OPTIMIZER_TIMEOUT_SECONDS,
+) -> Any:
     """POST the payload, retrying without `extra` if the endpoint rejects it.
 
     The thinking switches are the only optional fields, and a server that has
@@ -817,7 +854,7 @@ def _optimizer_http_post(url: str, headers: Mapping[str, str], payload: Mapping[
             url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=dict(headers), method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_TIMEOUT_SECONDS) as response:
+            with urllib.request.urlopen(request, timeout=max(1.0, float(timeout_seconds))) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -831,8 +868,18 @@ def _optimizer_http_post(url: str, headers: Mapping[str, str], payload: Mapping[
     raise last or RuntimeError("Prompt optimization request failed")
 
 
-def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str, system_prompt: str, user_prompt: str, media_parts: list[dict[str, Any]] | None = None) -> str:
+def _optimizer_http_json(
+    api_url: str,
+    api_key: str,
+    model: str,
+    api_format: str,
+    system_prompt: str,
+    user_prompt: str,
+    media_parts: list[dict[str, Any]] | None = None,
+    timeout_seconds: float = PROMPT_OPTIMIZER_TIMEOUT_SECONDS,
+) -> str:
     url = _normalize_optimizer_url(api_url, api_format, model)
+    api_key = str(api_key or "").strip()
     media_parts = list(media_parts or [])
     started = time.perf_counter()
     _optimizer_log(
@@ -840,6 +887,8 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
         api_format, model or "?", len(system_prompt), len(user_prompt), len(media_parts),
     )
     if api_format == "gemini":
+        if not api_key:
+            raise ValueError("Prompt optimization API key is required for Gemini Native")
         headers = {"Content-Type": "application/json", "Accept": "application/json", "x-goog-api-key": api_key}
         # Some Gemini-compatible channels accept the native payload and return
         # candidates but silently ignore systemInstruction. Keep the complete
@@ -857,7 +906,9 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
             "generationConfig": {"temperature": 0.35, "maxOutputTokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS},
         }
     elif api_format == "responses":
-        headers = {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {api_key}"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         user_content: list[dict[str, Any]] = [{"type": "input_text", "text": user_prompt}]
         user_content.extend(media_parts)
         payload = {
@@ -870,14 +921,18 @@ def _optimizer_http_json(api_url: str, api_key: str, model: str, api_format: str
             "max_output_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS,
         }
     else:
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         content: str | list[dict[str, Any]]
         if media_parts:
             content = [{"type": "text", "text": user_prompt}, *media_parts]
         else:
             content = user_prompt
         payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}], "stream": False, "temperature": 0.35, "max_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS}
-    data = _optimizer_http_post(url, headers, payload, _optimizer_thinking_off_payload(api_format))
+    data = _optimizer_http_post(
+        url, headers, payload, _optimizer_thinking_off_payload(api_format), timeout_seconds=timeout_seconds,
+    )
     if api_format == "gemini":
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates:
@@ -1876,6 +1931,206 @@ def _notify_prompt_optimized(node_id: Any, prompt: str) -> None:
         pass
 
 
+def _runtime_optimizer_resources(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+    if not isinstance(value, list):
+        return []
+    return [item for item in value[:MAX_MEDIA] if isinstance(item, Mapping)]
+
+
+def _runtime_optimizer_marker(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def _optimizer_sha256(value: str) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _runtime_optimizer_resource_signature(
+    resources: list[Mapping[str, Any]],
+    items: list[_MediaInput],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    count = max(len(resources), len(items))
+    for index in range(count):
+        resource = resources[index] if index < len(resources) else {}
+        item = items[index] if index < len(items) else None
+        asset = resource.get("asset") if isinstance(resource.get("asset"), Mapping) else {}
+        entry: dict[str, Any] = {
+            "type": str(resource.get("type") or getattr(item, "media_type", "") or ""),
+            "tag": str(resource.get("tag") or ""),
+            "name": str(resource.get("name") or ""),
+            "asset": {
+                "filename": str(asset.get("filename") or ""),
+                "subfolder": str(asset.get("subfolder") or ""),
+                "storage": str(asset.get("storage") or ""),
+            },
+        }
+        path = _optimizer_asset_path(asset) if asset else None
+        if path:
+            try:
+                stat = os.stat(path)
+                entry["file"] = {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+            except OSError:
+                pass
+        result.append(entry)
+    return result
+
+
+def _runtime_optimizer_context_hash(
+    settings: Mapping[str, Any],
+    mode: str,
+    seconds: float,
+    scene_guide: str,
+    counts: Mapping[str, int],
+    resources: list[Mapping[str, Any]],
+    items: list[_MediaInput],
+) -> str:
+    guide_fingerprint = _optimizer_sha256(
+        _optimizer_system_prompt(scene_guide, mode, seconds, counts, 0)
+    )
+    payload = {
+        "version": PROMPT_OPTIMIZER_MARKER_VERSION,
+        "guide": guide_fingerprint,
+        "api_format": str(settings.get("api_format") or "openai").lower(),
+        "api_url": str(settings.get("api_url") or "").strip(),
+        "model": str(settings.get("model") or "").strip(),
+        "read_media": bool(settings.get("read_media")),
+        "resources": _runtime_optimizer_resource_signature(resources, items),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _optimizer_sha256(canonical)
+
+
+def _runtime_optimizer_prompt(
+    prompt: str,
+    resources: list[Mapping[str, Any]],
+    items: list[_MediaInput],
+) -> str:
+    fallback_counts = {"image": 0, "video": 0, "audio": 0}
+    fallback_tags: list[str] = []
+    tag_prefixes = {"image": "Picture", "video": "Video", "audio": "Audio"}
+    for item in items:
+        media_type = item.media_type if item.media_type in fallback_counts else "video"
+        fallback_counts[media_type] += 1
+        fallback_tags.append(f"<{tag_prefixes[media_type]} {fallback_counts[media_type]}>")
+
+    def replace(match: re.Match) -> str:
+        index = int(match.group(1)) - 1
+        if 0 <= index < len(resources):
+            tag = str(resources[index].get("tag") or "").strip()
+            if tag:
+                return tag
+        if 0 <= index < len(fallback_tags):
+            return fallback_tags[index]
+        return match.group(0)
+
+    return REFERENCE_PLACEHOLDER_RE.sub(replace, str(prompt or ""))
+
+
+@dataclass(frozen=True)
+class _RuntimePromptOptimization:
+    prompt: str
+    marker: Mapping[str, Any] | None = None
+
+
+def _optimize_prompt_on_run(
+    prompt: str,
+    mode: str,
+    seconds: float,
+    scene_guide: str,
+    items: list[_MediaInput],
+    resource_payload: Any,
+    marker_payload: Any,
+    prompt_connected: bool,
+) -> _RuntimePromptOptimization:
+    source_prompt = str(prompt or "")
+    settings = _read_prompt_optimizer_config()
+    if not bool(settings.get("optimize_on_run")) or not source_prompt.strip() or bool(prompt_connected):
+        return _RuntimePromptOptimization(source_prompt)
+
+    api_url = str(settings.get("api_url") or "").strip()
+    api_key = str(settings.get("api_key") or "").strip()
+    model = str(settings.get("model") or "").strip()
+    api_format = str(settings.get("api_format") or OPTIMIZER_FORMAT_OPENAI).lower()
+    # This path is HTTP-only. The fork's local formats optimize elsewhere - `clip`
+    # from inside `generate` via `_clip_prompt_transform`, `gguf` from the editor
+    # route - and handing either of them to `_optimizer_http_json` would post the
+    # request to whatever URL happens to be left in the shared settings.
+    if api_format not in OPTIMIZER_HTTP_FORMATS:
+        return _RuntimePromptOptimization(source_prompt)
+    if not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
+        return _RuntimePromptOptimization(source_prompt)
+
+    counts = {"image": 0, "video": 0, "audio": 0}
+    for item in items:
+        if item.media_type in counts:
+            counts[item.media_type] += 1
+
+    try:
+        resources = _runtime_optimizer_resources(resource_payload)
+        context_hash = _runtime_optimizer_context_hash(
+            settings,
+            str(mode or MODE_IMAGE),
+            float(seconds),
+            str(scene_guide or "none"),
+            counts,
+            resources,
+            items,
+        )
+        request_prompt = _runtime_optimizer_prompt(source_prompt, resources, items)
+        marker = _runtime_optimizer_marker(marker_payload)
+        if (
+            int(marker.get("version") or 0) == PROMPT_OPTIMIZER_MARKER_VERSION
+            and str(marker.get("prompt_sha256") or "") == _optimizer_sha256(request_prompt)
+            and str(marker.get("context_sha256") or "") == context_hash
+        ):
+            return _RuntimePromptOptimization(source_prompt)
+
+        media_parts = _optimizer_media_parts(resources, api_format) if bool(settings.get("read_media")) else []
+        system = _optimizer_system_prompt(
+            str(scene_guide or "none"),
+            str(mode or MODE_IMAGE),
+            float(seconds),
+            counts,
+            len(media_parts),
+        )
+        optimized = _optimizer_http_json(
+            api_url,
+            api_key,
+            model,
+            api_format,
+            system,
+            request_prompt,
+            media_parts,
+            timeout_seconds=PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS,
+        )
+        cleaned = re.sub(r"^```(?:text)?\s*", "", str(optimized or ""), flags=re.I)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        if not cleaned:
+            return _RuntimePromptOptimization(source_prompt)
+        return _RuntimePromptOptimization(
+            cleaned,
+            {
+                "version": PROMPT_OPTIMIZER_MARKER_VERSION,
+                "prompt_sha256": _optimizer_sha256(_runtime_optimizer_prompt(cleaned, resources, items)),
+                "context_sha256": context_hash,
+            },
+        )
+    except Exception as exc:
+        print(f"[MiniMax H3 Easy] Prompt optimization skipped; using the original prompt: {exc}")
+        return _RuntimePromptOptimization(source_prompt)
+
+
 class MiniMaxH3PromptOptimizer:
     CATEGORY = "MiniMax H3 Easy"
     FUNCTION = "optimize"
@@ -1907,13 +2162,14 @@ class MiniMaxH3PromptOptimizer:
         return float("nan")
 
     def optimize(self, prompt, mode, seconds, scene_guide, api_format, api_url, api_key, model):
-        if not str(api_key or "").strip():
-            raise ValueError("Prompt optimization API key is required")
+        api_format = str(api_format or "openai").strip().lower()
+        if _prompt_optimizer_api_key_required(api_format) and not str(api_key or "").strip():
+            raise ValueError("Prompt optimization API key is required for Gemini Native")
         if not str(model or "").strip():
             raise ValueError("Prompt optimization model is required")
         counts = {"image": 0, "video": 0, "audio": 0}
         system = _optimizer_system_prompt(str(scene_guide or "none"), str(mode or MODE_IMAGE), float(seconds), counts)
-        return (_optimizer_http_json(str(api_url), str(api_key), str(model), str(api_format or "openai"), system, str(prompt or "")),)
+        return (_optimizer_http_json(str(api_url), str(api_key), str(model), api_format, system, str(prompt or "")),)
 
 
 def _register_prompt_optimizer_route() -> bool:
@@ -1994,7 +2250,7 @@ def _register_prompt_optimizer_route() -> bool:
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
             if local and not str(settings.get("gguf_model") or "").strip():
                 return web.json_response({"ok": False, "error": "Select a GGUF model in the prompt optimization settings"}, status=400)
-            if not local and (not api_key.strip() or not api_url.strip() or not model.strip()):
+            if not local and not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
             raw_counts = payload.get("media_counts") if isinstance(payload.get("media_counts"), dict) else {}
             counts = {kind: max(0, min(MAX_MEDIA, int(raw_counts.get(kind, 0) or 0))) for kind in ("image", "video", "audio")}
@@ -2244,12 +2500,20 @@ class MiniMaxH3Bundle:
 
 
 @dataclass(frozen=True)
+class _MiniMaxH3KeyframeSource:
+    resolved_frame_index: int
+    image: torch.Tensor
+
+
+@dataclass(frozen=True)
 class MiniMaxH3Context:
     conditioning: Any
     latent: Any
     video_vae: Any
     audio_vae: Any
     fps: float
+    aspect_ratio: str
+    keyframe_sources: tuple[_MiniMaxH3KeyframeSource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2461,14 +2725,19 @@ def _empty_image_conditioning(bundle, prompt, width, height, length, first_frame
     latent, frame_count = h3._empty_av_latent(width, height, length)
     images = []
     keyframes = []
+    keyframe_sources = []
     if first_frame is not None:
-        image = h3._resize(first_frame[:1], width, height, "center")
+        source = first_frame[:1]
+        image = h3._resize(source, width, height, "center")
         images.append(image)
         keyframes.append({"resolved_frame_index": 0, "image": image})
+        keyframe_sources.append(_MiniMaxH3KeyframeSource(0, source))
     if last_frame is not None:
-        image = h3._resize(last_frame[:1], width, height, "center")
+        source = last_frame[:1]
+        image = h3._resize(source, width, height, "center")
         images.append(image)
         keyframes.append({"resolved_frame_index": frame_count - 1, "image": image})
+        keyframe_sources.append(_MiniMaxH3KeyframeSource(frame_count - 1, source))
 
     tokens = bundle.clip.tokenize(prompt, images=images)
     conditioning = bundle.clip.encode_from_tokens_scheduled(tokens)
@@ -2479,7 +2748,7 @@ def _empty_image_conditioning(bundle, prompt, width, height, length, first_frame
             "minimax_keyframes": keyframes,
             "minimax_frame_count": frame_count,
         })
-    return conditioning, latent
+    return conditioning, latent, tuple(keyframe_sources)
 
 
 def _reference_conditioning(bundle, prompt, width, height, length, ref_image_size, items: list[_MediaInput], prompt_transform=None):
@@ -2633,6 +2902,12 @@ class MiniMaxH3Easy:
             # still empty. Defaults to True so an API/headless run with the
             # text encoder format configured still optimizes.
             "prompt_needs_optimization": ("BOOLEAN", {"default": True, "hidden": True}),
+            # Transport-only: upstream's run-time HTTP optimization. The editor
+            # reports the media manifest and the marker that says the prompt in
+            # the widget is already the optimized one.
+            "prompt_optimizer_resources": ("STRING", {"default": "", "hidden": True}),
+            "prompt_optimizer_marker": ("STRING", {"default": "", "hidden": True}),
+            "prompt_optimizer_prompt_connected": ("BOOLEAN", {"default": False, "hidden": True}),
         }
         for index in range(1, MAX_MEDIA + 1):
             # Transport-only inputs used by the virtual multi-wire frontend.
@@ -2681,6 +2956,12 @@ class MiniMaxH3Easy:
             resolved_type = media_type if media_type in {"image", "video", "audio"} else _infer_media_type(value)
             items.append(_MediaInput(index, resolved_type, value))
         return items
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        if bool(_read_prompt_optimizer_config().get("optimize_on_run")):
+            return float("nan")
+        return False
 
     @staticmethod
     def _keyframe_labels(items, role) -> dict[int, str]:
@@ -2784,6 +3065,21 @@ class MiniMaxH3Easy:
         seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(seconds)))
         length = _frame_length(seconds, fps)
         items = cls._collect_media(kwargs)
+        # Upstream's run-time HTTP optimization rewrites the prompt before it is
+        # tokenized; the fork's text-encoder format instead hands `generate` a
+        # transform that runs once the reference tags exist. Only one of them can
+        # be armed at a time - each checks the configured api_format itself.
+        optimization = _optimize_prompt_on_run(
+            prompt,
+            mode,
+            seconds,
+            str(kwargs.get("prompt_optimizer_scene_guide") or "none"),
+            items,
+            kwargs.get("prompt_optimizer_resources"),
+            kwargs.get("prompt_optimizer_marker"),
+            bool(kwargs.get("prompt_optimizer_prompt_connected", False)),
+        )
+        prompt = optimization.prompt
         prompt_transform, optimized_prompt = cls._clip_prompt_transform(mode, seconds, items, kwargs)
         if mode == MODE_REFERENCE and items:
             if len(items) > MAX_MEDIA:
@@ -2799,12 +3095,21 @@ class MiniMaxH3Easy:
                 raise ValueError("Reference mode needs an image or video in addition to audio")
             model = h3_bundle.model_for("ref2va")
             conditioning, latent = _reference_conditioning(h3_bundle, prompt, width, height, length, ref_image_size, items, prompt_transform)
+            keyframe_sources = ()
         else:
             first_frame, last_frame = cls._keyframes(items, keyframe_role)
             model = h3_bundle.model_for("fl2va")
             if prompt_transform is not None:
                 prompt = prompt_transform(prompt, cls._keyframe_labels(items, keyframe_role))
-            conditioning, latent = _empty_image_conditioning(h3_bundle, prompt, width, height, length, first_frame, last_frame)
+            conditioning, latent, keyframe_sources = _empty_image_conditioning(
+                h3_bundle,
+                prompt,
+                width,
+                height,
+                length,
+                first_frame,
+                last_frame,
+            )
         if optimized_prompt:
             _notify_prompt_optimized(kwargs.get("unique_id"), optimized_prompt[0])
         context = MiniMaxH3Context(
@@ -2813,8 +3118,19 @@ class MiniMaxH3Easy:
             video_vae=h3_bundle.video_vae,
             audio_vae=h3_bundle.audio_vae,
             fps=float(fps),
+            aspect_ratio=aspect_ratio,
+            keyframe_sources=keyframe_sources,
         )
-        return model, context
+        result = (model, context)
+        if optimization.marker:
+            return {
+                "ui": {
+                    "auto_optimized_prompt": [prompt],
+                    "auto_optimization_marker": [json.dumps(optimization.marker, sort_keys=True, separators=(",", ":"))],
+                },
+                "result": result,
+            }
+        return result
 
 
 class MiniMaxH3EasyOutput:
@@ -2845,6 +3161,91 @@ class MiniMaxH3EasyOutput:
         )
 
 
+class MiniMaxH3EasyAspectRatio:
+    """Expose Easy's resolved aspect ratio for downstream resolution controls."""
+
+    CATEGORY = "MiniMax H3 Easy"
+    FUNCTION = "extract"
+    RETURN_TYPES = ("*",)
+    RETURN_NAMES = ("aspect_ratio",)
+    DESCRIPTION = "Keep downstream resolution selectors aligned with MiniMax H3 Easy without copying width or height."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "h3_context": ("MINIMAX_H3_CONTEXT",),
+            },
+        }
+
+    @staticmethod
+    def extract(h3_context):
+        if not isinstance(h3_context, MiniMaxH3Context):
+            raise ValueError("Connect the H3 Context output from a MiniMax H3 Easy node")
+        try:
+            return (ASPECT_SELECTOR_LABELS[h3_context.aspect_ratio],)
+        except KeyError as exc:
+            raise ValueError(f"Unsupported MiniMax H3 aspect ratio: {h3_context.aspect_ratio}") from exc
+
+
+class MiniMaxH3EasySecondPassConditioning:
+    """Rebuild resolution-bound keyframes for a second-pass video latent."""
+
+    CATEGORY = "MiniMax H3 Easy"
+    FUNCTION = "rebuild"
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("second_pass_positive",)
+    DESCRIPTION = "Re-encode I2V/FL2V keyframes at the second-pass resolution while preserving text and reference-media conditioning."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "h3_context": ("MINIMAX_H3_CONTEXT",),
+                "second_pass_video_latent": ("LATENT",),
+            },
+        }
+
+    @staticmethod
+    def _target_dimensions(second_pass_video_latent):
+        if not isinstance(second_pass_video_latent, Mapping):
+            raise ValueError("Connect the video-only LATENT produced by the second-pass VAE Encode node")
+        samples = second_pass_video_latent.get("samples")
+        if not isinstance(samples, torch.Tensor) or samples.ndim != 5:
+            raise ValueError("Second-pass input must be a video-only LATENT tensor with shape [B, C, T, H, W]")
+        if samples.shape[1] != 24:
+            raise ValueError("Connect the 24-channel video LATENT before Concat AV Latent, not the combined AV latent")
+        return int(samples.shape[-1]) * 16, int(samples.shape[-2]) * 16, samples.shape[-2:]
+
+    @classmethod
+    def rebuild(cls, h3_context, second_pass_video_latent):
+        if not isinstance(h3_context, MiniMaxH3Context):
+            raise ValueError("Connect the H3 Context output from a MiniMax H3 Easy node")
+
+        conditioning = node_helpers.conditioning_set_values(h3_context.conditioning, {})
+        if not h3_context.keyframe_sources:
+            return (conditioning,)
+
+        target_width, target_height, target_latent_shape = cls._target_dimensions(second_pass_video_latent)
+        keyframes = []
+        for source in h3_context.keyframe_sources:
+            if not isinstance(source.image, torch.Tensor) or source.image.ndim != 4:
+                raise ValueError("The original MiniMax H3 keyframe source is unavailable; run the Easy node again")
+            resized = h3._resize(source.image[:1], target_width, target_height, "center")
+            latent = h3_context.video_vae.encode(resized)
+            if not isinstance(latent, torch.Tensor) or latent.ndim != 5 or latent.shape[-2:] != target_latent_shape:
+                raise ValueError(
+                    "The rebuilt MiniMax H3 keyframe does not match the second-pass video latent resolution"
+                )
+            keyframes.append({
+                "resolved_frame_index": source.resolved_frame_index,
+                "latent": latent,
+            })
+
+        conditioning = node_helpers.conditioning_set_values(conditioning, {"minimax_keyframes": keyframes})
+        return (conditioning,)
+
+
 _register_prompt_optimizer_route_when_ready()
 
 
@@ -2853,4 +3254,6 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3EasyModelAdapter": MiniMaxH3EasyModelAdapter,
     "MiniMaxH3Easy": MiniMaxH3Easy,
     "MiniMaxH3EasyOutput": MiniMaxH3EasyOutput,
+    "MiniMaxH3EasyAspectRatio": MiniMaxH3EasyAspectRatio,
+    "MiniMaxH3EasySecondPassConditioning": MiniMaxH3EasySecondPassConditioning,
 }

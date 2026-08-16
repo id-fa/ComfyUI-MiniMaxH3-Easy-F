@@ -486,3 +486,34 @@ encodes.
 ### Scope
 
 `nodes.py` only. **Restart ComfyUI.**
+
+---
+
+## "Optimize when workflow runs" and the local formats
+
+Upstream 1.0.11 added an `optimize_on_run` switch to the prompt optimization
+settings: when it is on, `MiniMaxH3Easy` rewrites the prompt over HTTP as part
+of executing the node, and reports the result back to the editor.
+
+This fork adds two local `api_format`s that upstream does not have — `clip` and
+`gguf` — and neither of them has an API URL. Upstream's run-time path calls
+`_optimizer_http_json` unconditionally, so with a local format selected it would
+POST the request to whatever URL happened to be left in the shared settings.
+
+In this fork `_optimize_prompt_on_run` therefore returns the prompt untouched
+unless `api_format` is one of `OPTIMIZER_HTTP_FORMATS`, and the settings modal
+hides the switch while a local format is selected. The local formats keep the
+paths they already had:
+
+| `api_format` | Where the prompt is optimized |
+| --- | --- |
+| `openai`, `responses`, `gemini` | The `✦` button, and `optimize_on_run` if it is on |
+| `gguf` | The `✦` button (llama-cpp runs in the editor route) |
+| `clip` | While the workflow runs, from `MiniMaxH3Easy.generate` |
+
+This supersedes upstream's description of "Optimize when workflow runs" as
+applying to every configured format.
+
+### Scope
+
+`nodes.py` and `web/minimax_h3_easy_ui.js`. **Restart ComfyUI and hard refresh.**
