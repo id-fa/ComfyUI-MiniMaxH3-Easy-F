@@ -199,13 +199,18 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   loads the projector, the final text-only pass takes `keep_vision=True`; without it the signature would
   change and the model would be reloaded between the two. `_optimizer_media_items` keeps unsendable
   media with empty `parts` (and its `path`) so skips can be logged rather than silently dropped.
-  Two things that mode gets wrong if you are not careful, both found with Gemma 4:
+  Three things that mode gets wrong if you are not careful, found with Gemma 4 and Qwen3.8:
   - **The describe pass has its own token budget, and a model that cannot be told to stop reasoning
     spends it on the thought.** `OPTIMIZER_CLIP_DESCRIBE_LENGTH` alone left Gemma stopping
     mid-thought, so `_strip_optimizer_output` correctly returned nothing and *every* description came
     back empty. `OPTIMIZER_DESCRIBE_THINKING_HEADROOM` is added for the families with no working
     switch (gemma), and is deliberately not tied to the answer length: it buys room for text that is
     discarded either way.
+  - **A vision chat handler renders no chat template**, so neither switch reaches the model on the
+    describe path and the budget is the only lever left. `_optimizer_gguf_chat` raises
+    `_OptimizerThinkingOverflow` for exactly that failure, and `_optimizer_gguf_describe_each` retries
+    the asset with `OPTIMIZER_DESCRIBE_THINKING_HEADROOM` and keeps the raised budget for the rest of
+    the run — one wasted pass, not one lost description per asset.
   - **A describe pass that produced nothing must not be treated as "no media was connected".** The
     route falls back to the single-request path (`describe = False`) and logs it. Without that the
     final pass got no parts *and* no media rule, and the model wrote — reasonably — a prompt about
@@ -228,9 +233,12 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   served until that finishes is not a cancel. Do not call it inline again; it is the window the stop
   button is pressed in most often, because it is the one before anything appears to happen.
 - Reasoning is always off — the answer *is* the prompt. Each backend suppresses it its own way (`clip`:
-  `thinking=False`; `gguf` and the HTTP pair: `chat_template_kwargs.enable_thinking=false`, plus
-  `/no_think` and `force_reasoning=False` for Qwen and family-specific `stop` markers; Gemini:
-  `thinkingConfig.thinkingBudget=0`), and `_strip_optimizer_output` is the shared backstop.
+  `thinking=False`; `gguf` and the HTTP pair: `chat_template_kwargs.enable_thinking=false` plus
+  `reasoning_effort=OPTIMIZER_REASONING_EFFORT`, and `/no_think` and `force_reasoning=False` for Qwen
+  and family-specific `stop` markers; Gemini: `thinkingConfig.thinkingBudget=0`), and
+  `_strip_optimizer_output` is the shared backstop. Qwen3.8 reads the *depth* rather than the switch and
+  defaults to `xhigh`, hence `low`; both fields go in the same dict because older templates read only
+  `enable_thinking`, and `none` is not a value that template accepts.
   Don't add a "reasoning" toggle without deciding what the leftover block should do to the H3 prompt.
   Three mistakes were made here already — do not reintroduce any of them:
   1. **The HTTP formats sent no switch and never called `_strip_optimizer_output`**, so a reasoning

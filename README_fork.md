@@ -341,6 +341,12 @@ switched off — there is no toggle for it:
   which newer Qwen templates read instead of `/no_think`. OpenAI-compatible
   servers (llama.cpp, vLLM, SGLang, LM Studio, Ollama) read the same field;
   Gemini gets `thinkingConfig.thinkingBudget=0` instead.
+- The same `chat_template_kwargs` also carries `reasoning_effort=low`. Qwen3.8
+  replaced the on/off switch with a depth and defaults it to `xhigh`, which is
+  enough to spend an entire answer on the thought; `low` is the shallowest value
+  its template accepts (`none` is not one of them). It is sent *in addition to*
+  `enable_thinking`, since older templates only read that one, and a template
+  that does not know the variable ignores it.
 - An endpoint that rejects that unknown field (400/404/422) — or a llama-cpp
   build too old to accept the argument — gets the request again without it, so a
   stricter API still answers.
@@ -427,6 +433,13 @@ mid-thought contains no description at all, since the closing marker never
 arrives. Gemma-family models therefore get extra headroom on top of the 256
 tokens (separate from the answer length, because it pays for text that is
 discarded anyway).
+
+Any other model that keeps thinking anyway gets the same headroom the moment it
+costs a description: a vision chat handler renders no chat template, so neither
+`enable_thinking` nor `reasoning_effort` reaches the model on that path and the
+budget is the only thing left. The first asset lost to an unterminated thought
+is retried with the headroom, and the rest of the run keeps the raised budget,
+so only one pass is paid for the discovery.
 
 If every description fails regardless, the run does **not** pretend no media was
 connected: it logs a warning and falls back to attaching the media to the

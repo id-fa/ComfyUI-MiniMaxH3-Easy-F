@@ -176,6 +176,14 @@ OPTIMIZER_CLIP_DESCRIBE_LENGTH = 256
 # headroom is spent on text that is thrown away, which is why only the models
 # that cannot be told to skip it get it.
 OPTIMIZER_DESCRIBE_THINKING_HEADROOM = 768
+# Qwen3.8 turned the on/off switch into a depth: its template reads
+# `reasoning_effort` and defaults to `xhigh`, which spends a describe pass'
+# whole budget on the thought. `low` is the shallowest value it accepts ("none"
+# is not one of them), so it is sent alongside `enable_thinking` rather than
+# instead of it — a template that has never heard of the variable ignores it,
+# and the same request has to keep working for the models that only read the
+# older switch.
+OPTIMIZER_REASONING_EFFORT = "low"
 OPTIMIZER_CLIP_DESCRIBE_SYSTEM = (
     "You describe one reference asset for a video generation prompt.\n"
     "Report only what is actually present in the attached media: subject, appearance, clothing, pose, "
@@ -809,6 +817,15 @@ class _OptimizerCancelled(Exception):
     """The editor asked for this optimization to stop."""
 
 
+class _OptimizerThinkingOverflow(RuntimeError):
+    """The whole token budget went into a thought that never closed.
+
+    Separate from a plain failure because it is the one error a bigger budget
+    fixes: the describe pass retries the asset with the thinking headroom
+    instead of dropping its description.
+    """
+
+
 _OPTIMIZER_CANCEL_LOCK = threading.RLock()
 _OPTIMIZER_CANCELLED: list[str] = []
 
@@ -867,7 +884,7 @@ def _optimizer_thinking_off_payload(api_format: str) -> dict[str, Any]:
         # `_optimizer_responses_text` never reads. Sending the chat switch here
         # would only cost every request a rejected first attempt.
         return {}
-    return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {"chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": OPTIMIZER_REASONING_EFFORT}}
 
 
 def _optimizer_merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, Any]:
@@ -2212,7 +2229,7 @@ def _optimizer_gguf_chat(
         # variable. llama-cpp only forwards this when it renders a Jinja
         # template, and ignores it otherwise, so sending both is the only way to
         # cover the whole family.
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": OPTIMIZER_REASONING_EFFORT},
     }
 
     def finish(raw: Any) -> str:
@@ -2221,7 +2238,7 @@ def _optimizer_gguf_chat(
             # Distinguishable from "the model said nothing": the block is there,
             # it simply never closed. Naming it is the difference between a
             # setting the user can raise and an unexplained empty prompt.
-            raise ValueError(
+            raise _OptimizerThinkingOverflow(
                 f"The model spent all {int(max_tokens)} tokens reasoning and never reached an answer. "
                 "Raise the local answer length, or use a model whose thinking can be switched off."
             )
@@ -2286,6 +2303,13 @@ def _optimizer_gguf_describe(
 
 def _optimizer_gguf_describe_each(llm, describable, gemma: bool, length: int, should_stop) -> list[str]:
     lines: list[str] = []
+    # The budget is raised for the rest of the run the first time a description
+    # is lost to an unterminated thought. The switches ask every backend for no
+    # reasoning, but a vision chat handler renders no Jinja template, so neither
+    # `enable_thinking` nor `reasoning_effort` reaches the model there and the
+    # budget is all that is left. Paying for one discarded thought beats losing
+    # every description.
+    budget = length
     for index, item in enumerate(describable, start=1):
         if should_stop is not None and should_stop():
             raise _OptimizerCancelled("Prompt optimization was cancelled")
@@ -2312,10 +2336,31 @@ def _optimizer_gguf_describe_each(llm, describable, gemma: bool, length: int, sh
         step = time.perf_counter()
         try:
             description = _optimizer_gguf_chat(
-                llm, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, request, parts, length, gemma, should_stop,
+                llm, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, request, parts, budget, gemma, should_stop,
             )
         except _OptimizerCancelled:
             raise
+        except _OptimizerThinkingOverflow as exc:
+            headroom = length + OPTIMIZER_DESCRIBE_THINKING_HEADROOM
+            if budget >= headroom:
+                logging.warning("MiniMax H3 Easy: could not describe %s for the prompt optimizer (%s).", label, exc)
+                continue
+            budget = headroom
+            _optimizer_log(
+                "  %s (%d/%d): the model kept thinking; retrying it and the rest with max_tokens=%d",
+                label, index, len(describable), budget,
+            )
+            try:
+                description = _optimizer_gguf_chat(
+                    llm, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, request, parts, budget, gemma, should_stop,
+                )
+            except _OptimizerCancelled:
+                raise
+            except Exception as retry_exc:
+                logging.warning(
+                    "MiniMax H3 Easy: could not describe %s for the prompt optimizer (%s).", label, retry_exc,
+                )
+                continue
         except Exception as exc:
             logging.warning("MiniMax H3 Easy: could not describe %s for the prompt optimizer (%s).", label, exc)
             continue
