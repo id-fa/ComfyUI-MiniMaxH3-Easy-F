@@ -187,23 +187,28 @@ OPTIMIZER_CLIP_DESCRIBE_REQUESTS = {
     "audio": "Describe this reference audio clip.",
 }
 # A chat API has no video channel, so a reference video is described from
-# evenly spaced stills instead.
+# stills instead.
 OPTIMIZER_VIDEO_STILLS = 4
 OPTIMIZER_VIDEO_STILL_MAX_SIDE = 768
-# How densely a reference video is sampled. The `fps` modes scale with the
-# clip's length, the frame modes are a fixed count whatever it is. Rates stop at
-# 1 fps and the total at OPTIMIZER_VIDEO_SAMPLE_MAX_FRAMES because every still
-# is a full image part in the request: an unbounded rate would blow up the
-# context on a long reference. Duplicated in the JS as OPTIMIZER_VIDEO_SAMPLES.
-OPTIMIZER_VIDEO_SAMPLES: dict[str, dict[str, float]] = {
-    "1fps": {"fps": 1.0},
-    "0.5fps": {"fps": 0.5},
-    "0.25fps": {"fps": 0.25},
-    "8frames": {"frames": 8},
-    "4frames": {"frames": 4},
-}
+# How many stills one reference video becomes. Candidates are taken at
+# OPTIMIZER_VIDEO_SAMPLE_RATE fps; the first and the last frame are always kept,
+# and the rest of the budget goes to the candidates that changed most from the
+# one before them, so a held shot is not sent several times over while the cut
+# in the middle of the clip goes unseen. Duplicated in the JS as
+# OPTIMIZER_VIDEO_SAMPLES.
+OPTIMIZER_VIDEO_SAMPLE_MIN = 2
+OPTIMIZER_VIDEO_SAMPLE_MAX = 12
+OPTIMIZER_VIDEO_SAMPLES: tuple[str, ...] = tuple(
+    f"{count}frames" for count in range(OPTIMIZER_VIDEO_SAMPLE_MIN, OPTIMIZER_VIDEO_SAMPLE_MAX + 1)
+)
 OPTIMIZER_VIDEO_SAMPLE_DEFAULT = "4frames"
-OPTIMIZER_VIDEO_SAMPLE_MAX_FRAMES = 16
+OPTIMIZER_VIDEO_SAMPLE_RATE = 1.0
+# 1 fps over a long reference is a lot of decoding for frames that mostly get
+# discarded, so the candidate set itself is capped and spread evenly beyond it.
+OPTIMIZER_VIDEO_SAMPLE_MAX_CANDIDATES = 180
+# Change is measured on a small grayscale thumbnail: what matters is that the
+# composition moved, not that the encoder's noise did.
+OPTIMIZER_VIDEO_SAMPLE_SCORE_SIDE = 48
 OPTIMIZER_VIDEO_STILLS_REQUEST = (
     "Describe this reference video. The {count} attached images are frames sampled from it in "
     "chronological order, not separate references: describe the clip as a whole, including the "
@@ -1013,22 +1018,106 @@ def _optimizer_inline_part(mime: str, encoded: str, api_format: str) -> dict[str
     return {"type": "image_url", "image_url": {"url": data_url}}
 
 
-def _optimizer_video_sample_count(sample: str, duration: float) -> int:
-    """How many stills one reference video of `duration` seconds becomes.
+def _optimizer_video_sample_count(sample: str) -> int:
+    """How many stills one reference video becomes.
 
-    A rate that cannot be applied — the container reports no duration — falls
-    back to the fixed default rather than to zero frames: a video the optimizer
-    cannot see is the one outcome worth avoiding.
+    The setting is a plain frame budget; anything unrecognised (including the
+    rate ids this setting shipped with) falls back to the default rather than to
+    zero frames, because a video the optimizer cannot see is the one outcome
+    worth avoiding.
     """
-    spec = OPTIMIZER_VIDEO_SAMPLES.get(str(sample or "").strip().lower())
-    if spec is None:
-        spec = OPTIMIZER_VIDEO_SAMPLES[OPTIMIZER_VIDEO_SAMPLE_DEFAULT]
-    frames = spec.get("frames")
-    if frames:
-        return max(1, int(frames))
+    value = str(sample or "").strip().lower()
+    if value not in OPTIMIZER_VIDEO_SAMPLES:
+        value = OPTIMIZER_VIDEO_SAMPLE_DEFAULT
+    match = re.match(r"(\d+)", value)
+    count = int(match.group(1)) if match else OPTIMIZER_VIDEO_STILLS
+    return min(OPTIMIZER_VIDEO_SAMPLE_MAX, max(OPTIMIZER_VIDEO_SAMPLE_MIN, count))
+
+
+def _optimizer_video_sample_times(duration: float, minimum: int = 2) -> list[float]:
+    """Candidate seek points across a clip of `duration` seconds.
+
+    One per second, first and last included. The last one is nudged just inside
+    the clip because seeking to the exact end lands past the final frame. A clip
+    too short to yield `minimum` candidates at that rate is sampled faster
+    instead: a 4 second reference must still be able to fill a 12 frame budget.
+    """
     if duration <= 0:
-        return OPTIMIZER_VIDEO_STILLS
-    return max(1, min(OPTIMIZER_VIDEO_SAMPLE_MAX_FRAMES, round(duration * float(spec["fps"]))))
+        return []
+    end = max(0.0, duration - 0.05)
+    count = min(
+        OPTIMIZER_VIDEO_SAMPLE_MAX_CANDIDATES,
+        max(2, minimum, int(duration * OPTIMIZER_VIDEO_SAMPLE_RATE) + 1),
+    )
+    if end <= 0:
+        return [0.0]
+    step = end / float(count - 1)
+    return [step * index for index in range(count)]
+
+
+def _optimizer_video_candidate_indices(total: int, fps: float, minimum: int = 2) -> list[int]:
+    """The same candidate set as `_optimizer_video_sample_times`, by frame index.
+
+    Used where the frames are already decoded, so the clip is addressed by index
+    instead of by seek time.
+    """
+    if total <= 0:
+        return []
+    step = max(1, int(round(float(fps or 24.0) / OPTIMIZER_VIDEO_SAMPLE_RATE)))
+    if minimum > 1:
+        step = max(1, min(step, total // max(1, minimum - 1)))
+    indices = list(range(0, total, step))
+    if indices[-1] != total - 1:
+        indices.append(total - 1)
+    limit = OPTIMIZER_VIDEO_SAMPLE_MAX_CANDIDATES
+    if len(indices) > limit:
+        stride = len(indices) / float(limit)
+        thinned = [indices[min(len(indices) - 1, int(index * stride))] for index in range(limit)]
+        thinned[-1] = indices[-1]
+        indices = sorted(set(thinned))
+    return indices
+
+
+def _select_change_frames(scores: Sequence[float], count: int) -> list[int]:
+    """Choose `count` candidates: both ends, then wherever the picture moved.
+
+    A reference clip is judged by where it starts and where it ends, so those two
+    are never given up. What is left of the budget goes to the candidates that
+    differ most from the frame before them: that is where the cut, the gesture or
+    the camera move is, and it is what an evenly spaced sample keeps missing on a
+    clip that holds still and then does one thing.
+    """
+    total = len(scores)
+    if total <= count:
+        return list(range(total))
+    if count <= 1:
+        return [0] if total else []
+    chosen = {0, total - 1}
+    for index in sorted(range(1, total - 1), key=lambda position: (-scores[position], position)):
+        if len(chosen) >= count:
+            break
+        chosen.add(index)
+    return sorted(chosen)
+
+
+def _optimizer_still_change_scores(thumbnails: Sequence[Any]) -> list[float]:
+    """Mean absolute difference from the previous candidate, per candidate.
+
+    Pillow ships with ComfyUI and already holds the decoded frame, so the score
+    needs no extra dependency; the first candidate has nothing to compare
+    against and is forced in by `_select_change_frames` anyway.
+    """
+    scores = [0.0]
+    try:
+        from PIL import ImageChops, ImageStat
+    except ImportError:
+        return scores + [0.0] * max(0, len(thumbnails) - 1)
+    for previous, current in zip(thumbnails, thumbnails[1:]):
+        try:
+            scores.append(float(ImageStat.Stat(ImageChops.difference(previous, current)).mean[0]))
+        except Exception:
+            scores.append(0.0)
+    return scores
 
 
 def _optimizer_media_items(
@@ -1098,20 +1187,43 @@ def _optimizer_media_manifest(items: Sequence[Mapping[str, Any]]) -> str:
     return "Attached media parts, in order:\n" + "\n".join(lines)
 
 
+def _optimizer_video_still(frame, max_side: int) -> tuple[bytes, Any] | None:
+    """One decoded frame as JPEG bytes plus the thumbnail its change is scored on.
+
+    Candidates are encoded as they are decoded rather than kept as images: at
+    one per second a long reference would otherwise hold a few hundred full-size
+    bitmaps in memory only to throw most of them away.
+    """
+    try:
+        image = frame.to_image().convert("RGB")
+        longest = max(image.width, image.height)
+        if longest > max_side:
+            scale = max_side / longest
+            image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85)
+        side = OPTIMIZER_VIDEO_SAMPLE_SCORE_SIDE
+        thumbnail = image.convert("L").resize((side, side))
+    except Exception as exc:
+        logging.warning("MiniMax H3 Easy: could not encode a sampled frame (%s).", exc)
+        return None
+    return buffer.getvalue(), thumbnail
+
+
 def _optimizer_video_still_parts(
     path: str,
     sample: str = OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
     max_side: int = OPTIMIZER_VIDEO_STILL_MAX_SIDE,
     api_format: str = OPTIMIZER_FORMAT_OPENAI,
 ) -> list[dict[str, Any]]:
-    """Sample evenly spaced frames from a video file as image parts.
+    """Sample a video file into the stills that stand in for it.
 
     A chat completion has no video channel, so this is the only way a reference
-    video reaches the optimizer. How many frames `sample` asks for can depend on
-    the clip's length, so the count is decided once the duration is known.
-    Frames are seeked rather than decoded in full, since a reference clip can be
-    long and only a handful of stills are wanted; files whose duration is
-    unknown (or that refuse to seek) fall back to a strided sequential decode.
+    video reaches the optimizer. Candidates are taken at one per second — seeked
+    rather than decoded in full, since a reference clip can be long — and the
+    `sample` budget is then spent on the first frame, the last frame and the
+    biggest changes in between. Files whose duration is unknown (or that refuse
+    to seek) fall back to a strided sequential decode.
     """
     if not path:
         return []
@@ -1120,7 +1232,8 @@ def _optimizer_video_still_parts(
     except ImportError:
         logging.warning("MiniMax H3 Easy: PyAV is unavailable, so reference videos cannot be sampled.")
         return []
-    frames: list[Any] = []
+    count = _optimizer_video_sample_count(sample)
+    candidates: list[tuple[bytes, Any]] = []
     try:
         with av.open(path) as container:
             streams = container.streams.video
@@ -1133,48 +1246,54 @@ def _optimizer_video_still_parts(
                 duration = float(stream.duration * stream.time_base)
             elif container.duration:
                 duration = float(container.duration) / float(av.time_base)
-            count = _optimizer_video_sample_count(sample, duration)
             if duration > 0 and stream.time_base:
-                for index in range(count):
-                    # Aim at the middle of each slice so the first and last
-                    # frames (often black) are not what gets described.
-                    seconds = duration * (index + 0.5) / count
+                for seconds in _optimizer_video_sample_times(duration, count):
                     try:
-                        container.seek(int(seconds / stream.time_base), stream=stream)
-                        frame = next(container.decode(stream), None)
+                        # Seeking lands on the keyframe before the target, so the
+                        # decode is carried forward to the frame actually asked
+                        # for: a candidate set that silently collapses onto one
+                        # keyframe per GOP has no changes left to measure.
+                        target = int(seconds / stream.time_base)
+                        container.seek(target, stream=stream)
+                        frame = None
+                        for decoded in container.decode(stream):
+                            frame = decoded
+                            if decoded.pts is None or decoded.pts >= target:
+                                break
                     except Exception:
                         frame = None
-                    if frame is not None:
-                        frames.append(frame)
-            if not frames:
+                    if frame is None:
+                        continue
+                    still = _optimizer_video_still(frame, max_side)
+                    if still is not None:
+                        candidates.append(still)
+            if not candidates:
                 container.seek(0)
-                total = int(stream.frames or 0)
-                stride = max(1, total // count) if total else 1
+                rate = float(stream.average_rate or 0) or 24.0
+                stride = max(1, int(round(rate / OPTIMIZER_VIDEO_SAMPLE_RATE)))
                 for index, frame in enumerate(container.decode(stream)):
-                    if index % stride == 0:
-                        frames.append(frame)
-                    if len(frames) >= count:
+                    if index % stride:
+                        continue
+                    still = _optimizer_video_still(frame, max_side)
+                    if still is not None:
+                        candidates.append(still)
+                    if len(candidates) >= OPTIMIZER_VIDEO_SAMPLE_MAX_CANDIDATES:
                         break
     except Exception as exc:
         logging.warning("MiniMax H3 Easy: could not sample %s for the prompt optimizer (%s).", os.path.basename(path), exc)
         return []
-    parts: list[dict[str, Any]] = []
-    for frame in frames:
-        try:
-            image = frame.to_image()
-            longest = max(image.width, image.height)
-            if longest > max_side:
-                scale = max_side / longest
-                image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
-            buffer = io.BytesIO()
-            image.convert("RGB").save(buffer, format="JPEG", quality=85)
-        except Exception as exc:
-            logging.warning("MiniMax H3 Easy: could not encode a sampled frame (%s).", exc)
-            continue
-        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-        parts.append(_optimizer_inline_part("image/jpeg", encoded, api_format))
+    if not candidates:
+        return []
+    scores = _optimizer_still_change_scores([thumbnail for _, thumbnail in candidates])
+    chosen = _select_change_frames(scores, count)
+    parts = [
+        _optimizer_inline_part("image/jpeg", base64.b64encode(candidates[index][0]).decode("ascii"), api_format)
+        for index in chosen
+    ]
     if parts:
-        _optimizer_log("sampled %d frames from %s", len(parts), os.path.basename(path))
+        _optimizer_log(
+            "sampled %d of %d candidate frames from %s", len(parts), len(candidates), os.path.basename(path),
+        )
     return parts
 
 
@@ -1320,16 +1439,40 @@ def _tokenizer_accepts(clip, name: str) -> bool:
         return False
 
 
-def _sample_frames(frames, limit: int):
-    """Evenly thin a frame batch down to at most `limit` frames."""
+def _tensor_change_scores(frames, indices: Sequence[int]) -> list[float]:
+    """Mean absolute difference between consecutive candidates of a frame batch.
+
+    The tensor is already in memory here, so the thumbnail is taken by striding
+    rather than by resizing.
+    """
+    try:
+        small = frames[list(indices)][..., :3].float()
+        step_h = max(1, int(small.shape[1]) // OPTIMIZER_VIDEO_SAMPLE_SCORE_SIDE)
+        step_w = max(1, int(small.shape[2]) // OPTIMIZER_VIDEO_SAMPLE_SCORE_SIDE)
+        small = small[:, ::step_h, ::step_w, :]
+        diff = (small[1:] - small[:-1]).abs().mean(dim=(1, 2, 3))
+        return [0.0] + [float(value) for value in diff]
+    except Exception:
+        return [0.0] * len(indices)
+
+
+def _sample_frames(frames, fps: float, limit: int):
+    """Thin a decoded frame batch to `limit` frames, the same way the file path does.
+
+    Candidates at one per second, then the first frame, the last frame and the
+    biggest changes in between.
+    """
     try:
         count = int(frames.shape[0])
     except (AttributeError, IndexError, TypeError):
         return frames
     if count <= limit:
         return frames
-    step = count / float(limit)
-    return frames[[min(count - 1, int(index * step)) for index in range(limit)]]
+    indices = _optimizer_video_candidate_indices(count, fps, limit)
+    if len(indices) <= limit:
+        return frames[indices]
+    chosen = _select_change_frames(_tensor_change_scores(frames, indices), limit)
+    return frames[[indices[position] for position in chosen]]
 
 
 def _stack_stills(stills: list) -> Any:
@@ -1379,9 +1522,9 @@ def _optimizer_clip_media(
             frames, soundtrack, fps = _video_parts(item.value)
         except ValueError:
             continue
-        # The frames are already decoded here, so the clip's length is known
-        # without seeking: a rate-based `sample` can be applied directly.
-        videos.append((frames, float(frames.shape[0]) / max(1e-6, float(fps or 24.0))))
+        # The frames are already decoded here, so the candidate set can be taken
+        # by index instead of by seeking.
+        videos.append((frames, float(fps or 24.0)))
         if soundtrack is not None:
             soundtracks.append(soundtrack)
 
@@ -1390,15 +1533,15 @@ def _optimizer_clip_media(
     # The dedicated video channel replaces the image channel on the encoders
     # that have one, so it is only used when no reference image would be lost.
     if not stills and len(videos) == 1 and _tokenizer_accepts(clip, "video"):
-        frames, duration = videos[0]
-        wanted = min(OPTIMIZER_CLIP_MAX_VIDEO_FRAMES, _optimizer_video_sample_count(sample, duration))
-        media["video"] = _sample_frames(frames, wanted)[..., :3]
+        frames, fps = videos[0]
+        wanted = min(OPTIMIZER_CLIP_MAX_VIDEO_FRAMES, _optimizer_video_sample_count(sample))
+        media["video"] = _sample_frames(frames, fps, wanted)[..., :3]
         # The frames are already thinned, so keep every one of them.
         media["fps"] = 1.0
         attached += 1
     else:
-        for frames, duration in videos:
-            sampled = _sample_frames(frames, _optimizer_video_sample_count(sample, duration))
+        for frames, fps in videos:
+            sampled = _sample_frames(frames, fps, _optimizer_video_sample_count(sample))
             stills.extend(sampled[index:index + 1] for index in range(int(sampled.shape[0])))
         if stills:
             dropped = max(0, len(stills) - OPTIMIZER_CLIP_MAX_STILLS)

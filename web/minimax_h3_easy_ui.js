@@ -35,17 +35,21 @@ const OPTIMIZER_FORMATS = [
     OPTIMIZER_FORMAT_CLIP,
     OPTIMIZER_FORMAT_GGUF,
 ];
-// Mirrors OPTIMIZER_VIDEO_SAMPLES in nodes.py: how densely a reference video is
-// sampled before it is shown to the optimizer. The values are the canonical ids
-// the server accepts; the labels are display only.
+// Mirrors OPTIMIZER_VIDEO_SAMPLES in nodes.py: how many stills a reference
+// video becomes before it is shown to the optimizer. The server samples
+// candidates at 1 fps, always keeps the first and the last frame, and spends
+// what is left of the budget on the frames that changed most. The values are
+// the canonical ids the server accepts; the labels are display only.
+const VIDEO_SAMPLE_MIN = 2;
+const VIDEO_SAMPLE_MAX = 12;
 const VIDEO_SAMPLE_DEFAULT = "4frames";
-const OPTIMIZER_VIDEO_SAMPLES = [
-    { value: "1fps", zh: "1 fps\uff08\u6bcf\u79d2 1 \u5e27\uff09", en: "1 fps" },
-    { value: "0.5fps", zh: "0.5 fps\uff08\u6bcf 2 \u79d2 1 \u5e27\uff09", en: "0.5 fps" },
-    { value: "0.25fps", zh: "0.25 fps\uff08\u6bcf 4 \u79d2 1 \u5e27\uff09", en: "0.25 fps" },
-    { value: "8frames", zh: "8 \u5e27\uff08\u5747\u5300\u62bd\u53d6\uff09", en: "8 frames" },
-    { value: "4frames", zh: "4 \u5e27\uff08\u5747\u5300\u62bd\u53d6\uff09", en: "4 frames" },
-];
+const OPTIMIZER_VIDEO_SAMPLES = Array.from(
+    { length: VIDEO_SAMPLE_MAX - VIDEO_SAMPLE_MIN + 1 },
+    (_unused, index) => {
+        const count = VIDEO_SAMPLE_MIN + index;
+        return { value: `${count}frames`, zh: `${count} \u5e27`, en: `${count} frames` };
+    },
+);
 const LOCAL_MAX_LENGTH_DEFAULT = 1024;
 const LOCAL_MIN_LENGTH = 16;
 const LOCAL_MAX_LENGTH_LIMIT = 32768;

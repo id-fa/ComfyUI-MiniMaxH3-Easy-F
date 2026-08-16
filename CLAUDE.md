@@ -258,17 +258,27 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   the hidden `prompt_needs_optimization` transport input is true (frontend: "the open tab's Optimized
   field is empty"; default true so headless runs still optimize).
 - A chat-completions message has no video part, so `_optimizer_media_items` gives a reference video
-  `_optimizer_video_still_parts` instead: PyAV *seeks* evenly spaced frames (this is the editor route,
-  where media are file paths, not the tensors `clip` gets). One item can therefore hold several parts,
-  which is why `_optimizer_media_manifest` exists — several frames of one clip are otherwise
+  `_optimizer_video_still_parts` instead: PyAV *seeks* one candidate per second, then decodes forward
+  to the target — a seek only reaches the keyframe before it, and a candidate set that collapses onto
+  one keyframe per GOP has no changes left to score (this is the editor route, where media are file
+  paths, not the tensors `clip` gets). One item can therefore hold several
+  parts, which is why `_optimizer_media_manifest` exists — several frames of one clip are otherwise
   indistinguishable from several unrelated images, and the attached count is by reference, not by part.
   Gemini keeps sending video whole.
-- How many frames is the shared `video_sample` setting (`OPTIMIZER_VIDEO_SAMPLES`, duplicated in the JS),
-  resolved by `_optimizer_video_sample_count`. The rate modes need a duration, so the count is decided
-  *after* the container is opened, and a file that reports none falls back to `OPTIMIZER_VIDEO_STILLS`
-  rather than to zero frames. `OPTIMIZER_VIDEO_SAMPLE_MAX_FRAMES` caps every mode because each still is
-  a whole image part. `_optimizer_clip_media` honours the same setting — it already has the decoded
-  frames and the fps, so no seeking is involved — but keeps `OPTIMIZER_CLIP_MAX_VIDEO_FRAMES` /
+- How many of those candidates survive is the shared `video_sample` setting (`OPTIMIZER_VIDEO_SAMPLES`,
+  2–12 frames, duplicated in the JS), resolved by `_optimizer_video_sample_count`. The selection is
+  `_select_change_frames`: the **first and last** candidates are always kept, and the remaining budget
+  goes to the candidates whose mean absolute difference from the previous one is largest
+  (`_optimizer_still_change_scores` on Pillow thumbnails for the file path, `_tensor_change_scores` for
+  the decoded path). Even spacing was the earlier rule and it kept spending the whole budget on a held
+  shot; do not restore it without deciding what happens to the cut in the middle. Sampling at
+  `OPTIMIZER_VIDEO_SAMPLE_RATE` fps means the candidate set grows with the clip, so
+  `OPTIMIZER_VIDEO_SAMPLE_MAX_CANDIDATES` caps it and spreads it evenly beyond that — each candidate
+  costs a decode and a JPEG encode, and the stills are held as encoded bytes rather than as images for
+  the same reason. A file that reports no duration (or refuses to seek) falls back to a strided
+  sequential decode, never to zero frames. `_optimizer_clip_media` honours the same setting — it
+  already has the decoded frames and the fps, so `_sample_frames` addresses candidates by index instead
+  of seeking — but keeps `OPTIMIZER_CLIP_MAX_VIDEO_FRAMES` /
   `OPTIMIZER_CLIP_MAX_STILLS` on top of it: that path shares VRAM with the H3 model.
 - Cancelling a GGUF run releases the model (`_optimizer_gguf_release`) regardless of
   `gguf_unload_after`, from inside the worker thread — never from the `asyncio.CancelledError` handler,

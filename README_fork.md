@@ -187,8 +187,9 @@ limits, and the final prompt-writing pass runs on text alone.
 - A modality the encoder has no channel for is skipped rather than guessed at,
   and the guide's media evidence rule is told how many descriptions exist, so
   unlisted references are never invented.
-- Video is sampled before it reaches the encoder (8 frames through a native
-  video channel, otherwise 4 frames as stills).
+- Video is sampled before it reaches the encoder, with the same rule as the
+  chat formats (see *Video reference frames* below), capped at 8 frames through
+  a native video channel and 12 stills in total otherwise.
 - Each description is capped at 256 tokens, or `clip_max_length` when that is
   lower.
 
@@ -415,42 +416,54 @@ built around a video reference optimized its prompt as if nothing were attached.
 
 A reference video is now sampled into stills and sent as those:
 
-- **Evenly spaced frames**, aimed at the middle of each slice so the first and
-  last frames — often black — are not what the model sees. How many is the
-  **Video reference frames** setting below; the default is 4.
+- **Candidates at 1 fps**, from which the **first frame**, the **last frame**
+  and the frames that changed most are kept. How many in total is the **Video
+  reference frames** setting below; the default is 4.
 - **Long side capped at 768 px**, re-encoded as JPEG.
 - Frames are **seeked, not decoded in sequence**, so a long reference video
-  costs a handful of decodes rather than a full pass. Files that report no
-  duration or refuse to seek fall back to a strided sequential decode.
+  costs one seek per second rather than a full pass. Each seek then decodes
+  forward to the frame actually asked for, because a seek only lands on the
+  keyframe before it — without that, whole seconds collapse onto the same
+  picture and there is no change left to measure. Files that report no duration
+  or refuse to seek fall back to a strided sequential decode.
 - Uses PyAV, which ComfyUI already requires. Without it, videos are skipped and
-  a warning is logged, as before.
+  a warning is logged, as before. Change is measured with Pillow, which ComfyUI
+  already requires too, so there is still no new dependency.
 
 Gemini is unaffected: it takes video natively, so the file is sent whole. (An
 oversized video that cannot be inlined falls back to frames there too.)
 
 ### Video reference frames
 
-**Video reference frames** (`video_sample`, default **4 frames**) chooses how
-densely a reference clip is sampled. It appears in the settings popup whenever
-**Read connected media** is on, and applies to every format:
+**Video reference frames** (`video_sample`, **2**–**12**, default **4 frames**)
+is how many stills one reference clip becomes. It appears in the settings popup
+whenever **Read connected media** is on, and applies to every format.
 
-| Setting | Frames sent |
-| --- | --- |
-| **1 fps** | one per second of the clip |
-| **0.5 fps** | one per 2 seconds |
-| **0.25 fps** | one per 4 seconds |
-| **8 frames** | 8, whatever the length |
-| **4 frames** | 4, whatever the length (the previous fixed behaviour) |
+Which frames those are is not an even split:
 
-The rates stop at 1 fps and every mode is capped at **16 frames total**, because
-each still is a full image part in the request: an uncapped rate would fill the
-context with one long reference. A file whose duration cannot be read falls back
-to 4 frames rather than to none.
+1. The clip is sampled at **1 fps** to get the candidates.
+2. The **first** and the **last** candidate are always kept — where a reference
+   clip starts and where it ends is what it is judged by.
+3. The remaining budget (the setting minus those two) goes to the candidates
+   that differ most from the frame before them, measured as the mean absolute
+   difference of a small grayscale thumbnail.
+4. The kept frames are sent in chronological order.
 
-The **local text encoder** format honours the setting too, but its own limits
-still apply on top of it — that path runs in the same VRAM as the H3 model, so a
-video sent on a dedicated video channel keeps its 8-frame ceiling and the stills
-of all references together keep their 12-frame one.
+That last step is the point of the change. Evenly spaced frames spend the whole
+budget on a shot that holds still and then walk straight past the cut, the
+gesture or the camera move in the middle; scoring the change puts the frames
+where something actually happens.
+
+The candidate set itself is capped at **180 frames** (and spread evenly beyond
+that), because every candidate costs a decode and a JPEG encode. A file whose
+duration cannot be read falls back to a strided sequential decode rather than to
+no frames at all.
+
+The **local text encoder** format uses the same rule — it already has the
+decoded frames, so it counts by frame index instead of seeking — but its own
+limits still apply on top of it: that path runs in the same VRAM as the H3
+model, so a video sent on a dedicated video channel keeps its 8-frame ceiling
+and the stills of all references together keep their 12-frame one.
 
 ### Telling the model what it received
 
