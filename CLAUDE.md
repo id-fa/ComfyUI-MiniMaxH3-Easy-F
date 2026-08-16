@@ -222,7 +222,11 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   so streaming and closing the generator is the only way to interrupt a chat turn; model loading and
   prompt evaluation still cannot be interrupted at all. urllib cannot be interrupted either, so an HTTP
   answer that arrives after a cancel is discarded instead. A client disconnect raises
-  `asyncio.CancelledError` in the route and is treated as a cancel.
+  `asyncio.CancelledError` in the route and is treated as a cancel. **Everything the route does that
+  blocks goes through `asyncio.to_thread`, `_optimizer_media_items` included** — reading the
+  references base64s whole files and decodes every video frame by frame, and a cancel that cannot be
+  served until that finishes is not a cancel. Do not call it inline again; it is the window the stop
+  button is pressed in most often, because it is the one before anything appears to happen.
 - Reasoning is always off — the answer *is* the prompt. Each backend suppresses it its own way (`clip`:
   `thinking=False`; `gguf` and the HTTP pair: `chat_template_kwargs.enable_thinking=false`, plus
   `/no_think` and `force_reasoning=False` for Qwen and family-specific `stop` markers; Gemini:
@@ -280,6 +284,17 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   already has the decoded frames and the fps, so `_sample_frames` addresses candidates by index instead
   of seeking — but keeps `OPTIMIZER_CLIP_MAX_VIDEO_FRAMES` /
   `OPTIMIZER_CLIP_MAX_STILLS` on top of it: that path shares VRAM with the H3 model.
+- The editor toolbar's `⏏` (`POST /minimax_h3_easy/prompt_optimizer_unload`) frees whatever the
+  configured backend holds: for `gguf` this process's cached `Llama` via `_optimizer_gguf_unload_now`,
+  for the two OpenAI-shaped formats the model on the server via `_optimizer_remote_unload`. Which
+  server that is, is answered by probing (`/api/v1/models` is LM Studio's, `/api/ps` is Ollama's,
+  neither has the other's) rather than by a setting — they are the same endpoint for every other
+  purpose. `gemini` and `clip` have nothing this route may free and the button is hidden for them.
+  **`_OPTIMIZER_GGUF_BUSY` / `_optimizer_gguf_hold` exist because that button can arrive mid-run**:
+  closing a `Llama` a worker thread is still generating with takes llama-cpp down with the process, so
+  the route is refused (`busy`) instead, and the whole decision including `llm.close()` happens under
+  `_OPTIMIZER_GGUF_LOCK`. The optimize route holds it across the describe pass and the final pass
+  together, not per call.
 - Cancelling a GGUF run releases the model (`_optimizer_gguf_release`) regardless of
   `gguf_unload_after`, from inside the worker thread — never from the `asyncio.CancelledError` handler,
   which returns while `asyncio.to_thread` is still generating.

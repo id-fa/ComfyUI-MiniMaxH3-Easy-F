@@ -23,6 +23,7 @@ const PROMPT_TAB_LIMIT = 20;
 const PROMPT_OPTIMIZER_SETTINGS_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_settings";
 const PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized";
 const PROMPT_OPTIMIZER_GGUF_ENDPOINT = "/minimax_h3_easy/gguf_models";
+const PROMPT_OPTIMIZER_UNLOAD_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_unload";
 const OPTIMIZER_FORMAT_OPENAI = "openai";
 const OPTIMIZER_FORMAT_RESPONSES = "responses";
 const OPTIMIZER_FORMAT_GEMINI = "gemini";
@@ -193,6 +194,10 @@ const TEXT = {
     optimizerStop: ZH_BROWSER ? "\u505c\u6b62\u63d0\u793a\u8bcd\u4f18\u5316" : "Stop prompt optimization",
     optimizerCancelled: ZH_BROWSER ? "\u5df2\u505c\u6b62\u63d0\u793a\u8bcd\u4f18\u5316" : "Prompt optimization stopped",
     optimizerDone: ZH_BROWSER ? "\u4f18\u5316\u5b8c\u6210" : "Optimization complete",
+    optimizerUnload: ZH_BROWSER ? "\u5378\u8f7d\u6a21\u578b" : "Unload the model",
+    optimizerUnloadHttp: ZH_BROWSER ? "\u5378\u8f7d\u6a21\u578b\uff08LM Studio / Ollama\uff09" : "Unload the model (LM Studio / Ollama)",
+    optimizerUnloaded: ZH_BROWSER ? "\u6a21\u578b\u5df2\u5378\u8f7d" : "Model unloaded",
+    optimizerUnloadIdle: ZH_BROWSER ? "\u6ca1\u6709\u5df2\u52a0\u8f7d\u7684\u6a21\u578b" : "No model was loaded",
     optimizerError: ZH_BROWSER ? "\u4f18\u5316\u5931\u8d25" : "Optimization failed",
     promptExternalConnected: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u6765\u81ea\u5916\u90e8\u6587\u672c\u8fde\u63a5" : "Prompt supplied by external text input",
     referencePromptPlaceholder: ZH_BROWSER ? "Prompt... \u8f93\u5165 @ \u5f15\u7528\u5df2\u8fde\u63a5\u7d20\u6750" : "Prompt... Type @ to reference connected media",
@@ -4406,8 +4411,60 @@ function syncPromptOptimizerButton(node) {
         editor.classList.toggle("is-loading", pending);
     }
     wrap?.classList?.toggle("is-loading", pending);
+    syncPromptOptimizerUnloadButton(node, state, pending);
     syncPromptFieldLabels(node);
     if (pending) closeMentionMenu(node);
+}
+
+/**
+ * Show the unload button only for the backends that hold a model somewhere.
+ *
+ * `gguf` caches its `Llama` in this process, and an OpenAI-compatible URL is
+ * usually LM Studio or Ollama on the same machine. Gemini holds nothing, and
+ * `clip` is ComfyUI's own model — unloading that behind ComfyUI's back is not
+ * this button's business.
+ */
+function syncPromptOptimizerUnloadButton(node, state, pending) {
+    const button = node?.__h3PromptUnloadButton;
+    if (!button) return;
+    const format = String(state?.api_format || "").toLowerCase();
+    const local = format === OPTIMIZER_FORMAT_GGUF;
+    button.hidden = !local && format !== OPTIMIZER_FORMAT_OPENAI && format !== OPTIMIZER_FORMAT_RESPONSES;
+    button.disabled = Boolean(pending);
+    button.title = local ? TEXT.optimizerUnload : TEXT.optimizerUnloadHttp;
+    button.setAttribute("aria-label", button.title);
+}
+
+/**
+ * Free whatever model the configured optimizer backend is holding.
+ *
+ * A GGUF stays cached between clicks so a second optimization does not reload
+ * it, and with "Unload the model after use" off nothing ever frees it.
+ * An OpenAI-compatible server is asked in whichever way it understands — the
+ * server works out whether it is talking to LM Studio or Ollama. Pointless
+ * against a cloud endpoint, but those are not the ones people run out of VRAM
+ * with. Either way this is the explicit way to hand the VRAM back before
+ * queueing the graph, which is the whole point on a machine that also has to
+ * fit H3.
+ */
+async function unloadPromptOptimizerModel(node) {
+    const button = node?.__h3PromptUnloadButton;
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    try {
+        const response = await api.fetchApi(PROMPT_OPTIMIZER_UNLOAD_ENDPOINT, { method: "POST" });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        // `detail` carries the server's own wording, e.g. which models it does
+        // have resident when the configured one is not among them.
+        const message = data.unloaded ? TEXT.optimizerUnloaded : String(data.detail || TEXT.optimizerUnloadIdle);
+        notifyPromptOptimizer(message, data.unloaded ? "success" : "info");
+    } catch (error) {
+        notifyPromptOptimizer(String(error?.message || error || TEXT.optimizerFailed));
+    } finally {
+        // syncPromptOptimizerButton owns the disabled state while a run is pending.
+        button.disabled = Boolean(node.__h3OptimizerPending);
+    }
 }
 
 function sourceAssetDescriptor(node, mediaType) {
@@ -5470,7 +5527,23 @@ function ensurePromptEditor(node) {
         if (node.__h3OptimizerPending) cancelPromptOptimization(node);
         else optimizePromptFromEditor(node);
     });
-    editorTools.append(optimizeButton, viewButton);
+    const unloadButton = document.createElement("button");
+    unloadButton.type = "button";
+    unloadButton.className = "h3-prompt-editor-tool h3-prompt-editor-unload";
+    unloadButton.textContent = "\u23cf";
+    unloadButton.hidden = true;
+    unloadButton.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+    });
+    unloadButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        unloadPromptOptimizerModel(node);
+    });
+    // Last in the row, with the view toggle between it and the run button, so
+    // the hand does not reach it on the way to \u2726.
+    editorTools.append(optimizeButton, viewButton, unloadButton);
     wrap.addEventListener("pointerdown", (event) => {
         event.stopPropagation();
         if (!event.target?.closest?.(".h3-mention-chip")) closeMentionMenu(node);
@@ -5492,6 +5565,7 @@ function ensurePromptEditor(node) {
     node.__h3PromptEditorTools = editorTools;
     node.__h3PromptViewButton = viewButton;
     node.__h3PromptOptimizeButton = optimizeButton;
+    node.__h3PromptUnloadButton = unloadButton;
     node.__h3PromptOptimizerStatus = optimizerStatus;
     node.__h3PromptOptimizerStatusText = optimizerStatusText;
     syncPromptExternalConnectionState(node);
@@ -5527,6 +5601,7 @@ function ensurePromptEditor(node) {
         node.__h3PromptEditorTools = null;
         node.__h3PromptViewButton = null;
         node.__h3PromptOptimizeButton = null;
+        node.__h3PromptUnloadButton = null;
         return;
     }
     node.__h3DomWidget = domWidget;
@@ -5987,6 +6062,7 @@ function installNode(nodeType, nodeData) {
         this.__h3PromptFieldLabels = null;
         this.__h3PromptEditorTools = null;
         this.__h3PromptViewButton = null;
+        this.__h3PromptUnloadButton = null;
         this.__h3PromptOptimizerStatus = null;
         this.__h3PromptOptimizerStatusText = null;
         removePromptEditorWidgets(this);
@@ -6199,6 +6275,8 @@ function install() {
         opacity: 1; background: rgba(255,110,110,.16); border-color: rgba(255,110,110,.4);
       }
       .h3-prompt-editor-tool:disabled, .h3-prompt-editor-tool.is-external { opacity: .16; cursor: not-allowed; pointer-events: none; }
+      .h3-prompt-editor-tool[hidden] { display: none !important; }
+      .h3-prompt-editor-unload { font-size: 11px; letter-spacing: 0; }
       @keyframes h3-prompt-tool-pulse { from { transform: scale(.88); } to { transform: scale(1.06); } }
       .h3-mention-chip {
         display: inline; max-width: 150px; margin: 0 1px; padding: 0; vertical-align: baseline; border: 0; border-radius: 0;

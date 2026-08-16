@@ -124,6 +124,9 @@ PROMPT_GUIDES_DIR = os.path.join(os.path.dirname(__file__), "prompt_guides")
 PROMPT_GUIDE_MANIFEST = os.path.join(PROMPT_GUIDES_DIR, "manifest.json")
 PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
 PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS = 120
+# Unloading is a management call to a server on the same machine, not a
+# generation, so it gets a short timeout of its own.
+PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS = 60
 PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
 PROMPT_OPTIMIZER_MARKER_VERSION = 1
 PROMPT_OPTIMIZER_CONFIG_VERSION = 2
@@ -720,6 +723,23 @@ def _strip_optimizer_endpoint(base: str) -> str:
 
 def _optimizer_url_with_query(url: str, query: str) -> str:
     return url + (f"?{query}" if query else "")
+
+
+def _optimizer_server_root(api_url: str) -> str:
+    """The server's own root, below the OpenAI-compatible path.
+
+    LM Studio's and Ollama's management routes sit *next to* `/v1`, not under
+    it, so the configured chat URL has to be walked back to the host. A path
+    prefix in front of it — a reverse proxy — is kept, because the management
+    routes live behind that prefix too.
+    """
+    parsed = urllib.parse.urlsplit(_strip_optimizer_endpoint(_normalize_optimizer_base_url(api_url)))
+    base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    lower = base.lower()
+    for suffix in ("/api/v1", "/api/v0", "/v1beta", "/v1"):
+        if lower.endswith(suffix):
+            return base[: len(base) - len(suffix)].rstrip("/")
+    return base
 
 
 def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
@@ -1806,8 +1826,163 @@ def _optimizer_gguf_chat_handler(model_name: str, mmproj_path: str):
     return None
 
 
+def _optimizer_api_request(url: str, headers: Mapping[str, str], payload: Any = None, method: str = "GET") -> Any:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
+    with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS) as response:
+        body = response.read().decode("utf-8", errors="replace")
+    return json.loads(body) if body.strip() else {}
+
+
+def _optimizer_lmstudio_instances(root: str, headers: Mapping[str, str]) -> list[tuple[str, str]] | None:
+    """`(model key, instance id)` for everything the server has resident.
+
+    None means the question could not be asked — an older LM Studio, a llama.cpp
+    server, a cloud endpoint. The caller then tries the unload blind rather than
+    giving up, because the error from that call is the informative one.
+    """
+    try:
+        data = _optimizer_api_request(f"{root}/api/v1/models", headers)
+    except Exception:
+        return None
+    models = data.get("models") if isinstance(data, Mapping) else None
+    if not isinstance(models, list):
+        return None
+    loaded: list[tuple[str, str]] = []
+    for entry in models:
+        if not isinstance(entry, Mapping):
+            continue
+        key = str(entry.get("key") or entry.get("id") or "")
+        for instance in entry.get("loaded_instances") or []:
+            if isinstance(instance, Mapping) and instance.get("id"):
+                loaded.append((key, str(instance["id"])))
+    return loaded
+
+
+def _optimizer_ollama_running(root: str, headers: Mapping[str, str]) -> list[str] | None:
+    """The model names Ollama currently has in memory, or None if that is not it.
+
+    `/api/ps` is Ollama's and `/api/v1/models` is LM Studio's; neither server has
+    the other's route, so which one answers *is* the detection. Both are plain
+    reads, so probing costs nothing but a local round trip.
+    """
+    try:
+        data = _optimizer_api_request(f"{root}/api/ps", headers)
+    except Exception:
+        return None
+    models = data.get("models") if isinstance(data, Mapping) else None
+    if not isinstance(models, list):
+        return None
+    return [
+        str(entry.get("model") or entry.get("name"))
+        for entry in models
+        if isinstance(entry, Mapping) and (entry.get("model") or entry.get("name"))
+    ]
+
+
+def _same_optimizer_model(configured: str, name: str) -> bool:
+    """Whether a resident model is the configured one.
+
+    The tag is optional on both sides: Ollama reports `llama3.2:latest` for what
+    the settings call `llama3.2`, and LM Studio gives a second instance of a
+    model the id `key:2`.
+    """
+    left = configured.strip().lower()
+    right = str(name).strip().lower()
+    if not left or not right:
+        return False
+    return left == right or right.startswith(f"{left}:") or left.startswith(f"{right}:")
+
+
+def _optimizer_not_loaded(model: str, resident: Sequence[str]) -> tuple[int, str]:
+    listed = ", ".join(sorted({str(name) for name in resident if name}))
+    return 0, f"{model} is not loaded" + (f" (loaded: {listed})" if listed else "")
+
+
+def _optimizer_unload_each(root: str, headers: Mapping[str, str], targets: Sequence[str], build) -> int:
+    unloaded = 0
+    for target in targets:
+        url, payload = build(target)
+        try:
+            _optimizer_api_request(url, headers, payload, method="POST")
+        except urllib.error.HTTPError as exc:
+            # The server listed this model moments ago, so a 404 now means it is
+            # already gone — which is the wanted end state either way.
+            if exc.code == 404:
+                continue
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Unload failed ({exc.code}): {detail[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Request failed: {exc.reason}") from exc
+        _optimizer_log("unloaded %s from %s", target, root)
+        unloaded += 1
+    return unloaded
+
+
+def _optimizer_remote_unload(settings: Mapping[str, Any]) -> tuple[int, str]:
+    """Unload the configured model from whichever local server is behind the URL.
+
+    Only local servers have anything to free, and the two that people actually
+    run this against say so in their own way: LM Studio through
+    `/api/v1/models/unload`, Ollama by asking for a generation with
+    `keep_alive: 0`. Which is which is answered by the listing probes rather than
+    by a setting — the two backends are the same OpenAI-compatible endpoint for
+    every other purpose, and making the user declare the vendor for one button is
+    not worth a sixth API format.
+    """
+    model = str(settings.get("model") or "").strip()
+    root = _optimizer_server_root(str(settings.get("api_url") or ""))
+    api_key = str(settings.get("api_key") or "")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if not model:
+        raise ValueError("Set the model in the prompt optimization settings first")
+
+    instances = _optimizer_lmstudio_instances(root, headers)
+    if instances is not None:
+        targets = [
+            instance for key, instance in instances
+            if _same_optimizer_model(model, instance) or _same_optimizer_model(model, key)
+        ]
+        if not targets:
+            return _optimizer_not_loaded(model, [instance for _, instance in instances])
+        return _optimizer_unload_each(
+            root, headers, targets,
+            lambda instance: (f"{root}/api/v1/models/unload", {"instance_id": instance}),
+        ), ""
+
+    running = _optimizer_ollama_running(root, headers)
+    if running is not None:
+        targets = [name for name in running if _same_optimizer_model(model, name)]
+        if not targets:
+            return _optimizer_not_loaded(model, running)
+        # An empty prompt with keep_alive 0 is how Ollama is told to drop a
+        # model; there is no dedicated route for it.
+        return _optimizer_unload_each(
+            root, headers, targets,
+            lambda name: (f"{root}/api/generate", {"model": name, "keep_alive": 0}),
+        ), ""
+
+    raise RuntimeError(
+        "This server has no unload endpoint. Freeing a model is LM Studio's "
+        "(/api/v1/models/unload) or Ollama's (keep_alive 0); neither answered at "
+        f"{root}, and plain OpenAI-compatible servers have nothing of the kind."
+    )
+
+
 _OPTIMIZER_GGUF_LOCK = threading.RLock()
 _OPTIMIZER_GGUF_STATE: dict[str, Any] = {"signature": None, "llm": None, "vision": False}
+# How many runs are inside the local backend right now. The unload button can
+# arrive from the editor at any moment, and closing a `Llama` that a worker
+# thread is still generating with takes llama-cpp down with it.
+_OPTIMIZER_GGUF_BUSY = 0
+
+
+def _optimizer_gguf_hold(delta: int) -> None:
+    global _OPTIMIZER_GGUF_BUSY
+    with _OPTIMIZER_GGUF_LOCK:
+        _OPTIMIZER_GGUF_BUSY = max(0, _OPTIMIZER_GGUF_BUSY + delta)
 
 
 def _optimizer_gguf_release() -> None:
@@ -1826,6 +2001,23 @@ def _optimizer_gguf_release() -> None:
             comfy.model_management.soft_empty_cache()
         except Exception:
             pass
+
+
+def _optimizer_gguf_unload_now() -> str:
+    """Free the cached model on request. Returns `busy`, `idle` or `unloaded`.
+
+    The whole decision happens under the lock, `llm.close()` included: checking
+    and then releasing would leave a window for a run to start in between and
+    have its model closed underneath it. `_optimizer_gguf_hold` takes the same
+    lock, so a run that starts here simply waits and then loads its own.
+    """
+    with _OPTIMIZER_GGUF_LOCK:
+        if _OPTIMIZER_GGUF_BUSY > 0:
+            return "busy"
+        if _OPTIMIZER_GGUF_STATE.get("llm") is None:
+            return "idle"
+        _optimizer_gguf_release()
+    return "unloaded"
 
 
 def _optimizer_gguf_model(settings: Mapping[str, Any], want_vision: bool):
@@ -2417,6 +2609,41 @@ def _register_prompt_optimizer_route() -> bool:
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
+    @routes.post("/minimax_h3_easy/prompt_optimizer_unload")
+    async def _prompt_optimizer_unload(request):
+        """Free the model the configured optimizer backend is holding.
+
+        For `gguf` that is this process's own cache; for the two OpenAI-shaped
+        formats it is a request to LM Studio's or Ollama's own management route
+        — the same servers answer both, so `responses` is included. Gemini is a
+        cloud endpoint with nothing to free and `clip` is ComfyUI's own model,
+        which is not this route's to unload; the button is hidden for both.
+        """
+        try:
+            settings = _read_prompt_optimizer_config()
+            api_format = str(settings.get("api_format") or OPTIMIZER_FORMAT_OPENAI).lower()
+            if api_format == OPTIMIZER_FORMAT_GGUF:
+                # llm.close() blocks while the weights are freed, so it stays off
+                # the event loop like every other model-touching call here.
+                state = await asyncio.to_thread(_optimizer_gguf_unload_now)
+                if state == "busy":
+                    return web.json_response(
+                        {"ok": False, "busy": True, "error": "A prompt optimization is still running"}, status=409,
+                    )
+                if state == "unloaded":
+                    _optimizer_log("model unloaded")
+                return web.json_response({"ok": True, "unloaded": state == "unloaded"})
+            if api_format not in {OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_RESPONSES}:
+                return web.json_response(
+                    {"ok": False, "error": "This backend has no model to unload"}, status=400,
+                )
+            if not str(settings.get("api_url") or "").strip():
+                return web.json_response({"ok": False, "error": "Set the API URL in the settings first"}, status=400)
+            count, detail = await asyncio.to_thread(_optimizer_remote_unload, settings)
+            return web.json_response({"ok": True, "unloaded": count > 0, "detail": detail})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @routes.post("/minimax_h3_easy/prompt_optimize_cancel")
     async def _prompt_optimize_cancel(request):
         try:
@@ -2467,48 +2694,65 @@ def _register_prompt_optimizer_route() -> bool:
             # llama-cpp takes the same OpenAI-shaped image parts as the HTTP
             # chat-completions format, so the media builder is shared.
             parts_format = OPTIMIZER_FORMAT_OPENAI if local else api_format
+            _optimizer_raise_if_cancelled(request_id)
+            # Off the event loop: reading the references means whole files
+            # base64'd and every video decoded and re-encoded frame by frame,
+            # and a cancel that cannot be served until that finishes is not a
+            # cancel. This is the window the stop button is pressed in most
+            # often, because it is the one before anything appears to happen.
             media_items = (
-                _optimizer_media_items(resources, parts_format, str(settings.get("video_sample") or ""))
+                await asyncio.to_thread(
+                    _optimizer_media_items, resources, parts_format, str(settings.get("video_sample") or ""),
+                )
                 if bool(settings.get("read_media")) else []
             )
             # The GGUF loop polls this, so cancelling actually stops the
             # generation instead of only freeing the editor.
             should_stop = (lambda: _optimizer_is_cancelled(request_id)) if request_id else None
-            describe = local and bool(settings.get("gguf_describe_media")) and bool(media_items)
-            described, described_count = "", 0
-            _optimizer_raise_if_cancelled(request_id)
-            if describe:
-                described, described_count = await asyncio.to_thread(
-                    _optimizer_gguf_describe, settings, media_items, should_stop,
-                )
-                _optimizer_raise_if_cancelled(request_id)
-                if not described_count and any(item["parts"] for item in media_items):
-                    # Every description failed. Carrying on would write the
-                    # prompt with no media and no media rule, and the model
-                    # would describe nothing at all — the one outcome this pack
-                    # does not allow. Fall back to attaching the media to the
-                    # request instead, which is slower to start but at least
-                    # sees the images.
-                    logging.warning(
-                        "MiniMax H3 Easy: the describe pass produced no descriptions; "
-                        "attaching the media to the prompt request instead."
-                    )
-                    describe = False
-            attached = [] if describe else [item for item in media_items if item["parts"]]
-            media_parts = [part for item in attached for part in item["parts"]]
-            # Counted by reference, not by part: a sampled video is one
-            # reference even though it arrives as several frames.
-            system = _optimizer_system_prompt(
-                scene_guide, mode, seconds, counts, len(attached), described_count,
-                _optimizer_media_manifest(attached),
-            )
+            # Held for the whole local run, describe pass included, so an unload
+            # pressed mid-generation is refused instead of freeing a model that
+            # is still in use.
             if local:
-                result = await asyncio.to_thread(
-                    _optimizer_gguf_json, settings, system, prompt, media_parts,
-                    should_stop, described, describe,
+                _optimizer_gguf_hold(1)
+            try:
+                describe = local and bool(settings.get("gguf_describe_media")) and bool(media_items)
+                described, described_count = "", 0
+                _optimizer_raise_if_cancelled(request_id)
+                if describe:
+                    described, described_count = await asyncio.to_thread(
+                        _optimizer_gguf_describe, settings, media_items, should_stop,
+                    )
+                    _optimizer_raise_if_cancelled(request_id)
+                    if not described_count and any(item["parts"] for item in media_items):
+                        # Every description failed. Carrying on would write the
+                        # prompt with no media and no media rule, and the model
+                        # would describe nothing at all — the one outcome this pack
+                        # does not allow. Fall back to attaching the media to the
+                        # request instead, which is slower to start but at least
+                        # sees the images.
+                        logging.warning(
+                            "MiniMax H3 Easy: the describe pass produced no descriptions; "
+                            "attaching the media to the prompt request instead."
+                        )
+                        describe = False
+                attached = [] if describe else [item for item in media_items if item["parts"]]
+                media_parts = [part for item in attached for part in item["parts"]]
+                # Counted by reference, not by part: a sampled video is one
+                # reference even though it arrives as several frames.
+                system = _optimizer_system_prompt(
+                    scene_guide, mode, seconds, counts, len(attached), described_count,
+                    _optimizer_media_manifest(attached),
                 )
-            else:
-                result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
+                if local:
+                    result = await asyncio.to_thread(
+                        _optimizer_gguf_json, settings, system, prompt, media_parts,
+                        should_stop, described, describe,
+                    )
+                else:
+                    result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
+            finally:
+                if local:
+                    _optimizer_gguf_hold(-1)
             # An HTTP request cannot be interrupted mid-flight, so a late cancel
             # is honoured by throwing the answer away.
             _optimizer_raise_if_cancelled(request_id)

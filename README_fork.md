@@ -72,6 +72,32 @@ This replaces the **Re-optimization** section of the upstream README.
 Upstream instead inferred the source prompt by comparing the editor text with
 the previous optimizer result; that heuristic is removed.
 
+### Unloading the model
+
+The prompt editor's toolbar carries an **⏏** button next to **✦** and
+**</>**. It hands back whatever VRAM the configured optimizer backend is
+holding, without touching the prompt:
+
+- **GGUF** — frees this process's cached `Llama`. The model is kept loaded
+  between clicks so a second optimization does not reload it, so with **Unload
+  the model after use** off nothing ever frees it. Refused with a message while
+  an optimization is running: closing a model llama-cpp is still generating with
+  takes the process down with it.
+- **OpenAI-compatible / OpenAI Responses** — asks the server to drop the
+  configured model. Which request that is, is worked out from the server itself:
+  LM Studio answers `/api/v1/models`, Ollama answers `/api/ps`, and neither has
+  the other's route, so the probe *is* the detection. LM Studio is then told
+  `/api/v1/models/unload`, Ollama is asked for a generation with `keep_alive: 0`.
+  A plain OpenAI-compatible server (or a cloud endpoint) has nothing of the kind
+  and says so. If the configured model is not resident, the reply names what is.
+- **Gemini native / Text encoder** — the button is hidden. Gemini is a cloud
+  endpoint with nothing to free, and the text encoder is ComfyUI's own model,
+  which is ComfyUI's to unload rather than this pack's.
+
+This matters here more than it would elsewhere: the optimizer's model and H3
+itself compete for the same VRAM, and the optimizer runs from the editor, before
+the graph is queued. This is the way to hand the card back before pressing Run.
+
 ### Stopping a running optimization
 
 While a request is running, `✦` turns into a stop button (`■`). Pressing it ends
@@ -93,6 +119,12 @@ How much actually stops depends on the format:
   billed. Its answer is discarded.
 - **Text encoder (clip input)** — no stop button, because it runs inside the
   workflow; use ComfyUI's own cancel instead.
+
+Reading the connected references — whole files base64'd, every video decoded and
+re-encoded frame by frame — happens on a worker thread rather than on ComfyUI's
+event loop, so the stop button is answered immediately even during that phase
+and the run ends as soon as it is done. Before, that work blocked the server and
+a stop pressed while it ran did nothing until it finished.
 
 This supersedes the stop button upstream places in the status strip. That one
 only aborts the browser's fetch; it never tells the server, so a local GGUF run
@@ -295,7 +327,8 @@ Selecting this format replaces the API rows with:
   connected media** is on.
 
 The model stays loaded between optimizations and is released automatically when
-any of these settings change.
+any of these settings change, or on demand with the **⏏** button described
+below.
 
 ### Reasoning models
 
