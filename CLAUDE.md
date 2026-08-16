@@ -284,6 +284,16 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   already has the decoded frames and the fps, so `_sample_frames` addresses candidates by index instead
   of seeking — but keeps `OPTIMIZER_CLIP_MAX_VIDEO_FRAMES` /
   `OPTIMIZER_CLIP_MAX_STILLS` on top of it: that path shares VRAM with the H3 model.
+- **Because that selection is uneven, every path that sends it also states the timestamps**
+  (`_optimizer_video_sample_detail`). `_optimizer_video_still_parts` returns `(parts, times, duration)`
+  and `_sample_frames` returns `(frames, times)` for exactly this reason; the times ride on the media
+  item (`times` / `duration`) into `_optimizer_media_manifest`, `OPTIMIZER_VIDEO_STILLS_REQUEST` and —
+  through the third return value of `_optimizer_clip_media` — `OPTIMIZER_CLIP_VIDEO_FRAMES_NOTE`.
+  Dropping them is not cosmetic: `0.0s / 5.0s / 6.0s / 10.0s` read as four equal steps turns a held
+  shot and a cut into a slow continuous move. When the times are unknown the wording falls back to
+  `OPTIMIZER_VIDEO_SAMPLE_ORDER` rather than inventing any. The `media["fps"] = 1.0` the text
+  encoder's video channel gets is a positional hint for the encoder, not a claim about the spacing —
+  the words are what carry that.
 - The editor toolbar's `⏏` (`POST /minimax_h3_easy/prompt_optimizer_unload`) frees whatever the
   configured backend holds: for `gguf` this process's cached `Llama` via `_optimizer_gguf_unload_now`,
   for the two OpenAI-shaped formats the model on the server via `_optimizer_remote_unload`. Which

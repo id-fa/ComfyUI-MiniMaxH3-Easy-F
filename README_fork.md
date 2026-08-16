@@ -480,7 +480,10 @@ Which frames those are is not an even split:
 3. The remaining budget (the setting minus those two) goes to the candidates
    that differ most from the frame before them, measured as the mean absolute
    difference of a small grayscale thumbnail.
-4. The kept frames are sent in chronological order.
+4. The kept frames are sent in chronological order, **with their timestamps**
+   (see *Telling the model what it received* below) — unevenly spaced frames
+   presented as an even sequence would misstate the pacing of everything
+   between them.
 
 That last step is the point of the change. Evenly spaced frames spend the whole
 budget on a shot that holds still and then walk straight past the cut, the
@@ -507,9 +510,19 @@ system prompt now ends with a manifest naming every attached part:
 Actual media references attached to this request: 2.
 Attached media parts, in order:
 - <Picture 1>: 1 image
-- <Video 1>: 4 still frames sampled in chronological order from one video clip.
-  They are that single video reference, not separate images.
+- <Video 1>: 4 still frames from one video clip, sampled at 0.0s / 5.0s / 6.0s /
+  10.0s of a 10.0s clip. The spacing is uneven, so read the timestamps rather
+  than assuming a constant interval. They are that single video reference, not
+  separate images.
 ```
+
+The timestamps are there because the selection above is deliberately uneven.
+"In chronological order" was enough while the frames were evenly spaced; it is
+not any more. `0.0s / 5.0s / 6.0s / 10.0s` is a shot that holds for five seconds
+and then cuts — read as four equal steps, that becomes a slow continuous move
+that never happened. The same line is given to the per-asset describe passes
+(GGUF and text encoder), which see one clip at a time. A file whose duration
+cannot be read falls back to the old wording rather than inventing times.
 
 This also fixes a smaller problem that predates the video change: the model used
 to receive an unlabelled pile of images with no way to tell which `<Picture N>`

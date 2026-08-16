@@ -212,11 +212,16 @@ OPTIMIZER_VIDEO_SAMPLE_MAX_CANDIDATES = 180
 # Change is measured on a small grayscale thumbnail: what matters is that the
 # composition moved, not that the encoder's noise did.
 OPTIMIZER_VIDEO_SAMPLE_SCORE_SIDE = 48
+# What is said about the attached stills when their timestamps are unknown.
+OPTIMIZER_VIDEO_SAMPLE_ORDER = "in chronological order"
 OPTIMIZER_VIDEO_STILLS_REQUEST = (
-    "Describe this reference video. The {count} attached images are frames sampled from it in "
-    "chronological order, not separate references: describe the clip as a whole, including the "
+    "Describe this reference video. The {count} attached images are frames sampled from it "
+    "{detail}. They are not separate references: describe the clip as a whole, including the "
     "action and camera movement the frames show."
 )
+# Appended to the text encoder's own video request, which sends the frames on a
+# tokenizer channel rather than as message parts.
+OPTIMIZER_CLIP_VIDEO_FRAMES_NOTE = "The attached frames are sampled {detail}."
 OPTIMIZER_MEDIA_MAX_BYTES = 32 * 1024 * 1024
 PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized"
 PROMPT_OPTIMIZER_CANCEL_LIMIT = 64
@@ -1120,6 +1125,25 @@ def _select_change_frames(scores: Sequence[float], count: int) -> list[int]:
     return sorted(chosen)
 
 
+def _optimizer_video_sample_detail(times: Sequence[float], duration: float = 0.0) -> str:
+    """Where in the clip the attached stills came from.
+
+    "In chronological order" was enough while the sampling was even. The change
+    based selection deliberately is not, so the timestamps have to be stated:
+    otherwise a held shot followed by a cut reads as four steady seconds, and
+    the model describes motion that is not there — or misses the speed of the
+    motion that is.
+    """
+    stamps = " / ".join(f"{float(value):.1f}s" for value in times if value is not None)
+    if not stamps:
+        return OPTIMIZER_VIDEO_SAMPLE_ORDER
+    clip = f" of a {duration:.1f}s clip" if duration > 0 else ""
+    return (
+        f"at {stamps}{clip}. The spacing is uneven, so read the timestamps rather than "
+        "assuming a constant interval"
+    )
+
+
 def _optimizer_still_change_scores(thumbnails: Sequence[Any]) -> list[float]:
     """Mean absolute difference from the previous candidate, per candidate.
 
@@ -1176,10 +1200,15 @@ def _optimizer_media_items(
         except (OSError, ValueError):
             parts = []
         sampled = not parts and media_type == "video"
+        times: list[float] = []
+        duration = 0.0
         if sampled:
-            parts = _optimizer_video_still_parts(path, sample=sample, api_format=api_format)
+            parts, times, duration = _optimizer_video_still_parts(path, sample=sample, api_format=api_format)
             sampled = bool(parts)
-        items.append({"tag": tag, "type": media_type, "path": path, "parts": parts, "sampled": sampled})
+        items.append({
+            "tag": tag, "type": media_type, "path": path, "parts": parts,
+            "sampled": sampled, "times": times, "duration": duration,
+        })
     return items
 
 
@@ -1196,9 +1225,10 @@ def _optimizer_media_manifest(items: Sequence[Mapping[str, Any]]) -> str:
         if not parts:
             continue
         if item.get("sampled"):
+            detail = _optimizer_video_sample_detail(item.get("times") or [], float(item.get("duration") or 0.0))
             lines.append(
-                f"- {item['tag']}: {len(parts)} still frames sampled in chronological order from one video "
-                "clip. They are that single video reference, not separate images."
+                f"- {item['tag']}: {len(parts)} still frames from one video clip, sampled {detail}. "
+                "They are that single video reference, not separate images."
             )
         else:
             lines.append(f"- {item['tag']}: 1 {item['type']}")
@@ -1235,7 +1265,7 @@ def _optimizer_video_still_parts(
     sample: str = OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
     max_side: int = OPTIMIZER_VIDEO_STILL_MAX_SIDE,
     api_format: str = OPTIMIZER_FORMAT_OPENAI,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[float], float]:
     """Sample a video file into the stills that stand in for it.
 
     A chat completion has no video channel, so this is the only way a reference
@@ -1244,21 +1274,27 @@ def _optimizer_video_still_parts(
     `sample` budget is then spent on the first frame, the last frame and the
     biggest changes in between. Files whose duration is unknown (or that refuse
     to seek) fall back to a strided sequential decode.
+
+    Returns the parts, the timestamp of each one and the clip's duration. The
+    times are part of the answer rather than a detail of it: the frames are
+    deliberately not evenly spaced, so a caller that cannot say where they came
+    from leaves the model guessing at everything between them.
     """
+    empty: tuple[list[dict[str, Any]], list[float], float] = ([], [], 0.0)
     if not path:
-        return []
+        return empty
     try:
         import av
     except ImportError:
         logging.warning("MiniMax H3 Easy: PyAV is unavailable, so reference videos cannot be sampled.")
-        return []
+        return empty
     count = _optimizer_video_sample_count(sample)
-    candidates: list[tuple[bytes, Any]] = []
+    candidates: list[tuple[bytes, Any, float]] = []
     try:
         with av.open(path) as container:
             streams = container.streams.video
             if not streams:
-                return []
+                return empty
             stream = streams[0]
             stream.thread_type = "AUTO"
             duration = 0.0
@@ -1286,7 +1322,11 @@ def _optimizer_video_still_parts(
                         continue
                     still = _optimizer_video_still(frame, max_side)
                     if still is not None:
-                        candidates.append(still)
+                        # The frame's own timestamp rather than the one asked
+                        # for: the decode stops at the first frame at or past
+                        # the target, which is not exactly it.
+                        actual = float(frame.pts * stream.time_base) if frame.pts is not None else seconds
+                        candidates.append((still[0], still[1], actual))
             if not candidates:
                 container.seek(0)
                 rate = float(stream.average_rate or 0) or 24.0
@@ -1296,25 +1336,28 @@ def _optimizer_video_still_parts(
                         continue
                     still = _optimizer_video_still(frame, max_side)
                     if still is not None:
-                        candidates.append(still)
+                        candidates.append((still[0], still[1], index / rate))
                     if len(candidates) >= OPTIMIZER_VIDEO_SAMPLE_MAX_CANDIDATES:
                         break
     except Exception as exc:
         logging.warning("MiniMax H3 Easy: could not sample %s for the prompt optimizer (%s).", os.path.basename(path), exc)
-        return []
+        return empty
     if not candidates:
-        return []
-    scores = _optimizer_still_change_scores([thumbnail for _, thumbnail in candidates])
+        return empty
+    scores = _optimizer_still_change_scores([thumbnail for _, thumbnail, _ in candidates])
     chosen = _select_change_frames(scores, count)
     parts = [
         _optimizer_inline_part("image/jpeg", base64.b64encode(candidates[index][0]).decode("ascii"), api_format)
         for index in chosen
     ]
+    times = [candidates[index][2] for index in chosen]
     if parts:
         _optimizer_log(
-            "sampled %d of %d candidate frames from %s", len(parts), len(candidates), os.path.basename(path),
+            "sampled %d of %d candidate frames from %s (%s)",
+            len(parts), len(candidates), os.path.basename(path),
+            " / ".join(f"{value:.1f}s" for value in times),
         )
-    return parts
+    return parts, times, duration
 
 
 def _optimizer_media_parts(
@@ -1480,19 +1523,22 @@ def _sample_frames(frames, fps: float, limit: int):
     """Thin a decoded frame batch to `limit` frames, the same way the file path does.
 
     Candidates at one per second, then the first frame, the last frame and the
-    biggest changes in between.
+    biggest changes in between. Returns the frames and the second each of them
+    sits at, because that selection is not evenly spaced and the encoder is told
+    so in words.
     """
+    rate = float(fps or 24.0)
     try:
         count = int(frames.shape[0])
     except (AttributeError, IndexError, TypeError):
-        return frames
+        return frames, []
     if count <= limit:
-        return frames
-    indices = _optimizer_video_candidate_indices(count, fps, limit)
-    if len(indices) <= limit:
-        return frames[indices]
-    chosen = _select_change_frames(_tensor_change_scores(frames, indices), limit)
-    return frames[[indices[position] for position in chosen]]
+        return frames, [index / rate for index in range(count)]
+    indices = _optimizer_video_candidate_indices(count, rate, limit)
+    if len(indices) > limit:
+        chosen = _select_change_frames(_tensor_change_scores(frames, indices), limit)
+        indices = [indices[position] for position in chosen]
+    return frames[indices], [index / rate for index in indices]
 
 
 def _stack_stills(stills: list) -> Any:
@@ -1519,14 +1565,15 @@ def _optimizer_clip_media(
     clip,
     items: list[_MediaInput],
     sample: str = OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
-) -> tuple[dict[str, Any], int]:
+) -> tuple[dict[str, Any], int, str]:
     """Map connected media onto the tokenizer arguments the encoder supports.
 
-    Returns the tokenizer kwargs plus how many media parts were actually
-    attached, so the system prompt's evidence rule can state the truth.
-    `sample` is the same setting the chat formats sample stills with, but the
-    encoder's own caps still apply on top of it: unlike an HTTP request, this
-    runs in the same VRAM as the H3 model.
+    Returns the tokenizer kwargs, how many media parts were actually attached so
+    the system prompt's evidence rule can state the truth, and where in the clip
+    a sampled video's frames came from — the encoder has no way to work that out
+    from an unevenly thinned batch. `sample` is the same setting the chat formats
+    sample stills with, but the encoder's own caps still apply on top of it:
+    unlike an HTTP request, this runs in the same VRAM as the H3 model.
     """
     stills = [
         item.value[:1]
@@ -1550,18 +1597,27 @@ def _optimizer_clip_media(
 
     media: dict[str, Any] = {}
     attached = 0
+    timeline = ""
     # The dedicated video channel replaces the image channel on the encoders
     # that have one, so it is only used when no reference image would be lost.
     if not stills and len(videos) == 1 and _tokenizer_accepts(clip, "video"):
         frames, fps = videos[0]
         wanted = min(OPTIMIZER_CLIP_MAX_VIDEO_FRAMES, _optimizer_video_sample_count(sample))
-        media["video"] = _sample_frames(frames, fps, wanted)[..., :3]
-        # The frames are already thinned, so keep every one of them.
+        picked, times = _sample_frames(frames, fps, wanted)
+        media["video"] = picked[..., :3]
+        # The frames are already thinned, so keep every one of them. This is a
+        # positional hint for the encoder, not the truth about the spacing —
+        # that is what `timeline` tells the model in words.
         media["fps"] = 1.0
+        timeline = _optimizer_video_sample_detail(times, float(frames.shape[0]) / max(1e-6, float(fps or 24.0)))
         attached += 1
     else:
         for frames, fps in videos:
-            sampled = _sample_frames(frames, fps, _optimizer_video_sample_count(sample))
+            sampled, times = _sample_frames(frames, fps, _optimizer_video_sample_count(sample))
+            if len(videos) == 1:
+                timeline = _optimizer_video_sample_detail(
+                    times, float(frames.shape[0]) / max(1e-6, float(fps or 24.0)),
+                )
             stills.extend(sampled[index:index + 1] for index in range(int(sampled.shape[0])))
         if stills:
             dropped = max(0, len(stills) - OPTIMIZER_CLIP_MAX_STILLS)
@@ -1586,7 +1642,7 @@ def _optimizer_clip_media(
             # Every encoder with an audio channel takes a single clip.
             media["audio"] = clips[0]
             attached += 1
-    return media, attached
+    return media, attached, timeline
 
 
 def _optimizer_clip_tokens(clip, text: str, media: Mapping[str, Any] | None = None):
@@ -1698,7 +1754,9 @@ def _optimizer_clip_descriptions(
     for index, item in enumerate(describable, start=1):
         request = OPTIMIZER_CLIP_DESCRIBE_REQUESTS[item.media_type]
         label = _optimizer_media_label(item, labels, ordinals)
-        media, attached = _optimizer_clip_media(clip, [item], sample)
+        media, attached, timeline = _optimizer_clip_media(clip, [item], sample)
+        if timeline:
+            request = f"{request} {OPTIMIZER_CLIP_VIDEO_FRAMES_NOTE.format(detail=timeline)}"
         if not attached:
             # The encoder has no channel for this modality; saying nothing is
             # better than letting the prompt writer imagine the content.
@@ -2236,7 +2294,10 @@ def _optimizer_gguf_describe_each(llm, describable, gemma: bool, length: int, sh
         parts = list(item.get("parts") or [])
         # llama-cpp has no video channel, so a clip arrives as ordered stills.
         request = (
-            OPTIMIZER_VIDEO_STILLS_REQUEST.format(count=len(parts))
+            OPTIMIZER_VIDEO_STILLS_REQUEST.format(
+                count=len(parts),
+                detail=_optimizer_video_sample_detail(item.get("times") or [], float(item.get("duration") or 0.0)),
+            )
             if item.get("sampled") else OPTIMIZER_CLIP_DESCRIBE_REQUESTS[media_type]
         )
         if not parts:
