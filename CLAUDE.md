@@ -133,8 +133,8 @@ memory; the encode translates it back.
 
 Constants are duplicated between `nodes.py` and `web/minimax_h3_easy_ui.js` and must be edited in both:
 `MAX_MEDIA`, `MIN_SECONDS` / `MAX_SECONDS`, mode ids, `KEYFRAME_*`, `REF_IMAGE_*`,
-`REFERENCE_MENTION_*`, `RESOLUTION_CUSTOM`, the resolution/aspect lists, the prompt-guide id list
-(`PROMPT_GUIDES` in JS vs `prompt_guides/manifest.json` on the server), and the
+`REFERENCE_MENTION_*`, `RESOLUTION_CUSTOM`, the resolution/aspect lists, `OPTIMIZER_VIDEO_SAMPLES`,
+the prompt-guide id list (`PROMPT_GUIDES` in JS vs `prompt_guides/manifest.json` on the server), and the
 `__MINIMAX_H3_REF_` / `__MINIMAX_H3_UNRESOLVED_REF_` prefixes.
 
 **Localization is homemade, not ComfyUI i18n.** `ZH_BROWSER` (browser language) picks between English
@@ -258,11 +258,18 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   the hidden `prompt_needs_optimization` transport input is true (frontend: "the open tab's Optimized
   field is empty"; default true so headless runs still optimize).
 - A chat-completions message has no video part, so `_optimizer_media_items` gives a reference video
-  `_optimizer_video_still_parts` instead: PyAV *seeks* `OPTIMIZER_VIDEO_STILLS` evenly spaced frames
-  (this is the editor route, where media are file paths, not the tensors `clip` gets). One item can
-  therefore hold several parts, which is why `_optimizer_media_manifest` exists — several frames of one
-  clip are otherwise indistinguishable from several unrelated images, and the attached count is by
-  reference, not by part. Gemini keeps sending video whole.
+  `_optimizer_video_still_parts` instead: PyAV *seeks* evenly spaced frames (this is the editor route,
+  where media are file paths, not the tensors `clip` gets). One item can therefore hold several parts,
+  which is why `_optimizer_media_manifest` exists — several frames of one clip are otherwise
+  indistinguishable from several unrelated images, and the attached count is by reference, not by part.
+  Gemini keeps sending video whole.
+- How many frames is the shared `video_sample` setting (`OPTIMIZER_VIDEO_SAMPLES`, duplicated in the JS),
+  resolved by `_optimizer_video_sample_count`. The rate modes need a duration, so the count is decided
+  *after* the container is opened, and a file that reports none falls back to `OPTIMIZER_VIDEO_STILLS`
+  rather than to zero frames. `OPTIMIZER_VIDEO_SAMPLE_MAX_FRAMES` caps every mode because each still is
+  a whole image part. `_optimizer_clip_media` honours the same setting — it already has the decoded
+  frames and the fps, so no seeking is involved — but keeps `OPTIMIZER_CLIP_MAX_VIDEO_FRAMES` /
+  `OPTIMIZER_CLIP_MAX_STILLS` on top of it: that path shares VRAM with the H3 model.
 - Cancelling a GGUF run releases the model (`_optimizer_gguf_release`) regardless of
   `gguf_unload_after`, from inside the worker thread — never from the `asyncio.CancelledError` handler,
   which returns while `asyncio.to_thread` is still generating.

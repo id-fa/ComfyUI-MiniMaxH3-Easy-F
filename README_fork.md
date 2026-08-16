@@ -221,8 +221,9 @@ shows instead:
 - **Max generated tokens** (`clip_max_length`, default `1024`, range
   `16`–`32768`).
 
-**Read connected media** stays visible and applies to every format. Both values
-are stored in the same shared `prompt_optimizer.json`.
+**Read connected media** stays visible and applies to every format, as does
+**Video reference frames** (see *Reference videos over a chat API* below) once
+it is on. All of these are stored in the same shared `prompt_optimizer.json`.
 
 ### Notes and limits
 
@@ -414,17 +415,42 @@ built around a video reference optimized its prompt as if nothing were attached.
 
 A reference video is now sampled into stills and sent as those:
 
-- **4 evenly spaced frames**, aimed at the middle of each quarter so the first
-  and last frames — often black — are not what the model sees.
+- **Evenly spaced frames**, aimed at the middle of each slice so the first and
+  last frames — often black — are not what the model sees. How many is the
+  **Video reference frames** setting below; the default is 4.
 - **Long side capped at 768 px**, re-encoded as JPEG.
 - Frames are **seeked, not decoded in sequence**, so a long reference video
-  costs four decodes rather than a full pass. Files that report no duration or
-  refuse to seek fall back to a strided sequential decode.
+  costs a handful of decodes rather than a full pass. Files that report no
+  duration or refuse to seek fall back to a strided sequential decode.
 - Uses PyAV, which ComfyUI already requires. Without it, videos are skipped and
   a warning is logged, as before.
 
 Gemini is unaffected: it takes video natively, so the file is sent whole. (An
 oversized video that cannot be inlined falls back to frames there too.)
+
+### Video reference frames
+
+**Video reference frames** (`video_sample`, default **4 frames**) chooses how
+densely a reference clip is sampled. It appears in the settings popup whenever
+**Read connected media** is on, and applies to every format:
+
+| Setting | Frames sent |
+| --- | --- |
+| **1 fps** | one per second of the clip |
+| **0.5 fps** | one per 2 seconds |
+| **0.25 fps** | one per 4 seconds |
+| **8 frames** | 8, whatever the length |
+| **4 frames** | 4, whatever the length (the previous fixed behaviour) |
+
+The rates stop at 1 fps and every mode is capped at **16 frames total**, because
+each still is a full image part in the request: an uncapped rate would fill the
+context with one long reference. A file whose duration cannot be read falls back
+to 4 frames rather than to none.
+
+The **local text encoder** format honours the setting too, but its own limits
+still apply on top of it — that path runs in the same VRAM as the H3 model, so a
+video sent on a dedicated video channel keeps its 8-frame ceiling and the stills
+of all references together keep their 12-frame one.
 
 ### Telling the model what it received
 
@@ -446,7 +472,8 @@ counts once.
 
 ### Scope
 
-`nodes.py` only. **Restart ComfyUI.**
+`nodes.py` and `web/minimax_h3_easy_ui.js`. Python changed, so **restart
+ComfyUI.**
 
 ---
 

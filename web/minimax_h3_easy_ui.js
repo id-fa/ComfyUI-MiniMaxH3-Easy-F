@@ -35,6 +35,17 @@ const OPTIMIZER_FORMATS = [
     OPTIMIZER_FORMAT_CLIP,
     OPTIMIZER_FORMAT_GGUF,
 ];
+// Mirrors OPTIMIZER_VIDEO_SAMPLES in nodes.py: how densely a reference video is
+// sampled before it is shown to the optimizer. The values are the canonical ids
+// the server accepts; the labels are display only.
+const VIDEO_SAMPLE_DEFAULT = "4frames";
+const OPTIMIZER_VIDEO_SAMPLES = [
+    { value: "1fps", zh: "1 fps\uff08\u6bcf\u79d2 1 \u5e27\uff09", en: "1 fps" },
+    { value: "0.5fps", zh: "0.5 fps\uff08\u6bcf 2 \u79d2 1 \u5e27\uff09", en: "0.5 fps" },
+    { value: "0.25fps", zh: "0.25 fps\uff08\u6bcf 4 \u79d2 1 \u5e27\uff09", en: "0.25 fps" },
+    { value: "8frames", zh: "8 \u5e27\uff08\u5747\u5300\u62bd\u53d6\uff09", en: "8 frames" },
+    { value: "4frames", zh: "4 \u5e27\uff08\u5747\u5300\u62bd\u53d6\uff09", en: "4 frames" },
+];
 const LOCAL_MAX_LENGTH_DEFAULT = 1024;
 const LOCAL_MIN_LENGTH = 16;
 const LOCAL_MAX_LENGTH_LIMIT = 32768;
@@ -50,6 +61,7 @@ const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     model: "",
     read_media: false,
     optimize_on_run: false,
+    video_sample: VIDEO_SAMPLE_DEFAULT,
     local_max_length: LOCAL_MAX_LENGTH_DEFAULT,
     gguf_model: "",
     gguf_mmproj: GGUF_MMPROJ_AUTO,
@@ -166,6 +178,7 @@ const TEXT = {
         : "Connect a text encoder to the optimizer_clip input first.",
     promptGuide: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u65b9\u6848" : "Prompt Guide",
     readMedia: ZH_BROWSER ? "\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53" : "Read connected media",
+    videoSample: ZH_BROWSER ? "\u89c6\u9891\u53c2\u8003\u5e27\u6570" : "Video reference frames",
     optimizeOnRun: ZH_BROWSER ? "\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u81ea\u52a8\u4f18\u5316" : "Optimize when workflow runs",
     optimizerMissing: ZH_BROWSER ? "\u8bf7\u586b\u5199 API \u5730\u5740\u548c\u6a21\u578b\u540d\uff1bGemini \u539f\u751f\u8fd8\u9700\u8981 API Key\u3002" : "Enter the API URL and model; Gemini Native also requires an API key.",
     optimizerFailed: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u5931\u8d25" : "Prompt optimization failed",
@@ -3744,6 +3757,7 @@ function normalizePromptOptimizerSettings(value) {
         model: String(source.model || "").trim(),
         read_media: asBoolean(source.read_media, false),
         optimize_on_run: asBoolean(source.optimize_on_run, false),
+        video_sample: canonicalVideoSample(source.video_sample),
         // Named clip_max_length before the GGUF format shared the setting.
         local_max_length: clamp(
             source.local_max_length ?? source.clip_max_length,
@@ -3756,6 +3770,11 @@ function normalizePromptOptimizerSettings(value) {
         gguf_unload_after: asBoolean(source.gguf_unload_after, false),
         gguf_describe_media: asBoolean(source.gguf_describe_media, false),
     };
+}
+
+function canonicalVideoSample(value) {
+    const requested = String(value || "").trim().toLowerCase();
+    return OPTIMIZER_VIDEO_SAMPLES.some((item) => item.value === requested) ? requested : VIDEO_SAMPLE_DEFAULT;
 }
 
 function isClipOptimizerFormat(value) {
@@ -4100,6 +4119,11 @@ async function openPromptOptimizerSettings(node) {
     const ggufDescribeText = document.createElement("span");
     ggufDescribeText.textContent = TEXT.ggufDescribe;
     ggufDescribeLabel.append(ggufDescribeText, ggufDescribe);
+    const videoSample = makePromptOptimizerSelect(
+        promptOptimizerSettingsCache.video_sample,
+        null,
+        OPTIMIZER_VIDEO_SAMPLES.map((item) => ({ value: item.value, label: ZH_BROWSER ? item.zh : item.en })),
+    );
     const readMediaLabel = document.createElement("div");
     readMediaLabel.className = "h3-optimizer-settings-check";
     const readMedia = makePromptOptimizerSwitch(promptOptimizerSettingsCache.read_media);
@@ -4125,6 +4149,7 @@ async function openPromptOptimizerSettings(node) {
     const ggufMmprojRow = makePromptOptimizerSettingsRow(TEXT.ggufMmproj, ggufMmproj);
     const ggufContextRow = makePromptOptimizerSettingsRow(TEXT.ggufContext, ggufContext);
     const ggufGpuLayersRow = makePromptOptimizerSettingsRow(TEXT.ggufGpuLayers, ggufGpuLayers);
+    const videoSampleRow = makePromptOptimizerSettingsRow(TEXT.videoSample, videoSample);
     form.append(
         makePromptOptimizerSettingsRow(TEXT.apiFormat, apiFormat),
         hint,
@@ -4138,6 +4163,7 @@ async function openPromptOptimizerSettings(node) {
         localMaxLengthRow,
         ggufUnloadLabel,
         readMediaLabel,
+        videoSampleRow,
         ggufDescribeLabel,
         optimizeOnRunLabel,
     );
@@ -4151,6 +4177,10 @@ async function openPromptOptimizerSettings(node) {
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadLabel]) row.hidden = !gguf;
         // Describing media one at a time only means something once media is read.
         ggufDescribeLabel.hidden = !gguf || !readMedia.checked;
+        // How a video is sampled only matters once media is read. It stays
+        // visible for Gemini too: that format sends a clip whole, but falls
+        // back to stills for one too large to inline.
+        videoSampleRow.hidden = !readMedia.checked;
         // Optimizing on run is an HTTP-only path server-side: `clip` optimizes
         // from inside the node and `gguf` from this editor, so neither reads it.
         optimizeOnRunLabel.hidden = local;
@@ -4214,6 +4244,7 @@ async function openPromptOptimizerSettings(node) {
     document.addEventListener("keydown", onKeyDown, true);
     overlay.addEventListener("pointerdown", (event) => {
         if (!apiFormat.contains?.(event.target)) apiFormat.__h3CloseMenu?.();
+        if (!videoSample.contains?.(event.target)) videoSample.__h3CloseMenu?.();
         if (event.target === overlay) close();
     });
     closeButton.addEventListener("click", close);
@@ -4229,6 +4260,7 @@ async function openPromptOptimizerSettings(node) {
                 api_key: apiKey.value,
                 model: model.value,
                 read_media: readMedia.checked,
+                video_sample: videoSample.value,
                 local_max_length: localMaxLength.value,
                 gguf_model: ggufModel.value,
                 gguf_mmproj: ggufMmproj.value,

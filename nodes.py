@@ -163,7 +163,6 @@ OPTIMIZER_GGUF_GPU_LAYERS = -1
 # encoder a block of soft tokens, so reference sets are trimmed rather than
 # sent whole.
 OPTIMIZER_CLIP_MAX_STILLS = 12
-OPTIMIZER_CLIP_FRAMES_PER_VIDEO = 4
 OPTIMIZER_CLIP_MAX_VIDEO_FRAMES = 8
 OPTIMIZER_CLIP_DESCRIBE_LENGTH = 256
 # Gemma has no switch for its reasoning — no `/no_think`, and its chat handler
@@ -191,6 +190,20 @@ OPTIMIZER_CLIP_DESCRIBE_REQUESTS = {
 # evenly spaced stills instead.
 OPTIMIZER_VIDEO_STILLS = 4
 OPTIMIZER_VIDEO_STILL_MAX_SIDE = 768
+# How densely a reference video is sampled. The `fps` modes scale with the
+# clip's length, the frame modes are a fixed count whatever it is. Rates stop at
+# 1 fps and the total at OPTIMIZER_VIDEO_SAMPLE_MAX_FRAMES because every still
+# is a full image part in the request: an unbounded rate would blow up the
+# context on a long reference. Duplicated in the JS as OPTIMIZER_VIDEO_SAMPLES.
+OPTIMIZER_VIDEO_SAMPLES: dict[str, dict[str, float]] = {
+    "1fps": {"fps": 1.0},
+    "0.5fps": {"fps": 0.5},
+    "0.25fps": {"fps": 0.25},
+    "8frames": {"frames": 8},
+    "4frames": {"frames": 4},
+}
+OPTIMIZER_VIDEO_SAMPLE_DEFAULT = "4frames"
+OPTIMIZER_VIDEO_SAMPLE_MAX_FRAMES = 16
 OPTIMIZER_VIDEO_STILLS_REQUEST = (
     "Describe this reference video. The {count} attached images are frames sampled from it in "
     "chronological order, not separate references: describe the clip as a whole, including the "
@@ -207,6 +220,7 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "model": "",
     "read_media": False,
     "optimize_on_run": False,
+    "video_sample": OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
     "local_max_length": PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
     "gguf_model": "",
     "gguf_mmproj": OPTIMIZER_GGUF_MMPROJ_AUTO,
@@ -502,6 +516,9 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     optimize_on_run = source.get("optimize_on_run", False)
     if isinstance(optimize_on_run, str):
         optimize_on_run = optimize_on_run.strip().lower() in {"1", "true", "yes", "on"}
+    video_sample = str(source.get("video_sample") or "").strip().lower()
+    if video_sample not in OPTIMIZER_VIDEO_SAMPLES:
+        video_sample = OPTIMIZER_VIDEO_SAMPLE_DEFAULT
 
     def integer(key: str, fallback: int, low: int, high: int, *legacy: str) -> int:
         raw = source.get(key)
@@ -535,6 +552,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "model": str(source.get("model") or "").strip(),
         "read_media": bool(read_media),
         "optimize_on_run": bool(optimize_on_run),
+        "video_sample": video_sample,
         "local_max_length": local_max_length,
         "gguf_model": str(source.get("gguf_model") or "").strip(),
         "gguf_mmproj": mmproj,
@@ -995,7 +1013,29 @@ def _optimizer_inline_part(mime: str, encoded: str, api_format: str) -> dict[str
     return {"type": "image_url", "image_url": {"url": data_url}}
 
 
-def _optimizer_media_items(resources: list[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
+def _optimizer_video_sample_count(sample: str, duration: float) -> int:
+    """How many stills one reference video of `duration` seconds becomes.
+
+    A rate that cannot be applied — the container reports no duration — falls
+    back to the fixed default rather than to zero frames: a video the optimizer
+    cannot see is the one outcome worth avoiding.
+    """
+    spec = OPTIMIZER_VIDEO_SAMPLES.get(str(sample or "").strip().lower())
+    if spec is None:
+        spec = OPTIMIZER_VIDEO_SAMPLES[OPTIMIZER_VIDEO_SAMPLE_DEFAULT]
+    frames = spec.get("frames")
+    if frames:
+        return max(1, int(frames))
+    if duration <= 0:
+        return OPTIMIZER_VIDEO_STILLS
+    return max(1, min(OPTIMIZER_VIDEO_SAMPLE_MAX_FRAMES, round(duration * float(spec["fps"]))))
+
+
+def _optimizer_media_items(
+    resources: list[Mapping[str, Any]],
+    api_format: str,
+    sample: str = OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
+) -> list[dict[str, Any]]:
     """Resolve the editor's media list into taggable request parts.
 
     Every readable asset is kept, including the ones this format cannot carry:
@@ -1028,7 +1068,7 @@ def _optimizer_media_items(resources: list[Mapping[str, Any]], api_format: str) 
             parts = []
         sampled = not parts and media_type == "video"
         if sampled:
-            parts = _optimizer_video_still_parts(path, api_format=api_format)
+            parts = _optimizer_video_still_parts(path, sample=sample, api_format=api_format)
             sampled = bool(parts)
         items.append({"tag": tag, "type": media_type, "path": path, "parts": parts, "sampled": sampled})
     return items
@@ -1060,17 +1100,18 @@ def _optimizer_media_manifest(items: Sequence[Mapping[str, Any]]) -> str:
 
 def _optimizer_video_still_parts(
     path: str,
-    count: int = OPTIMIZER_VIDEO_STILLS,
+    sample: str = OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
     max_side: int = OPTIMIZER_VIDEO_STILL_MAX_SIDE,
     api_format: str = OPTIMIZER_FORMAT_OPENAI,
 ) -> list[dict[str, Any]]:
     """Sample evenly spaced frames from a video file as image parts.
 
     A chat completion has no video channel, so this is the only way a reference
-    video reaches the optimizer. Frames are seeked rather than decoded in full,
-    since a reference clip can be long and only a handful of stills are wanted;
-    files whose duration is unknown (or that refuse to seek) fall back to a
-    strided sequential decode.
+    video reaches the optimizer. How many frames `sample` asks for can depend on
+    the clip's length, so the count is decided once the duration is known.
+    Frames are seeked rather than decoded in full, since a reference clip can be
+    long and only a handful of stills are wanted; files whose duration is
+    unknown (or that refuse to seek) fall back to a strided sequential decode.
     """
     if not path:
         return []
@@ -1092,6 +1133,7 @@ def _optimizer_video_still_parts(
                 duration = float(stream.duration * stream.time_base)
             elif container.duration:
                 duration = float(container.duration) / float(av.time_base)
+            count = _optimizer_video_sample_count(sample, duration)
             if duration > 0 and stream.time_base:
                 for index in range(count):
                     # Aim at the middle of each slice so the first and last
@@ -1136,8 +1178,12 @@ def _optimizer_video_still_parts(
     return parts
 
 
-def _optimizer_media_parts(resources: list[Mapping[str, Any]], api_format: str) -> list[dict[str, Any]]:
-    return [part for item in _optimizer_media_items(resources, api_format) for part in item["parts"]]
+def _optimizer_media_parts(
+    resources: list[Mapping[str, Any]],
+    api_format: str,
+    sample: str = OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
+) -> list[dict[str, Any]]:
+    return [part for item in _optimizer_media_items(resources, api_format, sample) for part in item["parts"]]
 
 
 def _media_counts_from_kwargs(kwargs: Mapping[str, Any]) -> dict[str, int]:
@@ -1306,11 +1352,18 @@ def _stack_stills(stills: list) -> Any:
     return torch.cat(normalized, dim=0)
 
 
-def _optimizer_clip_media(clip, items: list[_MediaInput]) -> tuple[dict[str, Any], int]:
+def _optimizer_clip_media(
+    clip,
+    items: list[_MediaInput],
+    sample: str = OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
+) -> tuple[dict[str, Any], int]:
     """Map connected media onto the tokenizer arguments the encoder supports.
 
     Returns the tokenizer kwargs plus how many media parts were actually
     attached, so the system prompt's evidence rule can state the truth.
+    `sample` is the same setting the chat formats sample stills with, but the
+    encoder's own caps still apply on top of it: unlike an HTTP request, this
+    runs in the same VRAM as the H3 model.
     """
     stills = [
         item.value[:1]
@@ -1323,10 +1376,12 @@ def _optimizer_clip_media(clip, items: list[_MediaInput]) -> tuple[dict[str, Any
         if item.media_type != "video":
             continue
         try:
-            frames, soundtrack, _fps = _video_parts(item.value)
+            frames, soundtrack, fps = _video_parts(item.value)
         except ValueError:
             continue
-        videos.append(frames)
+        # The frames are already decoded here, so the clip's length is known
+        # without seeking: a rate-based `sample` can be applied directly.
+        videos.append((frames, float(frames.shape[0]) / max(1e-6, float(fps or 24.0))))
         if soundtrack is not None:
             soundtracks.append(soundtrack)
 
@@ -1335,13 +1390,15 @@ def _optimizer_clip_media(clip, items: list[_MediaInput]) -> tuple[dict[str, Any
     # The dedicated video channel replaces the image channel on the encoders
     # that have one, so it is only used when no reference image would be lost.
     if not stills and len(videos) == 1 and _tokenizer_accepts(clip, "video"):
-        media["video"] = _sample_frames(videos[0], OPTIMIZER_CLIP_MAX_VIDEO_FRAMES)[..., :3]
+        frames, duration = videos[0]
+        wanted = min(OPTIMIZER_CLIP_MAX_VIDEO_FRAMES, _optimizer_video_sample_count(sample, duration))
+        media["video"] = _sample_frames(frames, wanted)[..., :3]
         # The frames are already thinned, so keep every one of them.
         media["fps"] = 1.0
         attached += 1
     else:
-        for frames in videos:
-            sampled = _sample_frames(frames, OPTIMIZER_CLIP_FRAMES_PER_VIDEO)
+        for frames, duration in videos:
+            sampled = _sample_frames(frames, _optimizer_video_sample_count(sample, duration))
             stills.extend(sampled[index:index + 1] for index in range(int(sampled.shape[0])))
         if stills:
             dropped = max(0, len(stills) - OPTIMIZER_CLIP_MAX_STILLS)
@@ -1453,7 +1510,13 @@ def _optimizer_media_label(item: _MediaInput, labels: Mapping[int, str] | None, 
     return f"{item.media_type} {ordinals[item.media_type]}"
 
 
-def _optimizer_clip_descriptions(clip, items: list[_MediaInput], labels: Mapping[int, str] | None, max_length: int) -> tuple[str, int]:
+def _optimizer_clip_descriptions(
+    clip,
+    items: list[_MediaInput],
+    labels: Mapping[int, str] | None,
+    max_length: int,
+    sample: str = OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
+) -> tuple[str, int]:
     """Describe every connected media on its own, then return one text block.
 
     One pass per asset avoids each encoder's single-slot media limits: no
@@ -1472,7 +1535,7 @@ def _optimizer_clip_descriptions(clip, items: list[_MediaInput], labels: Mapping
     for index, item in enumerate(describable, start=1):
         request = OPTIMIZER_CLIP_DESCRIBE_REQUESTS[item.media_type]
         label = _optimizer_media_label(item, labels, ordinals)
-        media, attached = _optimizer_clip_media(clip, [item])
+        media, attached = _optimizer_clip_media(clip, [item], sample)
         if not attached:
             # The encoder has no channel for this modality; saying nothing is
             # better than letting the prompt writer imagine the content.
@@ -2096,7 +2159,10 @@ def _optimize_prompt_on_run(
         ):
             return _RuntimePromptOptimization(source_prompt)
 
-        media_parts = _optimizer_media_parts(resources, api_format) if bool(settings.get("read_media")) else []
+        media_parts = (
+            _optimizer_media_parts(resources, api_format, str(settings.get("video_sample") or ""))
+            if bool(settings.get("read_media")) else []
+        )
         system = _optimizer_system_prompt(
             str(scene_guide or "none"),
             str(mode or MODE_IMAGE),
@@ -2258,7 +2324,10 @@ def _register_prompt_optimizer_route() -> bool:
             # llama-cpp takes the same OpenAI-shaped image parts as the HTTP
             # chat-completions format, so the media builder is shared.
             parts_format = OPTIMIZER_FORMAT_OPENAI if local else api_format
-            media_items = _optimizer_media_items(resources, parts_format) if bool(settings.get("read_media")) else []
+            media_items = (
+                _optimizer_media_items(resources, parts_format, str(settings.get("video_sample") or ""))
+                if bool(settings.get("read_media")) else []
+            )
             # The GGUF loop polls this, so cancelling actually stops the
             # generation instead of only freeing the editor.
             should_stop = (lambda: _optimizer_is_cancelled(request_id)) if request_id else None
@@ -3041,7 +3110,10 @@ class MiniMaxH3Easy:
             )
             # Reference videos are decoded again here; that is the price of
             # showing them to the encoder, so it only happens when asked.
-            described, count = _optimizer_clip_descriptions(clip, items, labels, max_length) if read_media else ("", 0)
+            described, count = (
+                _optimizer_clip_descriptions(clip, items, labels, max_length, str(settings.get("video_sample") or ""))
+                if read_media else ("", 0)
+            )
             system = _optimizer_system_prompt(scene_guide, mode, float(seconds), counts, 0, count)
             _optimizer_log("writing the final prompt (guide=%d chars, descriptions=%d)...", len(system), count)
             step = time.perf_counter()
