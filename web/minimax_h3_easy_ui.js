@@ -1065,6 +1065,49 @@ function getMediaBridgeLink(node) {
     return getNativeMediaBridgeLink(node) || getVirtualMediaBridgeLink(node);
 }
 
+function mediaBridgeSourceLinks(bridgeNode) {
+    // The order `MiniMaxH3EasyMediaBridge.pack` walks: image, then video, then
+    // audio, bounded by the count widgets and skipping the slots it hands the
+    // server as `None`. The 1-based position in this list is therefore the
+    // `_MediaInput.input_index` a `__MINIMAX_H3_REF_n__` placeholder is matched
+    // against, exactly as the virtual `media_N` order is without a bridge.
+    if (!isMediaBridge(bridgeNode)) return [];
+    const graph = bridgeNode.graph || app.graph;
+    const links = [];
+    for (const name of desiredMediaBridgeInputNames(bridgeNode)) {
+        const parsed = mediaBridgeGroupForInput(name);
+        const input = findInputByName(bridgeNode, name);
+        if (!parsed || input?.link == null) continue;
+        const link = getNativeGraphLink(graph, input.link);
+        if (!link) continue;
+        const sourceId = link.origin_id ?? link.originId ?? link.from_id ?? link.fromId;
+        const sourceNode = link.origin_node || link.originNode || link.fromNode || link.sourceNode
+            || graph?.getNodeById?.(Number(sourceId));
+        const resolvedSourceId = sourceId ?? sourceNode?.id;
+        if (resolvedSourceId == null) continue;
+        const rawSourceSlot = link.origin_slot ?? link.originSlot ?? link.from_slot ?? link.fromSlot ?? 0;
+        const parsedSourceSlot = Number(rawSourceSlot);
+        links.push({
+            source_id: Number(resolvedSourceId),
+            source_slot: Number.isFinite(parsedSourceSlot) ? parsedSourceSlot : 0,
+            media_type: parsed.type,
+        });
+    }
+    return links;
+}
+
+function effectiveMediaLinks(node) {
+    // The media the node will actually receive, whichever transport carries it.
+    // A bridged workflow has no virtual links at all, so mentions and the
+    // optimizer would otherwise see an empty reference set and write about
+    // media that is plainly connected as if it were not there.
+    const bridge = getMediaBridgeLink(node);
+    if (!bridge) return normalizeLinks(node);
+    const graph = node.graph || app.graph;
+    const bridgeNode = graph?.getNodeById?.(Number(bridge.source_id));
+    return bridgeNode ? mediaBridgeSourceLinks(bridgeNode) : [];
+}
+
 function convertNativeMediaConnection(targetNode, inputIndex, linkInfo = null) {
     if (!isTarget(targetNode) || targetNode.__h3VirtualWireClearing) return false;
     const input = targetNode.inputs?.[inputIndex];
@@ -1861,12 +1904,20 @@ function patchGraphToPrompt() {
                 promptNode.inputs[`media_${index + 1}`] = [String(link.source_id), slot];
                 promptNode.inputs[`media_type_${index + 1}`] = String(link.media_type || "image");
             });
+            // The bridged node emits no `media_N`, but its mentions still have
+            // to resolve — against the bundle the bridge packs, whose items are
+            // numbered in this same order. A source the prompt no longer holds
+            // (muted, bypassed) reaches `pack` as `None` and shifts the rest
+            // down, which is what dropping it here reproduces.
+            const promptLinks = mediaBridgeLink
+                ? effectiveMediaLinks(node).filter((link) => Boolean(output[String(link.source_id)]))
+                : runtimeLinks;
             const promptInput = promptInputSlot(node);
             const promptLinkId = promptInput?.link;
             const existingPromptLink = promptNode.inputs.prompt;
             const hasPromptConnection = promptLinkId != null || Array.isArray(existingPromptLink);
             if (!hasPromptConnection) {
-                promptNode.inputs.prompt = buildRuntimePrompt(node, runtimeLinks);
+                promptNode.inputs.prompt = buildRuntimePrompt(node, promptLinks);
             } else if (promptLinkId != null && (!Array.isArray(existingPromptLink) || existingPromptLink.length < 2)) {
                 // ComfyUI normally preserves connected widget inputs in graphToPrompt.
                 // Reconstruct the link as a fallback for frontends that omit it after
@@ -1966,7 +2017,7 @@ function truncateMentionLabel(value, maxLength = 22) {
 
 function mentionOptions(node) {
     if (!isReferenceMode(node)) return [];
-    const links = normalizeLinks(node);
+    const links = effectiveMediaLinks(node);
     const mediaOrder = { image: 0, video: 1, audio: 2 };
     const orderedLinks = links
         .map((link, index) => ({ link, index }))
@@ -4746,7 +4797,7 @@ function sourceAssetDescriptor(node, mediaType) {
 
 function promptOptimizerResources(node) {
     const counts = { image: 0, video: 0, audio: 0 };
-    return normalizeLinks(node).map((link) => {
+    return effectiveMediaLinks(node).map((link) => {
         const type = String(link.media_type || "image").toLowerCase();
         counts[type] = (counts[type] || 0) + 1;
         const ordinal = counts[type];
@@ -6401,6 +6452,9 @@ function installMediaBridgeNode(nodeType, nodeData) {
                 original?.apply(this, arguments);
                 clampMediaBridgeWidgetValue(widget, group, value);
                 updateMediaBridgeWidgets(node);
+                // A count change adds or drops a slot, which renumbers the
+                // bundle the H3 node's mentions are resolved against.
+                requestMentionPreviewRefresh();
             };
         }
         updateMediaBridgeWidgets(node, { force: true });
@@ -6426,6 +6480,17 @@ function installMediaBridgeNode(nodeType, nodeData) {
         const result = originalConfigure?.apply(this, arguments);
         setup(this);
         updateMediaBridgeWidgets(this, { force: true });
+        requestMentionPreviewRefresh();
+        return result;
+    };
+
+    // The H3 node's own connections never change when media is wired into the
+    // bridge instead, so without this its mention chips keep showing whatever
+    // the bundle held when it was last touched.
+    const originalConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function onConnectionsChangeH3EasyMediaBridge() {
+        const result = originalConnectionsChange?.apply(this, arguments);
+        requestMentionPreviewRefresh();
         return result;
     };
 }

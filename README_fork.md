@@ -616,3 +616,48 @@ applying to every configured format.
 ### Scope
 
 `nodes.py` and `web/minimax_h3_easy_ui.js`. **Restart ComfyUI and hard refresh.**
+
+---
+
+## Media Bridge references
+
+Upstream 1.0.12 added the **MiniMax H3 Easy Media Bridge** node: instead of
+dragging media onto the main node's single `Media` input and letting the
+frontend keep an ordered list of virtual links, an API-friendly workflow wires
+each asset into a numbered `image_N` / `video_N` / `audio_N` slot on the bridge,
+and the bridge hands the main node one `media_bundle`.
+
+A bridged node therefore has **no virtual media links at all**. Two of this
+fork's features read that list, and both were blind to a bundle:
+
+- **`@` mentions.** The picker had nothing to offer, and any mention already in
+  the prompt was reported as disconnected. Generation emitted
+  `__MINIMAX_H3_UNRESOLVED_REF_…__` for media that was plainly connected.
+- **Prompt optimization.** The request carried an empty resource list, so the
+  optimizer was told no media was attached and — reasonably — wrote a prompt
+  about nothing.
+
+Both now read `effectiveMediaLinks()`, which returns the virtual links as
+before, or, when a Media Bridge holds the `Media` input, the media that bridge
+packs. The order is the one `MiniMaxH3EasyMediaBridge.pack` walks — image, then
+video, then audio, bounded by the count widgets and skipping the slots it hands
+the server as `None`. That order is what makes it work: `pack` numbers the
+bundle's items `1..n` in exactly that sequence, and `__MINIMAX_H3_REF_n__` is
+resolved against those numbers, so a mention points at the same asset whichever
+transport carried it.
+
+A source the prompt no longer holds (muted, bypassed) reaches `pack` as `None`
+and shifts the rest of the bundle down; `graphToPrompt` drops it from the
+mention order for the same reason.
+
+Because the main node's own connections never change when media is wired into
+the bridge, the bridge node's connection and count changes now refresh the
+editor's mention chips.
+
+What is unchanged: the bridge still carries the media, `media_N` is still not
+emitted for a bridged node, and `MiniMaxH3Easy._collect_media` unpacks the
+bundle exactly as upstream wrote it.
+
+### Scope
+
+`web/minimax_h3_easy_ui.js` only. **Hard refresh the browser.**

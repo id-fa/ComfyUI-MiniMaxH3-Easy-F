@@ -68,6 +68,16 @@ Consequence: if you add a media-related widget or change `MAX_MEDIA`, you must t
 `isTransportInputName` in the JS decides what gets pruned; anything added to it must also be re-emitted in
 the `graphToPrompt` patch, or the server silently falls back to the input's default.
 
+`MiniMaxH3EasyMediaBridge` is the second transport: it packs numbered `image_N` / `video_N` / `audio_N`
+inputs into one `MINIMAX_H3_MEDIA_BUNDLE` on the real `media` link, and a node fed that way has **no
+virtual links at all** (`graphToPrompt` emits no `media_N` for it). Anything that asks "what media does
+this node have" must therefore go through `effectiveMediaLinks()`, not `normalizeLinks()` — `mentionOptions`,
+`promptOptimizerResources` and the mention half of `graphToPrompt` do. The order it returns for a bundle is
+the one `MiniMaxH3EasyMediaBridge.pack` walks (image → video → audio, bounded by the count widgets, skipping
+the unconnected slots it receives as `None`), because `pack` numbers the items `1..n` in that order and
+`_resolve_reference_prompt` looks a `__MINIMAX_H3_REF_n__` up by `_MediaInput.input_index`. Change one side
+of that numbering and every `@` mention in a bridged workflow silently points at the wrong asset.
+
 ### Prompt editor and `@` reference resolution
 
 The native `prompt` textarea is hidden and replaced by a composite DOM widget: a tab strip over **two**
