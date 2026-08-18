@@ -225,9 +225,9 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   registry (`_optimizer_cancel` / `_optimizer_is_cancelled`, capped) is polled by `_optimizer_gguf_stream`
   between tokens. **`create_chat_completion` has no `stopping_criteria`** (only `create_completion` does),
   so streaming and closing the generator is the only way to interrupt a chat turn; model loading and
-  prompt evaluation still cannot be interrupted at all. urllib cannot be interrupted either, so an HTTP
-  answer that arrives after a cancel is discarded instead. A client disconnect raises
-  `asyncio.CancelledError` in the route and is treated as a cancel. **Everything the route does that
+  prompt evaluation still cannot be interrupted at all. The blocking `requests.post` cannot be
+  interrupted either, so an HTTP answer that arrives after a cancel is discarded instead. A client
+  disconnect raises `asyncio.CancelledError` in the route and is treated as a cancel. **Everything the route does that
   blocks goes through `asyncio.to_thread`, `_optimizer_media_items` included** — reading the
   references base64s whole files and decodes every video frame by frame, and a cancel that cannot be
   served until that finishes is not a cancel. Do not call it inline again; it is the window the stop

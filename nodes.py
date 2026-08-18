@@ -22,7 +22,6 @@ import hashlib
 import json
 import mimetypes
 import tempfile
-import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
@@ -32,6 +31,7 @@ from typing import Any
 
 import torch
 import torchaudio
+import requests
 
 import comfy.model_management
 import folder_paths
@@ -118,6 +118,7 @@ MAX_MEDIA = 15
 MAX_IMAGES = 9
 MAX_VIDEOS = 3
 MAX_AUDIOS = 3
+MEDIA_BUNDLE_TYPE = "MINIMAX_H3_MEDIA_BUNDLE"
 MIN_SECONDS = 0.2
 MAX_SECONDS = 30.0
 PROMPT_GUIDES_DIR = os.path.join(os.path.dirname(__file__), "prompt_guides")
@@ -915,21 +916,28 @@ def _optimizer_http_post(
     attempts.append(payload)
     last: Exception | None = None
     for index, body in enumerate(attempts):
-        request = urllib.request.Request(
-            url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=dict(headers), method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=max(1.0, float(timeout_seconds))) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            last = RuntimeError(f"Prompt optimization API error ({exc.code}): {detail[:1000]}")
-            if index + 1 < len(attempts) and exc.code in {400, 404, 422}:
-                _optimizer_log("the endpoint rejected the thinking-off fields (%d); retrying without them", exc.code)
+            response = requests.post(
+                url, json=body, headers=dict(headers), timeout=max(1.0, float(timeout_seconds)),
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Prompt optimization request failed: {exc}") from exc
+        # The status is read rather than raised on, because the retry below has
+        # to see the code that `raise_for_status` would have hidden inside the
+        # exception.
+        if response.status_code >= 400:
+            detail = response.text or ""
+            last = RuntimeError(f"Prompt optimization API error ({response.status_code}): {detail[:1000]}")
+            if index + 1 < len(attempts) and response.status_code in {400, 404, 422}:
+                _optimizer_log(
+                    "the endpoint rejected the thinking-off fields (%d); retrying without them", response.status_code,
+                )
                 continue
-            raise last from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Prompt optimization request failed: {exc.reason}") from exc
+            raise last
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError("Prompt optimization API returned invalid JSON") from exc
     raise last or RuntimeError("Prompt optimization request failed")
 
 
@@ -3085,6 +3093,60 @@ class _MediaInput:
     value: Any
 
 
+@dataclass(frozen=True)
+class MiniMaxH3MediaBundle:
+    """Native multi-input transport used by API-friendly workflows."""
+
+    items: tuple[_MediaInput, ...]
+
+
+class MiniMaxH3EasyMediaBridge:
+    CATEGORY = "MiniMax H3 Easy"
+    FUNCTION = "pack"
+    RETURN_TYPES = (MEDIA_BUNDLE_TYPE,)
+    RETURN_NAMES = ("media_bundle",)
+    DESCRIPTION = "Collect explicit image, video and audio inputs for API-friendly MiniMax H3 workflows."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        optional = {}
+        for index in range(1, MAX_IMAGES + 1):
+            optional[f"image_{index}"] = ("*",)
+        for index in range(1, MAX_VIDEOS + 1):
+            optional[f"video_{index}"] = ("*",)
+        for index in range(1, MAX_AUDIOS + 1):
+            optional[f"audio_{index}"] = ("*",)
+        return {
+            "required": {
+                "image_count": ("INT", {"default": 1, "min": 0, "max": MAX_IMAGES, "step": 1}),
+                "video_count": ("INT", {"default": 0, "min": 0, "max": MAX_VIDEOS, "step": 1}),
+                "audio_count": ("INT", {"default": 0, "min": 0, "max": MAX_AUDIOS, "step": 1}),
+            },
+            "optional": optional,
+        }
+
+    def pack(self, image_count: int, video_count: int, audio_count: int, **kwargs):
+        items: list[_MediaInput] = []
+        input_index = 0
+        groups = (
+            ("image", image_count, MAX_IMAGES),
+            ("video", video_count, MAX_VIDEOS),
+            ("audio", audio_count, MAX_AUDIOS),
+        )
+        for media_type, raw_count, maximum in groups:
+            try:
+                count = max(0, min(maximum, int(raw_count)))
+            except (TypeError, ValueError):
+                count = 0
+            for index in range(1, count + 1):
+                value = kwargs.get(f"{media_type}_{index}")
+                if value is None:
+                    continue
+                input_index += 1
+                items.append(_MediaInput(input_index, media_type, value))
+        return (MiniMaxH3MediaBundle(tuple(items)),)
+
+
 class MiniMaxH3EasyLoader:
     CATEGORY = "MiniMax H3 Easy"
     FUNCTION = "load"
@@ -3508,11 +3570,19 @@ class MiniMaxH3Easy:
     def _collect_media(kwargs: dict) -> list[_MediaInput]:
         items = []
         direct = kwargs.get("media")
-        if direct is not None:
+        if isinstance(direct, MiniMaxH3MediaBundle):
+            items.extend(direct.items)
+        elif direct is not None:
             items.append(_MediaInput(0, _infer_media_type(direct), direct))
         for index in range(1, MAX_MEDIA + 1):
             value = kwargs.get(f"media_{index}")
             if value is None:
+                continue
+            # Older frontend sessions may have converted a media-bridge output
+            # into a virtual media_N link. Keep those saved/running workflows
+            # functional while the frontend preserves the native Media link.
+            if isinstance(value, MiniMaxH3MediaBundle):
+                items.extend(value.items)
                 continue
             media_type = str(kwargs.get(f"media_type_{index}") or "").strip().lower()
             resolved_type = media_type if media_type in {"image", "video", "audio"} else _infer_media_type(value)
@@ -3817,6 +3887,7 @@ _register_prompt_optimizer_route_when_ready()
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3EasyLoader": MiniMaxH3EasyLoader,
     "MiniMaxH3EasyModelAdapter": MiniMaxH3EasyModelAdapter,
+    "MiniMaxH3EasyMediaBridge": MiniMaxH3EasyMediaBridge,
     "MiniMaxH3Easy": MiniMaxH3Easy,
     "MiniMaxH3EasyOutput": MiniMaxH3EasyOutput,
     "MiniMaxH3EasyAspectRatio": MiniMaxH3EasyAspectRatio,
