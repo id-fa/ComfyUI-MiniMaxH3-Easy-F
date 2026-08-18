@@ -23,7 +23,6 @@ import json
 import mimetypes
 import tempfile
 import urllib.parse
-import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -1910,10 +1909,18 @@ def _optimizer_gguf_chat_handler(model_name: str, mmproj_path: str):
 
 
 def _optimizer_api_request(url: str, headers: Mapping[str, str], payload: Any = None, method: str = "GET") -> Any:
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    request = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
-    with urllib.request.urlopen(request, timeout=PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS) as response:
-        body = response.read().decode("utf-8", errors="replace")
+    response = requests.request(
+        method,
+        url,
+        json=payload if payload is not None else None,
+        headers=dict(headers),
+        timeout=PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS,
+    )
+    # `raise_for_status` rather than a status check, because the one caller that
+    # cares about the code (`_optimizer_unload_each`, for a 404) reads it off the
+    # exception, and the two probes only ever ask whether this raised at all.
+    response.raise_for_status()
+    body = response.text or ""
     return json.loads(body) if body.strip() else {}
 
 
@@ -1988,15 +1995,16 @@ def _optimizer_unload_each(root: str, headers: Mapping[str, str], targets: Seque
         url, payload = build(target)
         try:
             _optimizer_api_request(url, headers, payload, method="POST")
-        except urllib.error.HTTPError as exc:
+        except requests.HTTPError as exc:
             # The server listed this model moments ago, so a 404 now means it is
             # already gone — which is the wanted end state either way.
-            if exc.code == 404:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            if status_code == 404:
                 continue
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Unload failed ({exc.code}): {detail[:500]}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Request failed: {exc.reason}") from exc
+            detail = exc.response.text if exc.response is not None else str(exc)
+            raise RuntimeError(f"Unload failed ({status_code or 'unknown'}): {detail[:500]}") from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Request failed: {exc}") from exc
         _optimizer_log("unloaded %s from %s", target, root)
         unloaded += 1
     return unloaded
