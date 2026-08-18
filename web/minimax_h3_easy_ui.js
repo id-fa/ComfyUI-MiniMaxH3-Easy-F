@@ -18,6 +18,7 @@ const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     model: "",
     read_media: false,
     optimize_on_run: false,
+    unload_ollama_after_optimize: true,
 });
 let promptOptimizerSettingsCache = { ...PROMPT_OPTIMIZER_SETTINGS_DEFAULTS };
 let promptOptimizerSettingsLoaded = false;
@@ -91,6 +92,7 @@ const TEXT = {
     promptGuide: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u65b9\u6848" : "Prompt Guide",
     readMedia: ZH_BROWSER ? "\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53" : "Read connected media",
     optimizeOnRun: ZH_BROWSER ? "\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u81ea\u52a8\u4f18\u5316" : "Optimize when workflow runs",
+    unloadOllamaAfterOptimize: ZH_BROWSER ? "\u4f18\u5316\u5b8c\u6210\u540e\u5378\u8f7d\u6a21\u578b" : "Unload model after optimization",
     optimizerMissing: ZH_BROWSER ? "\u8bf7\u586b\u5199 API \u5730\u5740\u548c\u6a21\u578b\u540d\uff1bGemini \u539f\u751f\u8fd8\u9700\u8981 API Key\u3002" : "Enter the API URL and model; Gemini Native also requires an API key.",
     optimizerFailed: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u5931\u8d25" : "Prompt optimization failed",
     optimizerRunning: ZH_BROWSER ? "\u6b63\u5728\u4f18\u5316" : "Optimizing",
@@ -167,6 +169,7 @@ const OPTION_DEFS = {
         openai: ZH_BROWSER ? "OpenAI \u517c\u5bb9" : "OpenAI Compatible",
         responses: "OpenAI Responses",
         gemini: ZH_BROWSER ? "Gemini \u539f\u751f" : "Gemini Native",
+        ollama: "Ollama",
     },
     prompt_optimizer_scene_guide: {
         none: ZH_BROWSER ? "\u4ec5\u901a\u7528\u65b9\u6848" : "General only",
@@ -3559,7 +3562,7 @@ function togglePromptView(node) {
 function normalizePromptOptimizerSettings(value) {
     const source = value && typeof value === "object" ? value : {};
     const requestedFormat = String(source.api_format || "openai").toLowerCase();
-    const apiFormat = ["openai", "responses", "gemini"].includes(requestedFormat) ? requestedFormat : "openai";
+    const apiFormat = ["openai", "responses", "gemini", "ollama"].includes(requestedFormat) ? requestedFormat : "openai";
     return {
         api_format: apiFormat,
         api_url: String(source.api_url || "").trim(),
@@ -3567,6 +3570,7 @@ function normalizePromptOptimizerSettings(value) {
         model: String(source.model || "").trim(),
         read_media: asBoolean(source.read_media, false),
         optimize_on_run: asBoolean(source.optimize_on_run, false),
+        unload_ollama_after_optimize: asBoolean(source.unload_ollama_after_optimize, true),
     };
 }
 
@@ -3670,6 +3674,7 @@ function makePromptOptimizerSelect(initialValue) {
         activeIndex = nextIndex;
         render();
         close();
+        root.dispatchEvent(new Event("change"));
         trigger.focus();
     };
     options.forEach((item, index) => {
@@ -3822,6 +3827,18 @@ async function openPromptOptimizerSettings(node) {
     const optimizeOnRunText = document.createElement("span");
     optimizeOnRunText.textContent = TEXT.optimizeOnRun;
     optimizeOnRunLabel.append(optimizeOnRunText, optimizeOnRun);
+    const ollamaUnloadLabel = document.createElement("div");
+    ollamaUnloadLabel.className = "h3-optimizer-settings-check";
+    const ollamaUnload = makePromptOptimizerSwitch(promptOptimizerSettingsCache.unload_ollama_after_optimize);
+    ollamaUnload.setAttribute("aria-label", TEXT.unloadOllamaAfterOptimize);
+    const ollamaUnloadText = document.createElement("span");
+    ollamaUnloadText.textContent = TEXT.unloadOllamaAfterOptimize;
+    ollamaUnloadLabel.append(ollamaUnloadText, ollamaUnload);
+    const syncOllamaUnloadVisibility = () => {
+        ollamaUnloadLabel.hidden = apiFormat.value !== "ollama";
+    };
+    apiFormat.addEventListener("change", syncOllamaUnloadVisibility);
+    syncOllamaUnloadVisibility();
     form.append(
         makePromptOptimizerSettingsRow(TEXT.apiFormat, apiFormat),
         makePromptOptimizerSettingsRow(TEXT.apiUrl, apiUrl),
@@ -3829,6 +3846,7 @@ async function openPromptOptimizerSettings(node) {
         makePromptOptimizerSettingsRow(TEXT.apiModel, model),
         readMediaLabel,
         optimizeOnRunLabel,
+        ollamaUnloadLabel,
     );
 
     const error = document.createElement("div");
@@ -3876,6 +3894,7 @@ async function openPromptOptimizerSettings(node) {
                 model: model.value,
                 read_media: readMedia.checked,
                 optimize_on_run: optimizeOnRun.checked,
+                unload_ollama_after_optimize: ollamaUnload.checked,
             });
             notifyPromptOptimizer(TEXT.settingsSaved, "success");
             close();
@@ -5740,6 +5759,7 @@ function install() {
       .h3-optimizer-settings-form { display: grid; gap: 10px; padding: 14px 20px 12px; }
       .h3-optimizer-settings-row { display: flex; flex-direction: column; align-items: stretch; gap: 5px; min-height: 0; }
       .h3-optimizer-settings-label { color: var(--h3-settings-muted); font-size: 13px; font-weight: 500; }
+      .h3-optimizer-settings-check[hidden] { display: none !important; }
       .h3-optimizer-settings-control {
         width: 100%; min-width: 0; box-sizing: border-box; height: 34px; padding: 7px 12px; border: 1px solid var(--h3-settings-border); border-radius: 8px;
         background: var(--h3-settings-bg-base); color: var(--h3-settings-text); outline: none; font: inherit; font-size: 14px; transition: border-color .2s, background .2s, box-shadow .2s;

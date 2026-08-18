@@ -122,7 +122,7 @@ PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
 PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS = 120
 PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
 PROMPT_OPTIMIZER_MARKER_VERSION = 1
-PROMPT_OPTIMIZER_CONFIG_VERSION = 2
+PROMPT_OPTIMIZER_CONFIG_VERSION = 3
 PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
     "api_format": "openai",
@@ -131,6 +131,7 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "model": "",
     "read_media": False,
     "optimize_on_run": False,
+    "unload_ollama_after_optimize": True,
 }
 
 
@@ -411,7 +412,7 @@ def _prompt_optimizer_config_path() -> str:
 def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
     source = value if isinstance(value, Mapping) else {}
     api_format = str(source.get("api_format") or "openai").strip().lower()
-    if api_format not in {"openai", "responses", "gemini"}:
+    if api_format not in {"openai", "responses", "gemini", "ollama"}:
         api_format = "openai"
     read_media = source.get("read_media", False)
     if isinstance(read_media, str):
@@ -419,6 +420,9 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     optimize_on_run = source.get("optimize_on_run", False)
     if isinstance(optimize_on_run, str):
         optimize_on_run = optimize_on_run.strip().lower() in {"1", "true", "yes", "on"}
+    unload_ollama_after_optimize = source.get("unload_ollama_after_optimize", True)
+    if isinstance(unload_ollama_after_optimize, str):
+        unload_ollama_after_optimize = unload_ollama_after_optimize.strip().lower() in {"1", "true", "yes", "on"}
     return {
         "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
         "api_format": api_format,
@@ -427,6 +431,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "model": str(source.get("model") or "").strip(),
         "read_media": bool(read_media),
         "optimize_on_run": bool(optimize_on_run),
+        "unload_ollama_after_optimize": bool(unload_ollama_after_optimize),
     }
 
 
@@ -603,6 +608,31 @@ def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
     return _optimizer_url_with_query(base + endpoint, parsed.query)
 
 
+def _normalize_ollama_unload_url(api_url: str) -> str:
+    """Map an Ollama OpenAI-compatible URL back to its native unload endpoint."""
+    base = _normalize_optimizer_base_url(api_url)
+    parsed = urllib.parse.urlsplit(base)
+    clean = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    clean = _strip_optimizer_endpoint(clean)
+    if clean.lower().endswith("/v1"):
+        clean = clean[:-3].rstrip("/")
+    if clean.lower().endswith("/api/generate"):
+        clean = clean[: -len("/api/generate")].rstrip("/")
+    return _optimizer_url_with_query(clean + "/api/generate", parsed.query)
+
+
+def _unload_ollama_model(api_url: str, model: str, timeout_seconds: float) -> None:
+    try:
+        response = requests.post(
+            _normalize_ollama_unload_url(api_url),
+            json={"model": str(model or "").strip(), "keep_alive": 0},
+            timeout=min(10.0, max(1.0, float(timeout_seconds))),
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"[MiniMax H3 Easy] Ollama model unload skipped: {exc}")
+
+
 def _optimizer_responses_text(data: Any) -> str:
     if not isinstance(data, Mapping):
         return ""
@@ -646,6 +676,7 @@ def _optimizer_http_json(
     user_prompt: str,
     media_parts: list[dict[str, Any]] | None = None,
     timeout_seconds: float = PROMPT_OPTIMIZER_TIMEOUT_SECONDS,
+    unload_ollama_after_optimize: bool = True,
 ) -> str:
     url = _normalize_optimizer_url(api_url, api_format, model)
     api_key = str(api_key or "").strip()
@@ -712,6 +743,9 @@ def _optimizer_http_json(
         raise RuntimeError(f"Prompt optimization request failed: {exc}") from exc
     except ValueError as exc:
         raise RuntimeError("Prompt optimization API returned invalid JSON") from exc
+    finally:
+        if api_format == "ollama" and unload_ollama_after_optimize:
+            _unload_ollama_model(api_url, model, timeout_seconds)
     if api_format == "gemini":
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates:
@@ -997,6 +1031,7 @@ def _optimize_prompt_on_run(
             request_prompt,
             media_parts,
             timeout_seconds=PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS,
+            unload_ollama_after_optimize=bool(settings.get("unload_ollama_after_optimize", True)),
         )
         cleaned = re.sub(r"^```(?:text)?\s*", "", str(optimized or ""), flags=re.I)
         cleaned = re.sub(r"\s*```$", "", cleaned).strip()
@@ -1034,7 +1069,7 @@ class MiniMaxH3PromptOptimizer:
                 "mode": ([MODE_IMAGE, MODE_REFERENCE], {"default": MODE_IMAGE}),
                 "seconds": ("FLOAT", {"default": 5.0, "min": MIN_SECONDS, "max": MAX_SECONDS, "step": 0.1}),
                 "scene_guide": (choices, {"default": "none"}),
-                "api_format": (["openai", "responses", "gemini"], {"default": "openai"}),
+                "api_format": (["openai", "responses", "gemini", "ollama"], {"default": "openai"}),
                 "api_url": ("STRING", {"default": ""}),
                 "api_key": ("STRING", {"default": "", "multiline": False, "password": True}),
                 "model": ("STRING", {"default": ""}),
@@ -1092,7 +1127,7 @@ def _register_prompt_optimizer_route() -> bool:
             mode = str(payload.get("mode") or MODE_IMAGE)
             scene_guide = str(payload.get("scene_guide") or "none")
             seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(payload.get("seconds") or 5.0)))
-            if api_format not in {"openai", "responses", "gemini"}:
+            if api_format not in {"openai", "responses", "gemini", "ollama"}:
                 return web.json_response({"ok": False, "error": "Unsupported API format"}, status=400)
             if not prompt.strip() or not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
@@ -1101,7 +1136,17 @@ def _register_prompt_optimizer_route() -> bool:
             resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
             media_parts = _optimizer_media_parts(resources, api_format) if bool(settings.get("read_media")) else []
             system = _optimizer_system_prompt(scene_guide, mode, seconds, counts, len(media_parts))
-            result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
+            result = await asyncio.to_thread(
+                _optimizer_http_json,
+                api_url,
+                api_key,
+                model,
+                api_format,
+                system,
+                prompt,
+                media_parts,
+                unload_ollama_after_optimize=bool(settings.get("unload_ollama_after_optimize", True)),
+            )
             return web.json_response({"ok": True, "prompt": result})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
