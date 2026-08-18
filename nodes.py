@@ -18,9 +18,7 @@ import hashlib
 import json
 import mimetypes
 import tempfile
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
@@ -28,6 +26,7 @@ from typing import Any
 
 import torch
 import torchaudio
+import requests
 
 import comfy.model_management
 import folder_paths
@@ -695,15 +694,24 @@ def _optimizer_http_json(
         else:
             content = user_prompt
         payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}], "stream": False, "temperature": 0.35, "max_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS}
-    request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=max(1.0, float(timeout_seconds))) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Prompt optimization API error ({exc.code}): {detail[:1000]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Prompt optimization request failed: {exc.reason}") from exc
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.HTTPError as exc:
+        response = exc.response
+        status_code = response.status_code if response is not None else "unknown"
+        detail = response.text if response is not None else str(exc)
+        raise RuntimeError(f"Prompt optimization API error ({status_code}): {detail[:1000]}") from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Prompt optimization request failed: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError("Prompt optimization API returned invalid JSON") from exc
     if api_format == "gemini":
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates:
