@@ -12,7 +12,7 @@ The whole project is two source files:
 
 - `nodes.py` — all Python nodes, the model-filename matcher, reference conditioning, and the
   prompt-optimizer HTTP routes.
-- `web/minimax_h3_easy_ui.js` (~5300 lines) — the entire frontend: virtual media links, the
+- `web/minimax_h3_easy_f_ui.js` (~5300 lines) — the entire frontend: virtual media links, the
   contenteditable prompt editor, `@` mentions, localization, and the optimizer settings modal.
 
 ## Development loop
@@ -141,7 +141,7 @@ memory; the encode translates it back.
 
 ## Cross-file invariants
 
-Constants are duplicated between `nodes.py` and `web/minimax_h3_easy_ui.js` and must be edited in both:
+Constants are duplicated between `nodes.py` and `web/minimax_h3_easy_f_ui.js` and must be edited in both:
 `MAX_MEDIA`, `MIN_SECONDS` / `MAX_SECONDS`, mode ids, `KEYFRAME_*`, `REF_IMAGE_*`,
 `REFERENCE_MENTION_*`, `RESOLUTION_CUSTOM`, the resolution/aspect lists, `OPTIMIZER_VIDEO_SAMPLES`,
 the prompt-guide id list (`PROMPT_GUIDES` in JS vs `prompt_guides/manifest.json` on the server), and the

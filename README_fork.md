@@ -161,7 +161,7 @@ one control, on `✦`.
 
 ### Scope
 
-Frontend only — `web/minimax_h3_easy_ui.js`. No Python node, input, or output
+Frontend only — `web/minimax_h3_easy_f_ui.js`. No Python node, input, or output
 changed, so a browser refresh is enough to pick this up; no ComfyUI restart is
 required.
 
@@ -279,7 +279,7 @@ it is on. All of these are stored in the same shared `prompt_optimizer.json`.
 
 ### Scope
 
-`nodes.py` and `web/minimax_h3_easy_ui.js`. This one adds a node input, so
+`nodes.py` and `web/minimax_h3_easy_f_ui.js`. This one adds a node input, so
 **ComfyUI must be restarted**, not just refreshed.
 
 ---
@@ -447,7 +447,7 @@ prompt request, the way the format does when this switch is off.
 
 ### Scope
 
-`nodes.py` and `web/minimax_h3_easy_ui.js`. Adds
+`nodes.py` and `web/minimax_h3_easy_f_ui.js`. Adds
 `GET /minimax_h3_easy/gguf_models` for the model dropdown. Python changed, so
 **restart ComfyUI**.
 
@@ -544,7 +544,7 @@ counts once.
 
 ### Scope
 
-`nodes.py` and `web/minimax_h3_easy_ui.js`. Python changed, so **restart
+`nodes.py` and `web/minimax_h3_easy_f_ui.js`. Python changed, so **restart
 ComfyUI.**
 
 ---
@@ -615,7 +615,7 @@ applying to every configured format.
 
 ### Scope
 
-`nodes.py` and `web/minimax_h3_easy_ui.js`. **Restart ComfyUI and hard refresh.**
+`nodes.py` and `web/minimax_h3_easy_f_ui.js`. **Restart ComfyUI and hard refresh.**
 
 ---
 
@@ -660,4 +660,72 @@ bundle exactly as upstream wrote it.
 
 ### Scope
 
-`web/minimax_h3_easy_ui.js` only. **Hard refresh the browser.**
+`web/minimax_h3_easy_f_ui.js` only. **Hard refresh the browser.**
+
+---
+
+## Frontend file name and prompt editor globals
+
+This fork's frontend is `web/minimax_h3_easy_f_ui.js`. Upstream calls it
+`minimax_h3_easy_ui.js`; the two are the same file and `WEB_DIRECTORY = "./web"`
+serves every `.js` in the directory, so nothing references the name from Python.
+The rename and the flag renames below both exist for the same reason, described
+at the end of this section.
+
+### Undo shield globals
+
+The prompt editor's undo shield installs two process-wide guards: a `window`
+keydown capture listener (`ensurePromptUndoRedoShield`) and a wrapper around
+`LGraphCanvas.prototype.processKey` (`patchLiteGraphPromptProcessKey`). Both are
+installed once per page and guarded by flags on `globalThis`.
+
+Those flags were named `__H3_PROMPT_UNDO_SHIELD_INSTALLED`,
+`__H3_PROMPT_UNDO_VERSION` and `__H3_PROMPT_PROCESS_KEY_PATCHED` — generic
+enough that another extension shipping a derivative of this editor sets the same
+flags. `ComfyUI-MiniMax-H3-Studio`'s `web/h3studio_ui.js` does exactly that: it
+is this file with its identifiers renamed `h3` → `h3s`, and these three globals
+were missed in that rename.
+
+The effect is decided by whichever pack builds a prompt editor first, because
+the shield is installed lazily when the editor is created. The pack that loses
+the race never installs its shield, and the winner's shield only recognises its
+own editor class (`.h3-prompt-editor` here, `.h3s-prompt-editor` there), so it
+delegates to LiteGraph. `Ctrl+Z` typed inside the losing pack's prompt editor
+then undoes the *graph* instead of the text.
+
+The three flags are therefore now `__MINIMAX_H3_EASY_PROMPT_UNDO_SHIELD_INSTALLED`,
+`__MINIMAX_H3_EASY_PROMPT_UNDO_VERSION` and
+`__MINIMAX_H3_EASY_PROMPT_PROCESS_KEY_PATCHED`. Both shields then install and
+each one handles its own editor. Nothing else about the undo behaviour changes,
+and the flags are read nowhere else — they exist only to make the two
+installations idempotent.
+
+This is defensive naming, not an endorsement of coexistence. The two extensions
+still double-wrap `app.graphToPrompt`, `canvas.drawConnections`,
+`canvas.processMouseDown` and `canvas.linkConnector.events.dispatch`, and each
+keeps its own one-second editor-theme interval. Those wrappers are scoped to
+their own node types, so they cost work rather than correctness.
+
+### Why the file is named differently
+
+`ComfyUI-MiniMax-H3-Studio` ships a `prestartup_script.py` that walks the whole
+`custom_nodes/` tree and renames any file called `minimax_h3_easy_ui.js` to
+`minimax_h3_easy_ui.js.h3studio-disabled`. It runs on every ComfyUI start, before
+any node is registered, and it looks at nothing but the file name — the graph,
+the installed nodes and whether either pack is used play no part. The Python
+nodes keep loading, so the node still appears with its whole frontend gone.
+
+Matching that name is what triggers it, so this fork does not use it. Two other
+ways out, if the file ever has to be called `minimax_h3_easy_ui.js` again:
+setting `H3STUDIO_QUARANTINE_LEGACY_EASY_UI=0` in ComfyUI's environment turns
+the quarantine off entirely, and a file already renamed can be restored by
+dropping the `.h3studio-disabled` suffix.
+
+An installation that ran an older revision of this fork may still hold a stale
+`web/minimax_h3_easy_ui.js.h3studio-disabled`. It is not served and can be
+deleted.
+
+### Scope
+
+`web/minimax_h3_easy_f_ui.js` only, and it supersedes no upstream section. **Hard
+refresh the browser.**

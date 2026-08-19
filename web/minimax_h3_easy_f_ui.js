@@ -3079,9 +3079,9 @@ function handlePromptHistoryBeforeInputCapture(event) {
 }
 
 function ensurePromptUndoRedoShield() {
-    if (globalThis.__H3_PROMPT_UNDO_SHIELD_INSTALLED || typeof window === "undefined") return;
-    globalThis.__H3_PROMPT_UNDO_SHIELD_INSTALLED = true;
-    globalThis.__H3_PROMPT_UNDO_VERSION = PROMPT_UNDO_VERSION;
+    if (globalThis.__MINIMAX_H3_EASY_PROMPT_UNDO_SHIELD_INSTALLED || typeof window === "undefined") return;
+    globalThis.__MINIMAX_H3_EASY_PROMPT_UNDO_SHIELD_INSTALLED = true;
+    globalThis.__MINIMAX_H3_EASY_PROMPT_UNDO_VERSION = PROMPT_UNDO_VERSION;
     window.addEventListener("keydown", handlePromptUndoRedoCapture, true);
     window.addEventListener("pointerdown", (event) => {
         const editor = event?.target?.closest?.(".h3-prompt-editor");
@@ -3095,11 +3095,11 @@ function ensurePromptUndoRedoShield() {
 }
 
 function patchLiteGraphPromptProcessKey() {
-    if (globalThis.__H3_PROMPT_PROCESS_KEY_PATCHED || !globalThis.LGraphCanvas?.prototype) return;
+    if (globalThis.__MINIMAX_H3_EASY_PROMPT_PROCESS_KEY_PATCHED || !globalThis.LGraphCanvas?.prototype) return;
     const proto = globalThis.LGraphCanvas.prototype;
     const originalProcessKey = proto.processKey;
     if (typeof originalProcessKey !== "function") return;
-    globalThis.__H3_PROMPT_PROCESS_KEY_PATCHED = true;
+    globalThis.__MINIMAX_H3_EASY_PROMPT_PROCESS_KEY_PATCHED = true;
     proto.processKey = function processKeyH3PromptEditorShield(event) {
         const node = editorPromptNode(editorFromEvent(event));
         if (node && isPromptUndoRedoEvent(event)) {
