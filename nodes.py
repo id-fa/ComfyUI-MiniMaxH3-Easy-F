@@ -19,6 +19,7 @@ import json
 import mimetypes
 import tempfile
 import urllib.parse
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
@@ -27,6 +28,7 @@ from typing import Any
 import torch
 import torchaudio
 import requests
+import psutil
 
 import comfy.model_management
 import folder_paths
@@ -116,6 +118,10 @@ MAX_AUDIOS = 3
 MEDIA_BUNDLE_TYPE = "MINIMAX_H3_MEDIA_BUNDLE"
 MIN_SECONDS = 0.2
 MAX_SECONDS = 30.0
+REFERENCE_VIDEO_CACHE_MAX_ENTRIES = 2
+REFERENCE_VIDEO_CACHE_HARD_LIMIT_BYTES = 2 * 1024 ** 3
+REFERENCE_VIDEO_CACHE_RESERVE_BYTES = 2 * 1024 ** 3
+REFERENCE_VIDEO_CACHE_AVAILABLE_FRACTION = 0.125
 PROMPT_GUIDES_DIR = os.path.join(os.path.dirname(__file__), "prompt_guides")
 PROMPT_GUIDE_MANIFEST = os.path.join(PROMPT_GUIDES_DIR, "manifest.json")
 PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
@@ -1509,10 +1515,207 @@ def _audio_sample_rate(audio: Mapping) -> int:
     return int(audio.get("sample_rate") or audio.get("samplerate") or audio.get("sampler_rate") or 32000)
 
 
+@dataclass(frozen=True)
+class _ReferenceVideoCacheEntry:
+    """One file-backed VIDEO decoded into reusable CPU components."""
+
+    frames: torch.Tensor
+    audio: Mapping | None
+    fps: float
+    byte_size: int
+
+
+_REFERENCE_VIDEO_CACHE_LOCK = threading.RLock()
+_REFERENCE_VIDEO_CACHE: OrderedDict[tuple[str, int, int, float, float], _ReferenceVideoCacheEntry] = OrderedDict()
+_REFERENCE_VIDEO_CACHE_BYTES = 0
+_REFERENCE_VIDEO_CACHE_SCOPE: tuple[tuple[str, int, int, float, float], ...] | None = None
+
+
+def _tensor_bytes(value: Any) -> int:
+    if not isinstance(value, torch.Tensor):
+        return 0
+    return int(value.numel()) * int(value.element_size())
+
+
+def _reference_video_cache_bytes(frames: torch.Tensor, audio: Mapping | None) -> int:
+    waveform = audio.get("waveform") if isinstance(audio, Mapping) else None
+    return _tensor_bytes(frames) + _tensor_bytes(waveform)
+
+
+def _reference_video_cache_budget_bytes() -> int:
+    """Reserve most free RAM for ComfyUI and keep this cache deliberately small."""
+    try:
+        # Add our retained entries back before calculating the cap. Otherwise a
+        # successful cache insert would lower ``available`` enough to evict
+        # itself on the next run, even when no other process used more memory.
+        available = int(psutil.virtual_memory().available) + _REFERENCE_VIDEO_CACHE_BYTES
+    except Exception:
+        return 0
+    if available <= REFERENCE_VIDEO_CACHE_RESERVE_BYTES:
+        return 0
+    return min(
+        REFERENCE_VIDEO_CACHE_HARD_LIMIT_BYTES,
+        int((available - REFERENCE_VIDEO_CACHE_RESERVE_BYTES) * REFERENCE_VIDEO_CACHE_AVAILABLE_FRACTION),
+    )
+
+
+def _reference_video_cache_key(value: Any) -> tuple[str, int, int, float, float] | None:
+    """Identify only stable, local file VIDEO inputs without hashing media bytes."""
+    if not hasattr(value, "get_stream_source"):
+        return None
+    try:
+        source = value.get_stream_source()
+        if not isinstance(source, (str, os.PathLike)):
+            return None
+        path = os.path.normcase(os.path.realpath(os.fspath(source)))
+        stat = os.stat(path)
+        start_time, duration = (0.0, 0.0)
+        if hasattr(value, "get_active_trim_window"):
+            start_time, duration = value.get_active_trim_window()
+        return (
+            path,
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            round(float(start_time), 6),
+            round(float(duration), 6),
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _cache_entry_on_cpu(frames: torch.Tensor, audio: Mapping | None, fps: float) -> _ReferenceVideoCacheEntry:
+    cached_frames = frames.detach().to(device="cpu").contiguous() if frames.device.type != "cpu" else frames
+    cached_audio: Mapping | None = audio
+    waveform = audio.get("waveform") if isinstance(audio, Mapping) else None
+    if isinstance(waveform, torch.Tensor) and waveform.device.type != "cpu":
+        cached_audio = dict(audio)
+        cached_audio["waveform"] = waveform.detach().to(device="cpu").contiguous()
+    return _ReferenceVideoCacheEntry(
+        frames=cached_frames,
+        audio=cached_audio,
+        fps=fps,
+        byte_size=_reference_video_cache_bytes(cached_frames, cached_audio),
+    )
+
+
+def _remove_reference_video_cache_entry(key: tuple[str, int, int, float, float]) -> None:
+    global _REFERENCE_VIDEO_CACHE_BYTES
+    entry = _REFERENCE_VIDEO_CACHE.pop(key, None)
+    if entry is not None:
+        _REFERENCE_VIDEO_CACHE_BYTES = max(0, _REFERENCE_VIDEO_CACHE_BYTES - entry.byte_size)
+
+
+def _prune_reference_video_cache(budget: int) -> None:
+    while _REFERENCE_VIDEO_CACHE and (
+        len(_REFERENCE_VIDEO_CACHE) > REFERENCE_VIDEO_CACHE_MAX_ENTRIES
+        or _REFERENCE_VIDEO_CACHE_BYTES > budget
+    ):
+        oldest_key = next(iter(_REFERENCE_VIDEO_CACHE))
+        _remove_reference_video_cache_entry(oldest_key)
+
+
+def _get_reference_video_cache_entry(
+    key: tuple[str, int, int, float, float],
+) -> tuple[_ReferenceVideoCacheEntry | None, int, bool]:
+    """Return a cache hit plus its current memory budget and file invalidation state."""
+    with _REFERENCE_VIDEO_CACHE_LOCK:
+        budget = _reference_video_cache_budget_bytes()
+        _prune_reference_video_cache(budget)
+        invalidated = False
+        for cached_key in tuple(_REFERENCE_VIDEO_CACHE):
+            if cached_key[0] == key[0] and cached_key[1:3] != key[1:3]:
+                _remove_reference_video_cache_entry(cached_key)
+                invalidated = True
+        entry = _REFERENCE_VIDEO_CACHE.pop(key, None)
+        if entry is not None:
+            _REFERENCE_VIDEO_CACHE[key] = entry
+        return entry, budget, invalidated
+
+
+def _store_reference_video_cache_entry(
+    key: tuple[str, int, int, float, float], entry: _ReferenceVideoCacheEntry
+) -> bool:
+    global _REFERENCE_VIDEO_CACHE_BYTES
+    with _REFERENCE_VIDEO_CACHE_LOCK:
+        budget = _reference_video_cache_budget_bytes()
+        _prune_reference_video_cache(budget)
+        if not entry.byte_size or entry.byte_size > budget:
+            return False
+        _remove_reference_video_cache_entry(key)
+        while _REFERENCE_VIDEO_CACHE and (
+            len(_REFERENCE_VIDEO_CACHE) >= REFERENCE_VIDEO_CACHE_MAX_ENTRIES
+            or _REFERENCE_VIDEO_CACHE_BYTES + entry.byte_size > budget
+        ):
+            oldest_key = next(iter(_REFERENCE_VIDEO_CACHE))
+            _remove_reference_video_cache_entry(oldest_key)
+        _REFERENCE_VIDEO_CACHE[key] = entry
+        _REFERENCE_VIDEO_CACHE_BYTES += entry.byte_size
+        return True
+
+
+def _reference_video_cache_label(key: tuple[str, int, int, float, float]) -> str:
+    return os.path.basename(key[0]) or key[0]
+
+
+def _sync_reference_video_cache_scope(items: list[_MediaInput]) -> None:
+    """Keep only videos used by the current Easy run.
+
+    The scope is updated before conditioning starts, so removing or replacing
+    a reference video releases the previous decoded tensors on that run.
+    """
+    global _REFERENCE_VIDEO_CACHE_SCOPE
+    current = tuple(sorted(
+        key
+        for item in items
+        if item.media_type == "video"
+        for key in (_reference_video_cache_key(item.value),)
+        if key is not None
+    ))
+    with _REFERENCE_VIDEO_CACHE_LOCK:
+        if current == _REFERENCE_VIDEO_CACHE_SCOPE:
+            return
+        removed = 0
+        for key in tuple(_REFERENCE_VIDEO_CACHE):
+            if key not in current:
+                _remove_reference_video_cache_entry(key)
+                removed += 1
+        previous = _REFERENCE_VIDEO_CACHE_SCOPE
+        _REFERENCE_VIDEO_CACHE_SCOPE = current
+    if removed:
+        if not current:
+            print(f"[MiniMax H3 Easy] Reference video decode cache cleared: {removed} old video(s)")
+        else:
+            print(f"[MiniMax H3 Easy] Reference video decode cache switched: cleared {removed} old video(s)")
+    elif previous is not None and previous != current:
+        print("[MiniMax H3 Easy] Reference video decode cache scope changed")
+
+
 def _video_parts(value: Any) -> tuple[torch.Tensor, dict | None, float]:
     if hasattr(value, "get_components"):
+        key = _reference_video_cache_key(value)
+        if key is not None:
+            cached, budget, invalidated = _get_reference_video_cache_entry(key)
+            label = _reference_video_cache_label(key)
+            if cached is not None:
+                print(f"[MiniMax H3 Easy] Reference video decode cache hit: {label}")
+                return cached.frames, cached.audio, cached.fps
+            if invalidated:
+                print(f"[MiniMax H3 Easy] Reference video decode cache invalidated: {label}")
+            print(f"[MiniMax H3 Easy] Reference video decode cache miss: {label}")
         components = value.get_components()
-        return components.images, components.audio, float(components.frame_rate or 24.0)
+        frames = components.images
+        audio = components.audio
+        fps = float(components.frame_rate or 24.0)
+        if key is not None and isinstance(frames, torch.Tensor):
+            entry = _cache_entry_on_cpu(frames, audio, fps)
+            if _store_reference_video_cache_entry(key, entry):
+                print(f"[MiniMax H3 Easy] Reference video decode cache stored: {label}")
+            else:
+                print(
+                    "[MiniMax H3 Easy] Reference video decode cache skipped-too-large: "
+                    f"{label} ({entry.byte_size / (1024 ** 2):.0f} MiB; budget {budget / (1024 ** 2):.0f} MiB)"
+                )
+        return frames, audio, fps
     if isinstance(value, Mapping):
         frames = value.get("images")
         if frames is None:
@@ -1845,6 +2048,7 @@ class MiniMaxH3Easy:
         seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(seconds)))
         length = _frame_length(seconds, fps)
         items = cls._collect_media(kwargs)
+        _sync_reference_video_cache_scope(items)
         optimization = _optimize_prompt_on_run(
             prompt,
             mode,
