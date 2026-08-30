@@ -2,9 +2,14 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const NODE_CLASS = "MiniMaxH3Easy";
+const CONTEXT_SEGMENTS_CLASS = "MiniMaxH3EasyContextSegments";
 const LOADER_CLASS = "MiniMaxH3EasyLoader";
 const ADAPTER_CLASS = "MiniMaxH3EasyModelAdapter";
+const MEDIA_LOADER_CLASS = "MiniMaxH3EasyMediaLoader";
 const MEDIA_BRIDGE_CLASS = "MiniMaxH3EasyMediaBridge";
+const SEGMENT_RENDER_CLASS = "MiniMaxH3EasySegmentRender";
+const SEGMENT_REFINE_CLASS = "MiniMaxH3EasySegmentRefine";
+const SEGMENT_DECODE_CLASS = "MiniMaxH3EasySegmentDecode";
 const OUTPUT_CLASS = "MiniMaxH3EasyOutput";
 const LINKS_PROP = "minimax_h3_virtual_media_links";
 const PROMPT_DOC_PROP = "minimax_h3_prompt_reference_doc";
@@ -42,6 +47,16 @@ const PROMPT_GUIDES = [
 ];
 const MODE_IMAGE = "image";
 const MODE_REFERENCE = "reference";
+const MODE_DIGITAL_HUMAN = "digital_human";
+const MODE_SEGMENTS = "context_segments";
+const CONTEXT_AUDIO_GENERATED = "generated";
+const CONTINUITY_GUIDE = "guide";
+const CONTINUITY_LATENT = "latent_guide";
+const CONTINUITY_SOFT_AV = "soft_av";
+const CONTINUITY_HARD_AV = "hard_av";
+const GUIDE_CONTEXT_FRAME_GRID = Object.freeze([5, 22, 39, 56, 73]);
+const AV_CONTEXT_FRAME_GRID = Object.freeze([39, 90, 141]);
+const AV_CONTINUITY_MODES = new Set([CONTINUITY_SOFT_AV, CONTINUITY_HARD_AV]);
 const KEYFRAME_FIRST = "first";
 const RESOLUTION_CUSTOM = "custom";
 const REF_IMAGE_MATCH = "match";
@@ -50,11 +65,24 @@ const REF_IMAGE_15K = "1.5k";
 const REF_IMAGE_2K = "2k";
 const REF_IMAGE_ORIGINAL = "original";
 const MAX_MEDIA = 15;
+const MAX_IMAGES = 9;
+const MAX_VIDEOS = 3;
+const MAX_AUDIOS = 3;
+const SEGMENT_MAX_COUNT = 30;
+const SEGMENT_MAX_MEDIA = MAX_MEDIA * 3;
+const SEGMENT_MAX_IMAGES = MAX_IMAGES * 3;
+const SEGMENT_MAX_VIDEOS = MAX_VIDEOS * 3;
+const SEGMENT_MAX_AUDIOS = MAX_AUDIOS * 3;
 const MEDIA_BUNDLE_TYPE = "MINIMAX_H3_MEDIA_BUNDLE";
 const MEDIA_BRIDGE_GROUPS = Object.freeze([
-    { type: "image", count: "image_count", max: 9 },
-    { type: "video", count: "video_count", max: 3 },
-    { type: "audio", count: "audio_count", max: 3 },
+    { type: "image", count: "image_count", max: MAX_IMAGES },
+    { type: "video", count: "video_count", max: MAX_VIDEOS },
+    { type: "audio", count: "audio_count", max: MAX_AUDIOS },
+]);
+const MEDIA_LOADER_GROUPS = Object.freeze([
+    { type: "image", key: "images" },
+    { type: "audio", key: "audios" },
+    { type: "video", key: "videos" },
 ]);
 const MIN_SECONDS = 0.2;
 const MAX_SECONDS = 30;
@@ -107,9 +135,22 @@ const TEXT = {
     loaderTitle: ZH_BROWSER ? "MiniMax H3 Easy \u52a0\u8f7d\u5668" : "MiniMax H3 Easy Loader",
     adapterTitle: ZH_BROWSER ? "MiniMax H3 Easy \u6a21\u578b\u4e2d\u8f6c" : "MiniMax H3 Easy Model Bridge",
     mediaBridgeTitle: ZH_BROWSER ? "MiniMax H3 Easy \u5a92\u4f53\u4e2d\u8f6c" : "MiniMax H3 Easy Media Bridge",
+    mediaLoaderTitle: ZH_BROWSER ? "MiniMax H3 Easy \u5a92\u4f53\u52a0\u8f7d\u5668" : "MiniMax H3 Easy Media Loader",
+    mediaLoaderMenuTitle: ZH_BROWSER ? "\u5a92\u4f53\u52a0\u8f7d\u5668" : "Media Loader",
+    mediaLoaderAll: ZH_BROWSER ? "\u5a92\u4f53\u8d44\u6e90" : "Media resources",
+    mediaLoaderImages: ZH_BROWSER ? "\u56fe\u7247" : "Images",
+    mediaLoaderAudio: ZH_BROWSER ? "\u97f3\u9891" : "Audio",
+    mediaLoaderVideos: ZH_BROWSER ? "\u89c6\u9891" : "Videos",
+    mediaLoaderUpload: ZH_BROWSER ? "\u4e0a\u4f20\u5a92\u4f53" : "Upload media",
+    mediaLoaderReplace: ZH_BROWSER ? "\u66ff\u6362" : "Replace",
+    mediaLoaderRemove: ZH_BROWSER ? "\u5220\u9664" : "Remove",
+    mediaLoaderEmpty: ZH_BROWSER ? "\u6682\u65e0\u5a92\u4f53" : "No media",
+    mediaLoaderLimit: ZH_BROWSER ? "\u5df2\u8fbe\u8be5\u5206\u533a\u4e0a\u9650" : "This section is full",
+    mediaLoaderUnsupported: ZH_BROWSER ? "\u53ea\u652f\u6301\u56fe\u7247\u3001\u97f3\u9891\u6216\u89c6\u9891\u6587\u4ef6" : "Only image, audio, and video files are supported",
     outputTitle: ZH_BROWSER ? "MiniMax H3 Easy \u8f93\u51fa" : "MiniMax H3 Easy Output",
     category: "MiniMax H3 Easy",
     mode: ZH_BROWSER ? "\u6a21\u5f0f" : "Mode",
+    audioMode: ZH_BROWSER ? "\u97f3\u9891\u6a21\u5f0f" : "Audio mode",
     prompt: ZH_BROWSER ? "\u63d0\u793a\u8bcd" : "Prompt",
     resolution: ZH_BROWSER ? "\u5206\u8fa8\u7387" : "Resolution",
     aspectRatio: ZH_BROWSER ? "\u5bbd\u9ad8\u6bd4" : "Aspect ratio",
@@ -119,6 +160,8 @@ const TEXT = {
     advanced: ZH_BROWSER ? "\u9ad8\u7ea7\u9009\u9879" : "Advanced options",
     promptOptimizerSettings: ZH_BROWSER ? "\u6253\u5f00\u63d0\u793a\u8bcd\u4f18\u5316 API \u8bbe\u7f6e" : "Optimizer settings",
     promptOptimizerSceneGuide: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u65b9\u6848" : "Prompt Guide",
+    contextPromptOptimizerMode: ZH_BROWSER ? "\u4f18\u5316\u65b9\u5f0f" : "Context optimization mode",
+    contextPromptOptimizerConcurrency: ZH_BROWSER ? "\u5e76\u53d1\u6570" : "Optimization concurrency",
     fps: ZH_BROWSER ? "\u5e27\u7387 (FPS)" : "Frame rate (FPS)",
     keyframeRole: ZH_BROWSER ? "\u9996\u5c3e\u5e27\u8bbe\u7f6e" : "First/last frame setup",
     refImageSize: ZH_BROWSER ? "\u53c2\u8003\u56fe\u5c3a\u5bf8" : "Reference size",
@@ -138,17 +181,41 @@ const TEXT = {
     outputVideoVae: "Video VAE",
     outputAudioVae: "Audio VAE",
     outputFps: "FPS",
+    drivingAudio: ZH_BROWSER ? "\u9a71\u52a8\u97f3\u9891" : "Driving audio",
     outputContext: "H3 Context",
-    inputMedia: "Media",
+     inputMedia: "Media",
     mediaBundle: ZH_BROWSER ? "\u5a92\u4f53\u5305" : "Media bundle",
     imageCount: ZH_BROWSER ? "\u56fe\u7247\u6570\u91cf" : "Image count",
     videoCount: ZH_BROWSER ? "\u89c6\u9891\u6570\u91cf" : "Video count",
     audioCount: ZH_BROWSER ? "\u97f3\u9891\u6570\u91cf" : "Audio count",
+    seedLabel: "Seed",
+    segmentRenderTitle: ZH_BROWSER ? "MiniMax H3 Easy \u5206\u6bb5\u91c7\u6837" : "MiniMax H3 Easy Segment Sample",
+    segmentRefineTitle: ZH_BROWSER ? "MiniMax H3 Easy \u5206\u6bb5\u4e8c\u91c7" : "MiniMax H3 Easy Segment Refine",
+    segmentDecodeTitle: ZH_BROWSER ? "MiniMax H3 Easy \u5206\u6bb5\u89e3\u7801" : "MiniMax H3 Easy Segment Decode",
+    contextSegmentsTitle: ZH_BROWSER ? "MiniMax H3 Easy \u4e0a\u4e0b\u6587\u5206\u6bb5" : "MiniMax H3 Easy Context Segments",
+    segmentSeconds: ZH_BROWSER ? "\u5206\u6bb5\u79d2\u6570" : "Segment seconds",
+    segmentSecondsHint: ZH_BROWSER ? "\u9017\u53f7\u5206\u9694\u6bcf\u6bb5\u65f6\u957f\uff0c\u4f8b\u5982 10,8,5" : "Comma separated seconds per segment, e.g. 10,8,5",
+     contextLength: ZH_BROWSER ? "\u4e0a\u4e0b\u6587\u5e27\u6570" : "Context frames",
+    continuityMode: ZH_BROWSER ? "\u8fde\u7eed\u65b9\u5f0f" : "Continuity mode",
+    segmentResult: ZH_BROWSER ? "\u5206\u6bb5\u7ed3\u679c" : "Segments",
+    segmentPreview: ZH_BROWSER ? "\u9884\u89c8" : "Preview",
+    refineMode: ZH_BROWSER ? "\u4e8c\u91c7\u653e\u5927\u6a21\u5f0f" : "Refine mode",
+    refineExecution: ZH_BROWSER ? "\u4e8c\u91c7\u6267\u884c\u65b9\u5f0f" : "Refine execution",
+    tileWidth: ZH_BROWSER ? "Tile \u5bbd\u5ea6" : "Tile width",
+    tileHeight: ZH_BROWSER ? "Tile \u9ad8\u5ea6" : "Tile height",
+    tileOverlap: ZH_BROWSER ? "Tile \u91cd\u53e0\u533a" : "Tile overlap",
+    tileFade: ZH_BROWSER ? "Tile \u63a5\u7f1d\u6e10\u53d8" : "Tile seam fade",
 };
 const OPTION_DEFS = {
     mode: {
         [MODE_IMAGE]: ZH_BROWSER ? "\u56fe\u751f\u6216\u9996\u5c3e\u5e27" : "I2V or First/Last Frame",
         [MODE_REFERENCE]: ZH_BROWSER ? "\u53c2\u8003\u751f\u89c6\u9891" : "Reference-to-video",
+        [MODE_DIGITAL_HUMAN]: ZH_BROWSER ? "\u6570\u5b57\u4eba" : "Digital Human",
+        [MODE_SEGMENTS]: ZH_BROWSER ? "\u4e0a\u4e0b\u6587\u5206\u6bb5" : "Context Segments",
+    },
+    audio_mode: {
+        [CONTEXT_AUDIO_GENERATED]: ZH_BROWSER ? "\u9ed8\u8ba4" : "Default",
+        [MODE_DIGITAL_HUMAN]: ZH_BROWSER ? "\u6570\u5b57\u4eba" : "Digital Human",
     },
     keyframe_role: {
         first: ZH_BROWSER ? "\u9996\u5e27\u4f18\u5148" : "First frame priority",
@@ -165,6 +232,20 @@ const OPTION_DEFS = {
         filename: ZH_BROWSER ? "\u6309\u6587\u4ef6\u540d" : "By filename",
         index: ZH_BROWSER ? "\u6309\u5e8f\u53f7" : "By index",
     },
+    refine_execution: {
+        whole_segment: "Standard",
+        tiled_low_vram: "Low VRAM Tile",
+    },
+    refine_mode: {
+        pixel_resize: "Pixel Resize",
+        latent_upscale: "Latent Upscale",
+    },
+    continuity_mode: {
+        [CONTINUITY_LATENT]: "Latent Guide",
+        [CONTINUITY_GUIDE]: "RGB Guide",
+        [CONTINUITY_SOFT_AV]: "Soft AV Prefix",
+        [CONTINUITY_HARD_AV]: "Hard AV Prefix",
+    },
     prompt_optimizer_api_format: {
         openai: ZH_BROWSER ? "OpenAI \u517c\u5bb9" : "OpenAI Compatible",
         responses: "OpenAI Responses",
@@ -173,6 +254,10 @@ const OPTION_DEFS = {
     },
     prompt_optimizer_scene_guide: {
         none: ZH_BROWSER ? "\u4ec5\u901a\u7528\u65b9\u6848" : "General only",
+    },
+    context_prompt_optimizer_mode: {
+        whole_sequence: ZH_BROWSER ? "\u6574\u4f53\u4f18\u5316" : "Whole sequence",
+        per_segment: ZH_BROWSER ? "\u9010\u6bb5\u4f18\u5316" : "Per segment",
     },
     resolution: {
         "360P": "360P",
@@ -208,6 +293,20 @@ const OPTION_ALIASES = {
         [MODE_REFERENCE]: MODE_REFERENCE,
         "\u53c2\u8003\u751f\u89c6\u9891": MODE_REFERENCE,
         "Reference-to-video": MODE_REFERENCE,
+        [MODE_DIGITAL_HUMAN]: MODE_DIGITAL_HUMAN,
+        "\u6570\u5b57\u4eba": MODE_DIGITAL_HUMAN,
+        "Digital Human": MODE_DIGITAL_HUMAN,
+        [MODE_SEGMENTS]: MODE_SEGMENTS,
+        "\u4e0a\u4e0b\u6587\u5206\u6bb5": MODE_SEGMENTS,
+        "Context Segments": MODE_SEGMENTS,
+    },
+    audio_mode: {
+        [CONTEXT_AUDIO_GENERATED]: CONTEXT_AUDIO_GENERATED,
+        "\u751f\u6210\u97f3\u9891": CONTEXT_AUDIO_GENERATED,
+        "Generated Audio": CONTEXT_AUDIO_GENERATED,
+        [MODE_DIGITAL_HUMAN]: MODE_DIGITAL_HUMAN,
+        "\u6570\u5b57\u4eba\uff08Media \u97f3\u9891\u9a71\u52a8\uff09": MODE_DIGITAL_HUMAN,
+        "Digital Human (Media Audio Drive)": MODE_DIGITAL_HUMAN,
     },
     keyframe_role: {
         first: "first",
@@ -245,6 +344,14 @@ const OPTION_ALIASES = {
         index: "index",
         "\u6309\u5e8f\u53f7": "index",
         "By index": "index",
+    },
+    context_prompt_optimizer_mode: {
+        whole_sequence: "whole_sequence",
+        "\u6574\u4f53\u4f18\u5316": "whole_sequence",
+        "Whole sequence": "whole_sequence",
+        per_segment: "per_segment",
+        "\u9010\u6bb5\u4f18\u5316": "per_segment",
+        "Per segment": "per_segment",
     },
 };
 const COLOR_IMAGE = "#5aa9f0";
@@ -296,7 +403,16 @@ function nodeMatchesClass(node, className, displayName, installedMarker) {
 }
 
 function isTarget(node) {
-    return nodeMatchesClass(node, NODE_CLASS, TEXT.mainTitle, "__h3EasyNodeInstalled");
+    return nodeMatchesClass(node, NODE_CLASS, TEXT.mainTitle, "__h3EasyNodeInstalled")
+        || nodeMatchesClass(node, CONTEXT_SEGMENTS_CLASS, TEXT.contextSegmentsTitle, "__h3ContextSegmentsNodeInstalled");
+}
+
+function isContextSegmentsNode(node) {
+    return nodeMatchesClass(node, CONTEXT_SEGMENTS_CLASS, TEXT.contextSegmentsTitle, "__h3ContextSegmentsNodeInstalled");
+}
+
+function isSegmentRefineNode(node) {
+    return nodeMatchesClass(node, SEGMENT_REFINE_CLASS, TEXT.segmentRefineTitle, "__h3SegmentRefineInstalled");
 }
 
 function isLoader(node) {
@@ -311,8 +427,12 @@ function isMediaBridge(node) {
     return nodeMatchesClass(node, MEDIA_BRIDGE_CLASS, TEXT.mediaBridgeTitle, "__h3EasyMediaBridgeInstalled");
 }
 
+function isMediaLoader(node) {
+    return nodeMatchesClass(node, MEDIA_LOADER_CLASS, TEXT.mediaLoaderTitle, "__h3EasyMediaLoaderInstalled");
+}
+
 function isMediaBridgeOutput(node, sourceSlot = 0, sourceType = "") {
-    if (isMediaBridge(node)) return true;
+    if (isMediaBridge(node) || isMediaLoader(node)) return true;
     const output = node?.outputs?.[Number(sourceSlot) || 0] || {};
     const type = String(sourceType || output.type || "").trim().toUpperCase();
     return type === MEDIA_BUNDLE_TYPE || String(output.name || "").toLowerCase() === "media_bundle";
@@ -500,7 +620,7 @@ function canonicalPromptGuide(value) {
     return found?.value || "none";
 }
 
-function localizeComboWidget(widget) {
+function localizeComboWidget(widget, node = null) {
     const name = String(widget?.name || "");
     if (name === "prompt_optimizer_scene_guide") {
         const current = canonicalPromptGuide(widget?.value);
@@ -510,7 +630,16 @@ function localizeComboWidget(widget) {
         widget.__h3PromptGuideLocalized = true;
         return;
     }
-    const definition = OPTION_DEFS[name];
+    let definition = OPTION_DEFS[name];
+    if (name === "mode" && node) {
+        definition = isContextSegmentsNode(node)
+            ? { [MODE_SEGMENTS]: OPTION_DEFS.mode[MODE_SEGMENTS] }
+            : {
+                [MODE_IMAGE]: OPTION_DEFS.mode[MODE_IMAGE],
+                [MODE_REFERENCE]: OPTION_DEFS.mode[MODE_REFERENCE],
+                [MODE_DIGITAL_HUMAN]: OPTION_DEFS.mode[MODE_DIGITAL_HUMAN],
+            };
+    }
     if (!widget || !definition) return;
     const current = canonicalOption(name, widget.value);
     widget.__h3OptionName = name;
@@ -540,6 +669,13 @@ function setLocalizedSlotLabel(slot, label) {
 
 function localizeNodeInstance(node) {
     if (!node) return;
+    if (isMediaLoader(node)) {
+        node.title = TEXT.mediaLoaderTitle;
+        for (const output of node.outputs || []) {
+            if (String(output.name || "").toLowerCase() === "media_bundle") setLocalizedSlotLabel(output, TEXT.mediaBundle);
+        }
+        return;
+    }
     if (isMediaBridge(node)) {
         node.title = TEXT.mediaBridgeTitle;
         const countLabels = {
@@ -580,19 +716,70 @@ function localizeNodeInstance(node) {
         for (const input of node.inputs || []) {
             if (input.name === "h3_context") setLocalizedSlotLabel(input, TEXT.outputContext);
         }
-        const outputLabels = { positive: TEXT.outputConditioning, latent: TEXT.outputLatent, video_vae: TEXT.outputVideoVae, audio_vae: TEXT.outputAudioVae, fps: TEXT.outputFps };
+        const outputLabels = { positive: TEXT.outputConditioning, latent: TEXT.outputLatent, video_vae: TEXT.outputVideoVae, audio_vae: TEXT.outputAudioVae, fps: TEXT.outputFps, driving_audio: TEXT.drivingAudio };
         for (const output of node.outputs || []) {
             const key = String(output.name || "").toLowerCase();
             if (outputLabels[key]) setLocalizedSlotLabel(output, outputLabels[key]);
         }
         return;
     }
+    if (nodeMatchesClass(node, SEGMENT_RENDER_CLASS, TEXT.segmentRenderTitle, "__h3SegmentRenderInstalled")) {
+        node.title = TEXT.segmentRenderTitle;
+        const widgetLabels = { seed: TEXT.seedLabel };
+        for (const widget of node.widgets || []) {
+            if (widgetLabels[widget.name]) widget.label = widgetLabels[widget.name];
+        }
+        const inputLabels = { h3_context: TEXT.outputContext, model: TEXT.outputModel };
+        for (const input of node.inputs || []) {
+            if (inputLabels[input.name]) setLocalizedSlotLabel(input, inputLabels[input.name]);
+        }
+        const outputLabels = { segments: TEXT.segmentResult };
+        for (const output of node.outputs || []) {
+            if (outputLabels[output.name]) setLocalizedSlotLabel(output, outputLabels[output.name]);
+        }
+        return;
+    }
+    if (nodeMatchesClass(node, SEGMENT_REFINE_CLASS, TEXT.segmentRefineTitle, "__h3SegmentRefineInstalled")) {
+        node.title = TEXT.segmentRefineTitle;
+        const widgetLabels = {
+            refine_mode: TEXT.refineMode,
+            refine_execution: TEXT.refineExecution,
+            tile_width: TEXT.tileWidth,
+            tile_height: TEXT.tileHeight,
+            tile_overlap: TEXT.tileOverlap,
+            tile_fade: TEXT.tileFade,
+        };
+        for (const widget of node.widgets || []) {
+            if (widgetLabels[widget.name]) widget.label = widgetLabels[widget.name];
+            localizeComboWidget(widget, node);
+        }
+        const inputLabels = { h3_context: TEXT.outputContext, segments: TEXT.segmentResult, model: TEXT.outputModel };
+        for (const input of node.inputs || []) {
+            if (inputLabels[input.name]) setLocalizedSlotLabel(input, inputLabels[input.name]);
+        }
+        const outputLabels = { refined_segments: TEXT.segmentResult };
+        for (const output of node.outputs || []) {
+            if (outputLabels[output.name]) setLocalizedSlotLabel(output, outputLabels[output.name]);
+        }
+        return;
+    }
+    if (nodeMatchesClass(node, SEGMENT_DECODE_CLASS, TEXT.segmentDecodeTitle, "__h3SegmentDecodeInstalled")) {
+        node.title = TEXT.segmentDecodeTitle;
+        for (const input of node.inputs || []) {
+            if (input.name === "segments") setLocalizedSlotLabel(input, TEXT.segmentResult);
+        }
+        const outputLabels = { preview: TEXT.segmentPreview };
+        for (const output of node.outputs || []) {
+            if (outputLabels[output.name]) setLocalizedSlotLabel(output, outputLabels[output.name]);
+        }
+        return;
+    }
     if (!isTarget(node)) return;
-    node.title = TEXT.mainTitle;
-    const labels = { mode: TEXT.mode, prompt: TEXT.prompt, resolution: TEXT.resolution, aspect_ratio: TEXT.aspectRatio, width: TEXT.width, height: TEXT.height, seconds: TEXT.seconds, advanced: TEXT.advanced, prompt_optimizer_settings: TEXT.promptOptimizerSettings, prompt_optimizer_scene_guide: TEXT.promptOptimizerSceneGuide, fps: TEXT.fps, keyframe_role: TEXT.keyframeRole, ref_image_size: TEXT.refImageSize, reference_mention_mode: TEXT.referenceMentionMode };
+    node.title = isContextSegmentsNode(node) ? TEXT.contextSegmentsTitle : TEXT.mainTitle;
+    const labels = { mode: TEXT.mode, audio_mode: TEXT.audioMode, prompt: TEXT.prompt, resolution: TEXT.resolution, aspect_ratio: TEXT.aspectRatio, width: TEXT.width, height: TEXT.height, seconds: TEXT.seconds, advanced: TEXT.advanced, prompt_optimizer_settings: TEXT.promptOptimizerSettings, prompt_optimizer_scene_guide: TEXT.promptOptimizerSceneGuide, context_prompt_optimizer_mode: TEXT.contextPromptOptimizerMode, context_prompt_optimizer_concurrency: TEXT.contextPromptOptimizerConcurrency, fps: TEXT.fps, keyframe_role: TEXT.keyframeRole, ref_image_size: TEXT.refImageSize, reference_mention_mode: TEXT.referenceMentionMode, segment_seconds: TEXT.segmentSeconds, context_length: TEXT.contextLength, continuity_mode: TEXT.continuityMode };
     for (const widget of node.widgets || []) {
         if (labels[widget.name]) widget.label = labels[widget.name];
-        localizeComboWidget(widget);
+        localizeComboWidget(widget, node);
     }
     for (const input of node.inputs || []) {
         if (input.name === "h3_bundle") setLocalizedSlotLabel(input, TEXT.bundle);
@@ -606,15 +793,25 @@ function localizeNodeInstance(node) {
 }
 
 function localizeNodeDefinition(nodeData) {
-    if (!nodeData || ![NODE_CLASS, LOADER_CLASS, ADAPTER_CLASS, MEDIA_BRIDGE_CLASS, OUTPUT_CLASS].includes(nodeData.name)) return;
+    if (!nodeData || ![NODE_CLASS, CONTEXT_SEGMENTS_CLASS, LOADER_CLASS, ADAPTER_CLASS, MEDIA_LOADER_CLASS, MEDIA_BRIDGE_CLASS, OUTPUT_CLASS, SEGMENT_RENDER_CLASS, SEGMENT_REFINE_CLASS, SEGMENT_DECODE_CLASS].includes(nodeData.name)) return;
     nodeData.display_name = nodeData.name === LOADER_CLASS
         ? TEXT.loaderTitle
         : nodeData.name === ADAPTER_CLASS
             ? TEXT.adapterTitle
+            : nodeData.name === MEDIA_LOADER_CLASS
+                ? TEXT.mediaLoaderTitle
             : nodeData.name === MEDIA_BRIDGE_CLASS
             ? TEXT.mediaBridgeTitle
             : nodeData.name === OUTPUT_CLASS
             ? TEXT.outputTitle
+            : nodeData.name === SEGMENT_RENDER_CLASS
+            ? TEXT.segmentRenderTitle
+            : nodeData.name === SEGMENT_REFINE_CLASS
+            ? TEXT.segmentRefineTitle
+            : nodeData.name === SEGMENT_DECODE_CLASS
+            ? TEXT.segmentDecodeTitle
+            : nodeData.name === CONTEXT_SEGMENTS_CLASS
+            ? TEXT.contextSegmentsTitle
             : TEXT.mainTitle;
     nodeData.category = TEXT.category;
 }
@@ -640,7 +837,22 @@ function asBoolean(value, fallback = false) {
 }
 
 function isReferenceMode(node) {
-    return canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE)) === MODE_REFERENCE;
+    const mode = canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE));
+    return mode === MODE_REFERENCE || mode === MODE_DIGITAL_HUMAN;
+}
+
+function mediaReferenceMode(node) {
+    return isReferenceMode(node) || isContextSegmentsNode(node);
+}
+
+// Context Segments uses the same media-mention editor as reference mode, but
+// remains a separate execution mode and does not inherit reference-only UI.
+function canUseMediaMentions(node) {
+    return isReferenceMode(node) || isContextSegmentsNode(node);
+}
+
+function isSegmentMode(node) {
+    return canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE)) === MODE_SEGMENTS;
 }
 
 function isCustomResolution(node) {
@@ -729,13 +941,41 @@ function getMediaType(sourceType, sourceNode = null) {
 }
 
 function mediaLimits(node) {
+    if (isContextSegmentsNode(node)) {
+        // The context node owns one media library for the full sequence. Each
+        // prompt block selects its own H3-sized subset, so the library scales
+        // with the maximum thirty blocks instead of the single-shot limit.
+        const digitalAudio = canonicalOption("audio_mode", getWidgetValue(node, "audio_mode", CONTEXT_AUDIO_GENERATED)) === MODE_DIGITAL_HUMAN;
+        return {
+            image: SEGMENT_MAX_IMAGES,
+            video: SEGMENT_MAX_VIDEOS,
+            audio: digitalAudio ? 1 : SEGMENT_MAX_AUDIOS,
+            total: SEGMENT_MAX_MEDIA,
+        };
+    }
+    if (canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE)) === MODE_DIGITAL_HUMAN) {
+        return { image: MAX_IMAGES, video: MAX_VIDEOS, audio: 1, total: MAX_MEDIA };
+    }
     if (!isReferenceMode(node)) {
-        return { image: 2, video: 0, audio: 0, total: 2 };
+        return { image: MAX_IMAGES, video: MAX_VIDEOS, audio: MAX_AUDIOS, total: MAX_MEDIA };
     }
     return { image: 9, video: 3, audio: 3, total: MAX_MEDIA };
 }
 
+function transportMediaLimit(node) {
+    return isContextSegmentsNode(node) ? SEGMENT_MAX_MEDIA : MAX_MEDIA;
+}
+
+function hasVirtualMediaLinks(node) {
+    return isTarget(node) && normalizeLinks(node).length > 0;
+}
+
+function canCreateMediaLoaderFor(node) {
+    return isTarget(node) && !hasVirtualMediaLinks(node) && !getNativeMediaBridgeLink(node);
+}
+
 function canAccept(node, mediaType) {
+    if (!isTarget(node) || getNativeMediaBridgeLink(node)) return false;
     const limits = mediaLimits(node);
     if (!limits[mediaType]) return false;
     const links = ensureLinks(node);
@@ -862,6 +1102,7 @@ function clearConnecting(canvas) {
 
 function addVirtualLink(targetNode, sourceNode, sourceSlot, sourceType, mediaType = null) {
     if (!targetNode || !sourceNode || isSameNode(targetNode, sourceNode)) return false;
+    if (isMediaBridgeOutput(sourceNode, sourceSlot, sourceType) || getNativeMediaBridgeLink(targetNode)) return false;
     const sourceId = Number(sourceNode.id);
     if (!Number.isFinite(sourceId)) return false;
     mediaType ||= getMediaType(sourceType, sourceNode);
@@ -936,24 +1177,41 @@ function getNativeMediaBridgeLink(node) {
     };
 }
 
-function getVirtualMediaBridgeLink(node) {
-    if (!isTarget(node)) return null;
-    const graph = node.graph || app.graph;
-    for (const link of normalizeLinks(node)) {
-        const sourceId = link.source_id ?? link.sourceId;
-        const sourceNode = graph?.getNodeById?.(Number(sourceId));
-        const sourceSlot = Number(link.source_slot ?? link.sourceSlot ?? 0) || 0;
-        const sourceOutput = sourceNode?.outputs?.[sourceSlot] || {};
-        const sourceType = link.source_type || link.sourceType || link.media_type || link.mediaType
-            || sourceOutput.type || "";
-        if (!sourceNode || !isMediaBridgeOutput(sourceNode, sourceSlot, sourceType)) continue;
-        return { source_id: sourceId, source_slot: sourceSlot };
-    }
-    return null;
+function getMediaBridgeLink(node) {
+    return getNativeMediaBridgeLink(node);
 }
 
-function getMediaBridgeLink(node) {
-    return getNativeMediaBridgeLink(node) || getVirtualMediaBridgeLink(node);
+function enforceMediaInputExclusivity(node) {
+    if (!isTarget(node) || !getNativeMediaBridgeLink(node)) return false;
+    const links = ensureLinks(node);
+    if (!links.length) return false;
+    node.properties[LINKS_PROP] = [];
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
+    app.graph?.change?.();
+    requestMentionPreviewRefresh();
+    return true;
+}
+
+function connectionSource(output, originNode, originSlot = 0) {
+    const sourceNode = originNode && typeof originNode === "object"
+        ? originNode
+        : output?.node || output?.origin_node || output?.originNode || null;
+    const parsedSlot = Number(originSlot ?? output?.slot_index ?? output?.slot ?? 0);
+    return {
+        node: sourceNode,
+        slot: Number.isFinite(parsedSlot) ? parsedSlot : 0,
+        type: getSlotType(output),
+    };
+}
+
+function rejectsMixedMediaConnection(targetNode, inputIndex, output, originNode, originSlot) {
+    const input = targetNode?.inputs?.[Number(inputIndex)];
+    if (!isTarget(targetNode) || String(input?.name || "") !== "media") return false;
+    const source = connectionSource(output, originNode, originSlot);
+    if (!source.node) return false;
+    if (isMediaBridgeOutput(source.node, source.slot, source.type)) return hasVirtualMediaLinks(targetNode);
+    return Boolean(getNativeMediaBridgeLink(targetNode));
 }
 
 function convertNativeMediaConnection(targetNode, inputIndex, linkInfo = null) {
@@ -1131,13 +1389,23 @@ function openCreateMenu(canvas, targetNode, event, allowedTypes) {
         setNativeSearchVisualSuppression(false);
         clearTemporaryRenderLink(canvas);
     };
-    const items = allowedTypes.filter((type) => canAccept(targetNode, type)).map((type) => ({
+    const items = [];
+    items.push(...allowedTypes.filter((type) => canAccept(targetNode, type)).map((type) => ({
         content: LOADERS[type].label,
         callback: () => {
             createResourceNode(canvas, targetNode, type, [x, y]);
             finish();
         },
-    }));
+    })));
+    if (canCreateMediaLoaderFor(targetNode)) {
+        items.push({
+            content: TEXT.mediaLoaderMenuTitle,
+            callback: () => {
+                createMediaLoaderNode(canvas, targetNode, [x, y]);
+                finish();
+            },
+        });
+    }
     if (!globalThis.LiteGraph?.ContextMenu || !items.length) {
         deferredCreateMenuPending = false;
         setNativeSearchVisualSuppression(false);
@@ -1189,6 +1457,31 @@ function createResourceNode(canvas, targetNode, mediaType, position) {
     }
     const output = node.outputs?.[slot] || {};
     addVirtualLink(targetNode, node, slot, getSlotType(output) || mediaType.toUpperCase(), mediaType);
+    graph.setDirtyCanvas?.(true, true);
+    return true;
+}
+
+function createMediaLoaderNode(canvas, targetNode, position) {
+    if (!canCreateMediaLoaderFor(targetNode)) return false;
+    const graph = canvas?.graph || app.graph;
+    const LiteGraph = globalThis.LiteGraph;
+    if (!graph || !LiteGraph?.createNode) return false;
+    const node = LiteGraph.createNode(MEDIA_LOADER_CLASS);
+    if (!node) return false;
+    node.pos = [position[0], position[1]];
+    graph.add(node);
+    const outputSlot = node.outputs?.findIndex((output, index) => isMediaBridgeOutput(node, index, getSlotType(output))) ?? -1;
+    const inputSlot = getMediaInputIndex(targetNode);
+    if (outputSlot < 0 || inputSlot < 0) {
+        graph.remove?.(node);
+        return false;
+    }
+    alignNodeOutputToDrop(node, outputSlot, position);
+    const connected = node.connect?.(outputSlot, targetNode, inputSlot);
+    if (!connected) {
+        graph.remove?.(node);
+        return false;
+    }
     graph.setDirtyCanvas?.(true, true);
     return true;
 }
@@ -1489,6 +1782,23 @@ function installQuickCreateCapture(canvas) {
             });
             if (!target) return;
             if (isSameNode(target, pending.sourceNode)) return;
+            if (isMediaBridgeOutput(pending.sourceNode, pending.sourceSlot, pending.sourceType)) {
+                if (!hasVirtualMediaLinks(target)) return;
+                lastCapturedDropAt = performance.now();
+                event.preventDefault?.();
+                event.stopPropagation?.();
+                event.stopImmediatePropagation?.();
+                canvas.linkConnector.reset?.();
+                return;
+            }
+            if (getNativeMediaBridgeLink(target)) {
+                lastCapturedDropAt = performance.now();
+                event.preventDefault?.();
+                event.stopPropagation?.();
+                event.stopImmediatePropagation?.();
+                canvas.linkConnector.reset?.();
+                return;
+            }
             const added = addVirtualLink(target, pending.sourceNode, pending.sourceSlot, pending.sourceType);
             if (!added) return;
             lastCapturedDropAt = performance.now();
@@ -1499,7 +1809,7 @@ function installQuickCreateCapture(canvas) {
             closeNativeNodeSearchSoon();
             return;
         }
-        const allowed = isReferenceMode(pending.targetNode) ? ["image", "video", "audio"] : ["image"];
+        const allowed = mediaReferenceMode(pending.targetNode) ? ["image", "video", "audio"] : ["image"];
         if (scheduleDeferredInputCreateMenu(canvas, event, pending, allowed)) {
             lastCapturedDropAt = performance.now();
         }
@@ -1699,7 +2009,7 @@ function buildRuntimePrompt(node, runtimeLinks) {
             );
         }
         if (index >= 0) return `${RUNTIME_REF_PREFIX}${index + 1}__`;
-        if (!isReferenceMode(node)) return String(part.tag || part.token || "");
+        if (!canUseMediaMentions(node)) return String(part.tag || part.token || "");
         return `${UNRESOLVED_REF_PREFIX}${mediaType}__`;
     }).join("");
 }
@@ -1729,6 +2039,27 @@ function patchGraphToPrompt() {
         const promptData = await original.apply(this, arguments);
         const output = promptData?.output || {};
         for (const node of app.graph?._nodes || []) {
+            // Segment Refine has its own inputs and is intentionally excluded
+            // from the main/context media patch above. Its localized combo
+            // labels still need to be converted back to backend enum values.
+            if (isSegmentRefineNode(node)) {
+                const promptNode = output[String(node.id)];
+                if (!promptNode) continue;
+                promptNode.inputs ||= {};
+                if (!Array.isArray(promptNode.inputs.refine_mode)) {
+                    promptNode.inputs.refine_mode = canonicalOption(
+                        "refine_mode",
+                        getWidgetValue(node, "refine_mode", "pixel_resize"),
+                    );
+                }
+                if (!Array.isArray(promptNode.inputs.refine_execution)) {
+                    promptNode.inputs.refine_execution = canonicalOption(
+                        "refine_execution",
+                        getWidgetValue(node, "refine_execution", "whole_segment"),
+                    );
+                }
+                continue;
+            }
             if (!isTarget(node)) continue;
             const promptNode = output[String(node.id)];
             if (!promptNode) continue;
@@ -1736,7 +2067,7 @@ function patchGraphToPrompt() {
             const mediaBridgeLink = getMediaBridgeLink(node);
             if (mediaBridgeLink) promptNode.inputs.media = [String(mediaBridgeLink.source_id), mediaBridgeLink.source_slot];
             else delete promptNode.inputs.media;
-            for (let index = 1; index <= MAX_MEDIA; index += 1) {
+            for (let index = 1; index <= transportMediaLimit(node); index += 1) {
                 delete promptNode.inputs[`media_${index}`];
                 delete promptNode.inputs[`media_type_${index}`];
             }
@@ -1786,6 +2117,26 @@ function patchGraphToPrompt() {
             promptNode.inputs.keyframe_role = canonicalOption("keyframe_role", getWidgetValue(node, "keyframe_role", KEYFRAME_FIRST));
             promptNode.inputs.ref_image_size = canonicalOption("ref_image_size", getWidgetValue(node, "ref_image_size", REF_IMAGE_1K));
             promptNode.inputs.reference_mention_mode = canonicalOption("reference_mention_mode", getWidgetValue(node, "reference_mention_mode", "index"));
+            if (isContextSegmentsNode(node)) {
+                promptNode.inputs.audio_mode = canonicalOption(
+                    "audio_mode",
+                    getWidgetValue(node, "audio_mode", CONTEXT_AUDIO_GENERATED),
+                );
+                promptNode.inputs.segment_seconds = String(getWidgetValue(node, "segment_seconds", "") || "");
+                promptNode.inputs.context_length = Number(getWidgetValue(node, "context_length", 5)) || 5;
+                promptNode.inputs.continuity_mode = canonicalOption(
+                    "continuity_mode",
+                    getWidgetValue(node, "continuity_mode", CONTINUITY_LATENT),
+                );
+                promptNode.inputs.context_prompt_optimizer_mode = canonicalOption(
+                    "context_prompt_optimizer_mode",
+                    getWidgetValue(node, "context_prompt_optimizer_mode", "whole_sequence"),
+                );
+                promptNode.inputs.context_prompt_optimizer_concurrency = Math.max(
+                    1,
+                    Math.min(20, Number(getWidgetValue(node, "context_prompt_optimizer_concurrency", 3)) || 3),
+                );
+            }
         }
         return promptData;
     };
@@ -1848,6 +2199,59 @@ function sourceFilename(node, mediaType) {
     return widgetFilename(node?.properties?.filename || node?.properties?.file || "");
 }
 
+function mediaLoaderState(node) {
+    if (!isMediaLoader(node)) return { images: [], audios: [], videos: [] };
+    let value = getWidgetValue(node, "media_state", "");
+    if (typeof value === "string") {
+        try { value = JSON.parse(value || "{}"); } catch { value = {}; }
+    }
+    const state = { images: [], audios: [], videos: [] };
+    for (const group of MEDIA_LOADER_GROUPS) {
+        const values = Array.isArray(value?.[group.key]) ? value[group.key] : [];
+        const normalized = values.map((entry) => {
+            const filename = typeof entry === "object" ? entry?.filename : entry;
+            return String(filename || "").replaceAll("\\", "/").replace(/^\/+/, "").trim();
+        }).filter((filename) => filename && !filename.split("/").includes(".."))
+            .filter((filename, index, list) => list.indexOf(filename) === index);
+        state[group.key] = normalized;
+    }
+    return state;
+}
+
+function mediaLoaderEntryUrl(filename, type) {
+    if (!filename || type === "audio") return "";
+    const params = new URLSearchParams({ filename: String(filename), type: "input" });
+    return `/view?${params.toString()}`;
+}
+
+function mediaLoaderMentionOptions(source, targetNode = source) {
+    source = isMediaLoader(source) ? source : null;
+    if (!source) return [];
+    const state = mediaLoaderState(source);
+    const result = [];
+    const counts = { image: 0, video: 0, audio: 0 };
+    // Match the loader bundle's serialized order exactly. H3 still assigns
+    // the official type-local Picture/Video/Audio tags downstream.
+    for (const type of ["image", "audio", "video"]) {
+        const key = `${type}s`;
+        for (const filename of state[key] || []) {
+            counts[type] += 1;
+            const ordinal = counts[type];
+            const tag = promptMentionTag(type, ordinal);
+            const mode = referenceMentionMode(targetNode);
+            const fullLabel = filename.split(/[\\/]/).pop() || filename;
+            const label = mode === "index" ? `${LABELS[type] || type}${ordinal}` : truncateMentionLabel(fullLabel);
+            result.push({
+                type, tag, token: `@${mode === "index" ? label : fullLabel}`, label, fullLabel,
+                ordinal, referenceMode: mode, source: TEXT.mediaLoaderMenuTitle,
+                sourceId: Number(source.id), sourceSlot: 0, mediaIndex: result.length + 1,
+                previewUrl: mediaLoaderEntryUrl(filename, type), filename,
+            });
+        }
+    }
+    return result;
+}
+
 function truncateMentionLabel(value, maxLength = 22) {
     const text = String(value || "");
     if (text.length <= maxLength) return text;
@@ -1855,7 +2259,10 @@ function truncateMentionLabel(value, maxLength = 22) {
 }
 
 function mentionOptions(node) {
-    if (!isReferenceMode(node)) return [];
+    if (!mediaReferenceMode(node)) return [];
+    const native = getNativeMediaBridgeLink(node);
+    const loader = native ? app.graph?.getNodeById?.(Number(native.source_id)) : null;
+    if (loader && isMediaLoader(loader)) return mediaLoaderMentionOptions(loader, node);
     const links = normalizeLinks(node);
     const mediaOrder = { image: 0, video: 1, audio: 2 };
     const orderedLinks = links
@@ -1865,10 +2272,10 @@ function mentionOptions(node) {
             const rightType = String(right.link.media_type || "image").toLowerCase();
             return (mediaOrder[leftType] ?? 0) - (mediaOrder[rightType] ?? 0) || left.index - right.index;
         })
-        .map((entry) => entry.link);
+        .map((entry) => ({ link: entry.link, mediaIndex: entry.index + 1 }));
     const counts = { image: 0, video: 0, audio: 0 };
     const mode = referenceMentionMode(node);
-    return orderedLinks.map((link) => {
+    return orderedLinks.map(({ link, mediaIndex }) => {
         const type = String(link.media_type || "image");
         counts[type] = (counts[type] || 0) + 1;
         const ordinal = counts[type];
@@ -1889,6 +2296,7 @@ function mentionOptions(node) {
             source: sourceLabel(source),
             sourceId: Number(link.source_id),
             sourceSlot: Number(link.source_slot) || 0,
+            mediaIndex,
             previewUrl: sourcePreviewUrl(source, type),
         };
     });
@@ -1959,7 +2367,7 @@ function refreshMentionPreviews() {
     for (const node of app.graph?._nodes || []) {
         if (!isTarget(node)) continue;
         normalizeLinks(node);
-        if (!isReferenceMode(node)) {
+        if (!canUseMediaMentions(node)) {
             closeMentionMenu(node);
             continue;
         }
@@ -2017,6 +2425,7 @@ function updateMentionChip(chip, option) {
     chip.dataset.mediaType = option.type || chip.dataset.mediaType || "image";
     chip.dataset.referenceMode = option.referenceMode || chip.dataset.referenceMode || "index";
     chip.dataset.ordinal = Number(option.ordinal) || chip.dataset.ordinal || "";
+    chip.dataset.mediaIndex = Number(option.mediaIndex) || chip.dataset.mediaIndex || "";
     chip.dataset.pendingReference = option.pending ? "true" : "";
     if (option.sourceId != null) chip.dataset.sourceId = String(option.sourceId);
     if (option.sourceSlot != null) chip.dataset.sourceSlot = String(Number(option.sourceSlot) || 0);
@@ -2284,6 +2693,7 @@ function makeMentionChip(option) {
     chip.dataset.mediaType = option.type || "image";
     chip.dataset.referenceMode = option.referenceMode || "index";
     chip.dataset.ordinal = Number(option.ordinal) || "";
+    chip.dataset.mediaIndex = Number(option.mediaIndex) || "";
     chip.dataset.sourceId = option.sourceId != null ? String(option.sourceId) : "";
     chip.dataset.sourceSlot = String(option.sourceSlot || 0);
     chip.dataset.previewUrl = option.previewUrl || "";
@@ -2432,6 +2842,7 @@ function promptPartsFromText(node, value) {
             mediaType: option.type || "image",
             referenceMode: option.referenceMode || referenceMentionMode(node),
             ordinal: Number(option.ordinal) || null,
+            mediaIndex: Number(option.mediaIndex) || null,
             sourceId: option.sourceId != null ? Number(option.sourceId) : null,
             sourceSlot: Number(option.sourceSlot) || 0,
             previewUrl: option.previewUrl || "",
@@ -2521,6 +2932,7 @@ function serializeEditorDoc(editor) {
                 mediaType: item.dataset.mediaType || "image",
                 referenceMode: item.dataset.referenceMode || "index",
                 ordinal: Number(item.dataset.ordinal) || null,
+                mediaIndex: Number(item.dataset.mediaIndex) || null,
                 sourceId: item.dataset.sourceId ? Number(item.dataset.sourceId) : null,
                 sourceSlot: Number(item.dataset.sourceSlot) || 0,
                 previewUrl: item.dataset.previewUrl || "",
@@ -2615,7 +3027,9 @@ function syncPromptFromEditor(node, markDirty = true) {
         if (widget._state) widget._state.value = doc.text;
         node.properties ||= {};
         node.properties[PROMPT_DOC_PROP] = doc;
+        syncModeWidgets(node);
         if (isRawPromptMode(node)) node.__h3RawPromptNeedsSync = false;
+        syncSegmentSummary(node);
         if (markDirty) {
             node.setDirtyCanvas?.(true, true);
             app.graph?.setDirtyCanvas?.(true, true);
@@ -2962,6 +3376,24 @@ function insertDialogueBlockAtSelection(node, editor) {
     return true;
 }
 
+function insertSegmentDividerAtSelection(node, editor) {
+    if (!isSegmentMode(node)) return false;
+    const selection = window.getSelection?.();
+    if (!selection || !selection.rangeCount || !editor) return false;
+    const range = selection.getRangeAt(0);
+    if (!editor.contains(range.commonAncestorContainer)) return false;
+    range.deleteContents();
+    const divider = document.createTextNode("\n---\n");
+    range.insertNode(divider);
+    range.setStartAfter(divider);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    editor.focus({ preventScroll: true });
+    closeMentionMenu(node);
+    return true;
+}
+
 function findDialogueAcrossWhitespace(start, root, direction) {
     let current = start;
     const skipped = [];
@@ -3145,7 +3577,7 @@ function renderMentionMenu(node) {
 }
 
 function openMentionMenu(node, editor) {
-    if (!isReferenceMode(node)) {
+    if (!canUseMediaMentions(node)) {
         closeMentionMenu(node);
         return false;
     }
@@ -3176,7 +3608,7 @@ function openMentionMenu(node, editor) {
 }
 
 function syncMentionMenuToCaret(node, editor) {
-    if (!isReferenceMode(node) || !getMentionRange(editor)) {
+    if (!canUseMediaMentions(node) || !getMentionRange(editor)) {
         closeMentionMenu(node);
         return false;
     }
@@ -3439,7 +3871,7 @@ function hideConditionalWidget(widget) {
     return wasVisible;
 }
 
-function showConditionalWidget(widget) {
+function showConditionalWidget(widget, node = null) {
     if (!widget) return false;
     const wasHidden = widget.type === "hidden"
         || widget.hidden === true
@@ -3469,7 +3901,7 @@ function showConditionalWidget(widget) {
         if (widget.options?.canvasOnly === undefined) delete widget._state.options.canvasOnly;
         else widget._state.options.canvasOnly = widget.options.canvasOnly;
     }
-    localizeComboWidget(widget);
+    localizeComboWidget(widget, node);
     return wasHidden;
 }
 
@@ -3484,7 +3916,7 @@ function setConditionalWidgetVisible(node, widget, visible, { adjustHeight = tru
     // otherwise the flexible prompt editor is compressed a little for every
     // expanded setting row instead of the node extending downward.
     const layoutDelta = rowHeight + 4;
-    const changed = visible ? showConditionalWidget(widget) : hideConditionalWidget(widget);
+    const changed = visible ? showConditionalWidget(widget, node) : hideConditionalWidget(widget);
     node.__h3ConditionalVisibility.set(key, Boolean(visible));
     if (!changed) return false;
     // Change height only when the desired state actually changed. ComfyUI may
@@ -3499,11 +3931,70 @@ function setConditionalWidgetVisible(node, widget, visible, { adjustHeight = tru
     return true;
 }
 
+function syncSegmentSummary(node) {
+    if (!isSegmentMode(node)) return false;
+    const secondsSpec = String(getWidgetValue(node, "segment_seconds", "") || "");
+    const parts = secondsSpec.replace(/\uff0c/g, ",").split(",").map((item) => item.trim()).filter(Boolean);
+    const total = parts.reduce((sum, item) => {
+        const value = Number.parseFloat(item);
+        return Number.isFinite(value) ? sum + value : sum;
+    }, 0);
+    const seconds = getWidget(node, "seconds");
+    if (seconds && total > 0) {
+        seconds.value = Math.round(total * 10) / 10;
+        if (seconds._state) seconds._state.value = seconds.value;
+    }
+    const segmentSeconds = getWidget(node, "segment_seconds");
+    if (segmentSeconds) segmentSeconds.label = TEXT.segmentSecondsHint && parts.length ? TEXT.segmentSeconds : TEXT.segmentSeconds;
+    return true;
+}
+
+function promptTextForOptimizer(node) {
+    const doc = node?.properties?.[PROMPT_DOC_PROP];
+    if (Array.isArray(doc?.parts)) {
+        return promptDocTextFromParts(doc.parts);
+    }
+    return String(getWidget(node, "prompt")?.value || "");
+}
+
+function contextFrameGrid(node) {
+    const mode = canonicalOption("continuity_mode", getWidgetValue(node, "continuity_mode", CONTINUITY_LATENT));
+    return AV_CONTINUITY_MODES.has(mode) ? AV_CONTEXT_FRAME_GRID : GUIDE_CONTEXT_FRAME_GRID;
+}
+
+function syncContextLengthWidget(node) {
+    const widget = getWidget(node, "context_length");
+    if (!widget || !isSegmentMode(node)) return false;
+    const grid = contextFrameGrid(node);
+    widget.options ||= {};
+    widget.options.min = grid[0];
+    widget.options.max = grid[grid.length - 1];
+    widget.options.step = grid.length > 1 ? grid[1] - grid[0] : 1;
+    const current = Number(widget.value);
+    const value = Number.isFinite(current)
+        ? grid.reduce((best, candidate) => Math.abs(candidate - current) < Math.abs(best - current) ? candidate : best, grid[0])
+        : grid[0];
+    const changed = current !== value;
+    if (changed) {
+        widget.value = value;
+        if (widget._state) widget._state.value = value;
+    }
+    return changed;
+}
+
 function syncModeWidgets(node, { adjustHeight = true } = {}) {
     const advanced = isAdvancedEnabled(node);
+    const contextOptimizerMode = canonicalOption(
+        "context_prompt_optimizer_mode",
+        getWidgetValue(node, "context_prompt_optimizer_mode", "whole_sequence"),
+    );
+    const contextNode = isContextSegmentsNode(node);
     const changed = [
-        setConditionalWidgetVisible(node, getWidget(node, "fps"), advanced, { adjustHeight }),
-        setConditionalWidgetVisible(node, getWidget(node, "keyframe_role"), advanced && !isReferenceMode(node), { adjustHeight }),
+        syncContextLengthWidget(node),
+        setConditionalWidgetVisible(node, getWidget(node, "mode"), !isContextSegmentsNode(node), { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "audio_mode"), isContextSegmentsNode(node), { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "fps"), advanced && !isContextSegmentsNode(node), { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "keyframe_role"), advanced && !isReferenceMode(node) && !isContextSegmentsNode(node), { adjustHeight }),
         setConditionalWidgetVisible(node, getWidget(node, "ref_image_size"), advanced, { adjustHeight }),
         setConditionalWidgetVisible(node, getWidget(node, "reference_mention_mode"), advanced && isReferenceMode(node), { adjustHeight }),
         setConditionalWidgetVisible(node, getWidget(node, "aspect_ratio"), !isCustomResolution(node), { adjustHeight }),
@@ -3511,6 +4002,45 @@ function syncModeWidgets(node, { adjustHeight = true } = {}) {
         setConditionalWidgetVisible(node, getWidget(node, "height"), isCustomResolution(node), { adjustHeight }),
         setConditionalWidgetVisible(node, getWidget(node, "prompt_optimizer_settings"), advanced, { adjustHeight }),
         setConditionalWidgetVisible(node, getWidget(node, "prompt_optimizer_scene_guide"), advanced, { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "context_prompt_optimizer_mode"), contextNode && advanced, { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "context_prompt_optimizer_concurrency"), contextNode && advanced && contextOptimizerMode === "per_segment", { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "segment_seconds"), isSegmentMode(node), { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "context_length"), isSegmentMode(node), { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "continuity_mode"), isSegmentMode(node), { adjustHeight }),
+    ].some(Boolean);
+    if (!isSegmentMode(node)) {
+        const segmentSeconds = getWidget(node, "segment_seconds");
+        if (segmentSeconds) segmentSeconds.label = TEXT.segmentSeconds;
+    } else {
+        syncSegmentSummary(node);
+    }
+    if (changed) {
+        refreshVueNodeWidgets(node);
+        node._widgetSlotsDirty = true;
+        node.setDirtyCanvas?.(true, true);
+        app.graph?.setDirtyCanvas?.(true, true);
+    }
+    return changed;
+}
+
+function syncSegmentRefineWidgets(node, { adjustHeight = true } = {}) {
+    if (!isSegmentRefineNode(node)) return false;
+    // Combo widgets expose their localized display label as .value. Convert
+    // it back to the stable enum before deciding which parameter rows to show.
+    const refineMode = canonicalOption("refine_mode", getWidgetValue(node, "refine_mode", "pixel_resize"));
+    const refineExecution = canonicalOption("refine_execution", getWidgetValue(node, "refine_execution", "whole_segment"));
+    const tiled = refineExecution === "tiled_low_vram";
+    const changed = [
+        setConditionalWidgetVisible(node, getWidget(node, "target_width"), refineMode === "pixel_resize", { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "target_height"), refineMode === "pixel_resize", { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "latent_upscale_model"), refineMode === "latent_upscale", { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "latent_upscale_scale"), refineMode === "latent_upscale", { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "latent_upscale_device"), refineMode === "latent_upscale", { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "latent_upscale_precision"), refineMode === "latent_upscale", { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "tile_width"), tiled, { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "tile_height"), tiled, { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "tile_overlap"), tiled, { adjustHeight }),
+        setConditionalWidgetVisible(node, getWidget(node, "tile_fade"), tiled, { adjustHeight }),
     ].some(Boolean);
     if (changed) {
         refreshVueNodeWidgets(node);
@@ -3931,6 +4461,74 @@ function promptOptimizerConfigured(state) {
     );
 }
 
+function splitContextPromptSegments(value) {
+    const normalized = String(value || "")
+        .replace(/\r\n?/g, "\n")
+        .replace(/[\u2028\u2029]/g, "\n")
+        .replace(/[\ufeff\u200b\u200c\u200d\u2060]/g, "");
+    return normalized
+        .split(/^\s*\\?\s*-{3,}\s*\\?\s*$/m)
+        .map((part) => part.trim())
+        .filter(Boolean);
+}
+
+function contextSegmentDurations(node, count) {
+    const raw = String(getWidgetValue(node, "segment_seconds", "") || "")
+        .replace(/\uff0c/g, ",");
+    const values = raw.split(",")
+        .map((item) => Number.parseFloat(item.trim()))
+        .filter((item) => Number.isFinite(item) && item > 0);
+    if (values.length === count) return values;
+    const fallback = Number(getWidgetValue(node, "seconds", 5)) || 5;
+    return Array.from({ length: count }, () => fallback);
+}
+
+async function requestPromptOptimization(payload, signal) {
+    const response = await api.fetchApi("/minimax_h3_easy/prompt_optimize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal,
+        body: JSON.stringify(payload),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+    return data;
+}
+
+async function optimizeContextSegmentsIndividually({ node, sourcePrompt, commonPayload, concurrency, signal, requestId }) {
+    const segments = splitContextPromptSegments(sourcePrompt);
+    if (segments.length < 2) return null;
+    const durations = contextSegmentDurations(node, segments.length);
+    const results = Array.from({ length: segments.length }, () => "");
+    let nextIndex = 0;
+    let completed = 0;
+    const workerCount = Math.max(1, Math.min(20, Number(concurrency) || 3, segments.length));
+    setPromptOptimizerStatus(node, "loading", { completed: 0, total: segments.length });
+
+    const worker = async () => {
+        while (true) {
+            if (signal.aborted || node.__h3OptimizerRequestId !== requestId) return;
+            const index = nextIndex++;
+            if (index >= segments.length) return;
+            const data = await requestPromptOptimization({
+                ...commonPayload,
+                prompt: segments[index],
+                seconds: durations[index],
+                segment_index: index,
+                segment_count: segments.length,
+                previous_prompts: segments.slice(0, index),
+                optimizer_mode: "per_segment",
+            }, signal);
+            results[index] = String(data.prompt || "").trim();
+            completed += 1;
+            setPromptOptimizerStatus(node, "loading", { completed, total: segments.length });
+        }
+    };
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    if (results.some((part) => !part)) throw new Error("One or more context segments returned an empty result");
+    return results.join("\n\n---\n\n");
+}
+
 function notifyPromptOptimizer(message, severity = "error") {
     const detail = String(message || "");
     const toast = app.extensionManager?.toast;
@@ -3979,10 +4577,11 @@ function cancelPromptOptimization(node) {
     syncPromptOptimizerButton(node);
 }
 
-function setPromptOptimizerStatus(node, state = "idle") {
+function setPromptOptimizerStatus(node, state = "idle", progress = null) {
     if (!node) return;
     clearPromptOptimizerStatusTimers(node);
     node.__h3OptimizerStatus = state;
+    if (state !== "loading" || progress == null) node.__h3OptimizerProgress = null;
     const status = node.__h3PromptOptimizerStatus;
     const label = node.__h3PromptOptimizerStatusText;
     if (!status || !label) return;
@@ -3995,9 +4594,19 @@ function setPromptOptimizerStatus(node, state = "idle") {
     }
     const startedAt = Number(node.__h3OptimizerStartedAt) || (globalThis.performance?.now?.() || Date.now());
     node.__h3OptimizerStartedAt = startedAt;
+    if (progress && Number.isFinite(Number(progress.total))) {
+        node.__h3OptimizerProgress = {
+            completed: Math.max(0, Math.min(Number(progress.total), Number(progress.completed) || 0)),
+            total: Math.max(1, Number(progress.total)),
+        };
+    }
     const update = () => {
         const elapsed = Math.max(0, Math.floor(((globalThis.performance?.now?.() || Date.now()) - startedAt) / 1000));
-        label.textContent = elapsed > 1 ? `${TEXT.optimizerRunning} \u00b7 ${elapsed}s` : `${TEXT.optimizerRunning}...`;
+        const current = node.__h3OptimizerProgress;
+        const progressText = current ? ` ${current.completed}/${current.total}` : "";
+        label.textContent = elapsed > 1
+            ? `${TEXT.optimizerRunning}${progressText} \u00b7 ${elapsed}s`
+            : `${TEXT.optimizerRunning}${progressText}...`;
     };
     update();
     node.__h3OptimizerStatusTimer = setInterval(update, 1000);
@@ -4057,6 +4666,16 @@ function sourceAssetDescriptor(node, mediaType) {
 }
 
 function promptOptimizerResources(node) {
+    const native = getNativeMediaBridgeLink(node);
+    const loader = native ? app.graph?.getNodeById?.(Number(native.source_id)) : null;
+    if (loader && isMediaLoader(loader)) {
+        return mediaLoaderMentionOptions(loader, node).map((option) => ({
+            type: option.type,
+            tag: option.tag,
+            name: option.filename,
+            asset: { filename: option.filename, subfolder: "", storage: "input" },
+        }));
+    }
     const counts = { image: 0, video: 0, audio: 0 };
     return normalizeLinks(node).map((link) => {
         const type = String(link.media_type || "image").toLowerCase();
@@ -4086,8 +4705,8 @@ function setPromptFromOptimizedText(node, value, { preserveAutoMarker = false, n
     if (!preserveAutoMarker) clearAutomaticPromptMarker(node);
     node.properties[PROMPT_DOC_PROP] = doc;
     if (widget) {
-        widget.value = text;
-        if (widget._state) widget._state.value = text;
+        widget.value = doc.text;
+        if (widget._state) widget._state.value = doc.text;
     }
     node.__h3RawPromptNeedsSync = false;
     renderEditorFromNode(node, true);
@@ -4118,7 +4737,7 @@ function applyRuntimePromptOptimization(node, message) {
     }
     if (!marker || typeof marker !== "object") return;
 
-    const currentPrompt = String(getWidget(node, "prompt")?.value || "");
+    const currentPrompt = promptTextForOptimizer(node);
     const currentMarker = node.properties?.[PROMPT_AUTO_MARKER_PROP];
     if (currentPrompt === prompt && JSON.stringify(currentMarker || {}) === JSON.stringify(marker)) return;
 
@@ -4148,7 +4767,7 @@ async function optimizePromptFromEditor(node) {
         notifyPromptOptimizer(TEXT.optimizerMissing);
         return;
     }
-    const currentPrompt = String(getWidget(node, "prompt")?.value || "");
+    const currentPrompt = promptTextForOptimizer(node);
     const sourcePrompt = node.__h3OptimizerLastResult === currentPrompt && node.__h3OptimizerSourcePrompt != null
         ? node.__h3OptimizerSourcePrompt
         : currentPrompt;
@@ -4157,6 +4776,7 @@ async function optimizePromptFromEditor(node) {
     const mediaCounts = { image: 0, video: 0, audio: 0 };
     resources.forEach((item) => { mediaCounts[item.type] = (mediaCounts[item.type] || 0) + 1; });
     const requestMode = canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE));
+    const segmentMode = requestMode === MODE_SEGMENTS;
     const requestId = Symbol("h3-prompt-optimizer");
     const abortController = new AbortController();
     node.__h3OptimizerRequestId = requestId;
@@ -4166,24 +4786,42 @@ async function optimizePromptFromEditor(node) {
     setPromptOptimizerStatus(node, "loading");
     syncPromptOptimizerButton(node);
     try {
-        const response = await api.fetchApi("/minimax_h3_easy/prompt_optimize", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            signal: abortController.signal,
-            body: JSON.stringify({
-                prompt: sourcePrompt,
-                scene_guide: state.scene_guide,
-                mode: requestMode,
-                seconds: Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 5)) || 5)),
-                media_counts: mediaCounts,
-                resources,
-            }),
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        const optimizerMode = segmentMode
+            ? canonicalOption("context_prompt_optimizer_mode", getWidgetValue(node, "context_prompt_optimizer_mode", "whole_sequence"))
+            : "whole_sequence";
+        const commonPayload = {
+            prompt: sourcePrompt,
+            scene_guide: state.scene_guide,
+            mode: requestMode,
+            audio_mode: segmentMode
+                ? canonicalOption("audio_mode", getWidgetValue(node, "audio_mode", CONTEXT_AUDIO_GENERATED))
+                : "",
+            seconds: segmentMode
+                ? Number(getWidgetValue(node, "seconds", 5)) || 5
+                : Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 5)) || 5)),
+            segment_seconds: segmentMode ? String(getWidgetValue(node, "segment_seconds", "") || "") : "",
+            media_counts: mediaCounts,
+            resources,
+            optimizer_mode: optimizerMode,
+        };
+        let optimizedPrompt = "";
+        const sourceSegments = segmentMode ? splitContextPromptSegments(sourcePrompt) : [];
+        if (segmentMode && optimizerMode === "per_segment" && sourceSegments.length >= 2) {
+            optimizedPrompt = await optimizeContextSegmentsIndividually({
+                node,
+                sourcePrompt,
+                commonPayload,
+                concurrency: getWidgetValue(node, "context_prompt_optimizer_concurrency", 3),
+                signal: abortController.signal,
+                requestId,
+            });
+        } else {
+            const data = await requestPromptOptimization(commonPayload, abortController.signal);
+            optimizedPrompt = String(data.prompt || "");
+        }
         if (node.__h3OptimizerRequestId !== requestId) return;
         node.__h3OptimizerSourcePrompt = sourcePrompt;
-        node.__h3OptimizerLastResult = String(data.prompt || "");
+        node.__h3OptimizerLastResult = optimizedPrompt;
         setPromptFromOptimizedText(node, node.__h3OptimizerLastResult);
         setPromptOptimizerStatus(node, "success");
     } catch (error) {
@@ -4208,19 +4846,19 @@ function syncEditorMode(node) {
     const domWidget = node.__h3DomWidget;
     if (!widget || !editor || !wrap || !domWidget) return;
     syncPromptExternalConnectionState(node);
-    const reference = isReferenceMode(node);
+    const mediaMentions = canUseMediaMentions(node);
     const raw = isRawPromptMode(node);
     hideOriginalPromptWidget(widget);
     setWidgetOption(domWidget, "canvasOnly", false);
     showDomEditorWidget(domWidget);
     editor.style.display = "block";
     wrap.style.display = "block";
-    editor.dataset.placeholder = raw ? TEXT.rawPromptPlaceholder : reference ? TEXT.referencePromptPlaceholder : TEXT.promptPlaceholder;
+    editor.dataset.placeholder = raw ? TEXT.rawPromptPlaceholder : mediaMentions ? TEXT.referencePromptPlaceholder : TEXT.promptPlaceholder;
     editor.classList.toggle("is-raw", raw);
     wrap.classList.toggle("is-raw", raw);
     syncPromptViewButton(node);
     applyNativeEditorTheme(wrap);
-    if (!reference || raw) closeMentionMenu(node);
+    if (!mediaMentions || raw) closeMentionMenu(node);
 }
 
 function handleMentionMenuKeydown(node, event) {
@@ -4615,7 +5253,7 @@ function insertPlainText(editor, text) {
 }
 
 function pastedMentionCandidates(node) {
-    if (!isReferenceMode(node)) return [];
+    if (!canUseMediaMentions(node)) return [];
     const labels = {
         image: ["\u56fe\u7247", "Image", "image", "Picture", "picture"],
         video: ["\u89c6\u9891", "Video", "video"],
@@ -4643,7 +5281,7 @@ function pastedMentionCandidates(node) {
 }
 
 function pastedOfficialMediaTagMatch(node, value, cursor) {
-    if (!isReferenceMode(node)) return null;
+    if (!canUseMediaMentions(node)) return null;
     const match = String(value || "").slice(cursor).match(/^<\s*(picture|video|audio)\s*(\d+)\s*>/i);
     if (!match) return null;
     const type = match[1].toLowerCase() === "picture" ? "image" : match[1].toLowerCase();
@@ -4752,7 +5390,7 @@ function ensurePromptEditor(node) {
     editor.tabIndex = 0;
     editor.setAttribute("role", "textbox");
     editor.setAttribute("aria-label", "prompt");
-    editor.dataset.placeholder = isReferenceMode(node) ? TEXT.referencePromptPlaceholder : TEXT.promptPlaceholder;
+    editor.dataset.placeholder = canUseMediaMentions(node) ? TEXT.referencePromptPlaceholder : TEXT.promptPlaceholder;
     editor.spellcheck = false;
     const editorTools = document.createElement("div");
     editorTools.className = "h3-prompt-editor-tools";
@@ -4827,7 +5465,15 @@ function ensurePromptEditor(node) {
             pushPromptHistory(node);
             return;
         }
-        if (isReferenceMode(node) && event.data === "@") setTimeout(() => syncMentionMenuToCaret(node, editor), 0);
+        if (event.inputType === "insertText" && event.data === "~" && insertSegmentDividerAtSelection(node, editor)) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            syncPromptFromEditor(node);
+            pushPromptHistory(node);
+            return;
+        }
+        if (canUseMediaMentions(node) && event.data === "@") setTimeout(() => syncMentionMenuToCaret(node, editor), 0);
     });
     editor.addEventListener("input", (event) => {
         const raw = isRawPromptMode(node);
@@ -4865,7 +5511,7 @@ function ensurePromptEditor(node) {
         activePromptNode = node;
     }, true);
     editor.addEventListener("keyup", (event) => {
-        if (isRawPromptMode(node) || !isReferenceMode(node) || ["ArrowUp", "ArrowDown", "Enter", "Escape", "Tab"].includes(event.key)) return;
+        if (isRawPromptMode(node) || !canUseMediaMentions(node) || ["ArrowUp", "ArrowDown", "Enter", "Escape", "Tab"].includes(event.key)) return;
         syncMentionMenuToCaret(node, editor);
         event.stopPropagation();
     });
@@ -4889,6 +5535,15 @@ function ensurePromptEditor(node) {
             return;
         }
         if (!raw && event.key === "#" && !event.ctrlKey && !event.metaKey && !event.altKey && insertDialogueBlockAtSelection(node, editor)) {
+            event.preventDefault();
+            event.stopPropagation();
+            node.__h3DialogueHashHandled = true;
+            setTimeout(() => { node.__h3DialogueHashHandled = false; }, 0);
+            syncPromptFromEditor(node);
+            pushPromptHistory(node);
+            return;
+        }
+        if (!raw && event.key === "~" && !event.ctrlKey && !event.metaKey && !event.altKey && insertSegmentDividerAtSelection(node, editor)) {
             event.preventDefault();
             event.stopPropagation();
             node.__h3DialogueHashHandled = true;
@@ -5160,8 +5815,11 @@ function pruneTransportInputs(nodeData) {
         }
     }
     if (Array.isArray(nodeData?.inputs)) {
-        nodeData.inputs = nodeData.inputs.filter((input) => !isTransportInputName(input?.name));
-        changed = true;
+        const nextInputs = nodeData.inputs.filter((input) => !isTransportInputName(input?.name));
+        if (nextInputs.length !== nodeData.inputs.length) {
+            nodeData.inputs = nextInputs;
+            changed = true;
+        }
     }
     return changed;
 }
@@ -5213,7 +5871,12 @@ function setConfiguredWidgetValue(node, name, value) {
 }
 
 function bindPromptOptimizerWidgetCallbacks(node) {
-    const names = ["prompt_optimizer_settings", "prompt_optimizer_scene_guide"];
+    const names = [
+        "prompt_optimizer_settings",
+        "prompt_optimizer_scene_guide",
+        "context_prompt_optimizer_mode",
+        "context_prompt_optimizer_concurrency",
+    ];
     for (const name of names) {
         const widget = getWidget(node, name);
         if (!widget || widget.__h3PromptOptimizerCallbackBound) continue;
@@ -5230,6 +5893,13 @@ function bindPromptOptimizerWidgetCallbacks(node) {
             if (name === "prompt_optimizer_scene_guide") widget.value = ZH_BROWSER
                 ? (PROMPT_GUIDES.find((item) => item.value === canonicalPromptGuide(value))?.zh || value)
                 : (PROMPT_GUIDES.find((item) => item.value === canonicalPromptGuide(value))?.en || value);
+            if (name === "context_prompt_optimizer_mode") {
+                widget.value = OPTION_DEFS.context_prompt_optimizer_mode[
+                    canonicalOption(name, value)
+                ] || widget.value;
+                syncModeWidgets(node);
+                repairNodeLayout(node);
+            }
             syncPromptOptimizerButton(node);
             node.setDirtyCanvas?.(true, true);
             app.graph?.change?.();
@@ -5258,46 +5928,122 @@ function repairConfiguredWidgetValues(node, info) {
         prompt_optimizer_scene_guide: "none",
     };
     const names = Object.keys(defaults);
+    const contextSegments = isContextSegmentsNode(node);
     const values = raw;
+    // Context workflows saved before the audio-mode row existed have the
+    // prompt directly after mode. Normalize that in-memory before restoring
+    // the named widgets so the current workflow files remain usable.
+    if (contextSegments && !Object.prototype.hasOwnProperty.call(OPTION_DEFS.audio_mode, canonicalOption("audio_mode", values[1]))) {
+        values.splice(1, 0, CONTEXT_AUDIO_GENERATED);
+    }
     // Some ComfyUI workflow versions serialize an extra null placeholder
     // after the prompt widget. Remove it before restoring the named rows so
     // resolution, dimensions, duration, and the advanced values stay aligned.
-    const resolutionAt = canonicalOption("resolution", values[2]);
-    const nextResolution = canonicalOption("resolution", values[3]);
+    const resolutionAt = canonicalOption("resolution", values[contextSegments ? 3 : 2]);
+    const nextResolution = canonicalOption("resolution", values[contextSegments ? 4 : 3]);
     const hasResolution = Object.prototype.hasOwnProperty.call(OPTION_DEFS.resolution, resolutionAt);
     const hasShiftedResolution = Object.prototype.hasOwnProperty.call(OPTION_DEFS.resolution, nextResolution);
     if (!hasResolution && hasShiftedResolution) values.splice(2, 1);
 
+    const modeIndex = 0;
+    const audioModeIndex = contextSegments ? 1 : -1;
+    const promptIndex = contextSegments ? 2 : 1;
+    const resolutionIndex = contextSegments ? 3 : 2;
+    const aspectRatioIndex = contextSegments ? 4 : 3;
+    const widthIndex = contextSegments ? 5 : 4;
+    const heightIndex = contextSegments ? 6 : 5;
+    const secondsIndex = contextSegments ? 7 : 6;
+    const segmentSecondsIndex = contextSegments ? 8 : -1;
+    const contextLengthIndex = contextSegments ? 9 : -1;
+    const continuityModeIndex = contextSegments ? 10 : -1;
+    const advancedIndex = contextSegments ? 11 : 7;
+    const fpsIndex = contextSegments ? 12 : 8;
+    const keyframeRoleIndex = contextSegments ? 13 : 9;
+    const refImageSizeIndex = contextSegments ? 14 : 10;
+    const referenceMentionModeIndex = contextSegments ? 15 : 11;
+    const promptOptimizerSceneGuideIndex = contextSegments ? 17 : 13;
+    const contextOptimizerModeIndex = contextSegments ? 18 : -1;
+    const contextOptimizerConcurrencyIndex = contextSegments ? 19 : -1;
     const normalized = {
-        mode: Object.prototype.hasOwnProperty.call(OPTION_DEFS.mode, canonicalOption("mode", values[0]))
-            ? canonicalOption("mode", values[0]) : defaults.mode,
-        prompt: typeof values[1] === "string" ? values[1] : defaults.prompt,
-        resolution: Object.prototype.hasOwnProperty.call(OPTION_DEFS.resolution, canonicalOption("resolution", values[2]))
-            ? canonicalOption("resolution", values[2]) : defaults.resolution,
-        aspect_ratio: Object.prototype.hasOwnProperty.call(OPTION_DEFS.aspect_ratio, canonicalOption("aspect_ratio", values[3]))
-            ? canonicalOption("aspect_ratio", values[3]) : defaults.aspect_ratio,
-        width: Number.isFinite(Number(values[4])) ? Number(values[4]) : defaults.width,
-        height: Number.isFinite(Number(values[5])) ? Number(values[5]) : defaults.height,
-        seconds: Number.isFinite(Number(values[6]))
-            ? Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(values[6])))
+        mode: Object.prototype.hasOwnProperty.call(OPTION_DEFS.mode, canonicalOption("mode", values[modeIndex]))
+            ? canonicalOption("mode", values[modeIndex]) : defaults.mode,
+        audio_mode: Object.prototype.hasOwnProperty.call(OPTION_DEFS.audio_mode, canonicalOption("audio_mode", values[audioModeIndex]))
+            ? canonicalOption("audio_mode", values[audioModeIndex]) : CONTEXT_AUDIO_GENERATED,
+        prompt: typeof values[promptIndex] === "string" ? values[promptIndex] : defaults.prompt,
+        resolution: Object.prototype.hasOwnProperty.call(OPTION_DEFS.resolution, canonicalOption("resolution", values[resolutionIndex]))
+            ? canonicalOption("resolution", values[resolutionIndex]) : defaults.resolution,
+        aspect_ratio: Object.prototype.hasOwnProperty.call(OPTION_DEFS.aspect_ratio, canonicalOption("aspect_ratio", values[aspectRatioIndex]))
+            ? canonicalOption("aspect_ratio", values[aspectRatioIndex]) : defaults.aspect_ratio,
+        width: Number.isFinite(Number(values[widthIndex])) ? Number(values[widthIndex]) : defaults.width,
+        height: Number.isFinite(Number(values[heightIndex])) ? Number(values[heightIndex]) : defaults.height,
+        seconds: Number.isFinite(Number(values[secondsIndex]))
+            ? Math.min(contextSegments ? MAX_SECONDS * SEGMENT_MAX_COUNT : MAX_SECONDS, Math.max(MIN_SECONDS, Number(values[secondsIndex])))
             : defaults.seconds,
-        advanced: asBoolean(values[7], defaults.advanced),
-        fps: Number.isFinite(Number(values[8])) ? Number(values[8]) : defaults.fps,
-        keyframe_role: Object.prototype.hasOwnProperty.call(OPTION_DEFS.keyframe_role, canonicalOption("keyframe_role", values[9]))
-            ? canonicalOption("keyframe_role", values[9]) : defaults.keyframe_role,
-        ref_image_size: Object.prototype.hasOwnProperty.call(OPTION_DEFS.ref_image_size, canonicalOption("ref_image_size", values[10]))
-            ? canonicalOption("ref_image_size", values[10]) : defaults.ref_image_size,
-        reference_mention_mode: Object.prototype.hasOwnProperty.call(OPTION_DEFS.reference_mention_mode, canonicalOption("reference_mention_mode", values[11]))
-            ? canonicalOption("reference_mention_mode", values[11]) : defaults.reference_mention_mode,
+        advanced: asBoolean(values[advancedIndex], defaults.advanced),
+        fps: Number.isFinite(Number(values[fpsIndex])) ? Number(values[fpsIndex]) : defaults.fps,
+        keyframe_role: Object.prototype.hasOwnProperty.call(OPTION_DEFS.keyframe_role, canonicalOption("keyframe_role", values[keyframeRoleIndex]))
+            ? canonicalOption("keyframe_role", values[keyframeRoleIndex]) : defaults.keyframe_role,
+        ref_image_size: Object.prototype.hasOwnProperty.call(OPTION_DEFS.ref_image_size, canonicalOption("ref_image_size", values[refImageSizeIndex]))
+            ? canonicalOption("ref_image_size", values[refImageSizeIndex]) : defaults.ref_image_size,
+        reference_mention_mode: Object.prototype.hasOwnProperty.call(OPTION_DEFS.reference_mention_mode, canonicalOption("reference_mention_mode", values[referenceMentionModeIndex]))
+            ? canonicalOption("reference_mention_mode", values[referenceMentionModeIndex]) : defaults.reference_mention_mode,
+        continuity_mode: Object.prototype.hasOwnProperty.call(OPTION_DEFS.continuity_mode, canonicalOption("continuity_mode", values[continuityModeIndex]))
+            ? canonicalOption("continuity_mode", values[continuityModeIndex]) : CONTINUITY_LATENT,
         prompt_optimizer_settings: false,
-        prompt_optimizer_scene_guide: canonicalPromptGuide(values[13] || defaults.prompt_optimizer_scene_guide),
+        prompt_optimizer_scene_guide: canonicalPromptGuide(values[promptOptimizerSceneGuideIndex] || defaults.prompt_optimizer_scene_guide),
+        context_prompt_optimizer_mode: canonicalOption(
+            "context_prompt_optimizer_mode",
+            values[contextOptimizerModeIndex] || "whole_sequence",
+        ),
+        context_prompt_optimizer_concurrency: Math.max(
+            1,
+            Math.min(20, Number(values[contextOptimizerConcurrencyIndex]) || 3),
+        ),
     };
+    const segmentSeconds = contextSegments && typeof values[segmentSecondsIndex] === "string"
+        ? values[segmentSecondsIndex] : "";
+    const contextGrid = contextSegments && AV_CONTINUITY_MODES.has(normalized.continuity_mode)
+        ? AV_CONTEXT_FRAME_GRID : GUIDE_CONTEXT_FRAME_GRID;
+    const contextLength = contextSegments && Number.isFinite(Number(values[contextLengthIndex]))
+        ? contextGrid.reduce((best, candidate) => Math.abs(candidate - Number(values[contextLengthIndex])) < Math.abs(best - Number(values[contextLengthIndex])) ? candidate : best, contextGrid[0])
+        : contextGrid[0];
     for (const name of names) setConfiguredWidgetValue(node, name, normalized[name]);
-    info.widgets_values = names.map((name) => normalized[name]);
+    if (contextSegments) {
+        setConfiguredWidgetValue(node, "audio_mode", normalized.audio_mode);
+        setConfiguredWidgetValue(node, "segment_seconds", segmentSeconds);
+        setConfiguredWidgetValue(node, "context_length", contextLength);
+        setConfiguredWidgetValue(node, "continuity_mode", normalized.continuity_mode);
+        setConfiguredWidgetValue(node, "context_prompt_optimizer_mode", normalized.context_prompt_optimizer_mode);
+        setConfiguredWidgetValue(node, "context_prompt_optimizer_concurrency", normalized.context_prompt_optimizer_concurrency);
+        info.widgets_values = [
+            normalized.mode,
+            normalized.audio_mode,
+            normalized.prompt,
+            normalized.resolution,
+            normalized.aspect_ratio,
+            normalized.width,
+            normalized.height,
+            normalized.seconds,
+            segmentSeconds,
+            contextLength,
+            normalized.continuity_mode,
+            normalized.advanced,
+            normalized.fps,
+            normalized.keyframe_role,
+            normalized.ref_image_size,
+            normalized.reference_mention_mode,
+            normalized.prompt_optimizer_settings,
+            normalized.prompt_optimizer_scene_guide,
+            normalized.context_prompt_optimizer_mode,
+            normalized.context_prompt_optimizer_concurrency,
+        ];
+    } else {
+        info.widgets_values = names.map((name) => normalized[name]);
+    }
 }
 
 function installNode(nodeType, nodeData) {
-    if (nodeData?.name !== NODE_CLASS) return;
+    if (![NODE_CLASS, CONTEXT_SEGMENTS_CLASS].includes(nodeData?.name)) return;
     // Strip the virtual-wire transport fields from every frontend definition
     // before a node instance can be constructed. Execution still receives
     // them through the prompt patch and the Python INPUT_TYPES declaration.
@@ -5306,8 +6052,11 @@ function installNode(nodeType, nodeData) {
     if (nodeType?.prototype?.constructor?.nodeData && nodeType.prototype.constructor.nodeData !== nodeData) {
         pruneTransportInputs(nodeType.prototype.constructor.nodeData);
     }
-    if (nodeType.prototype.__h3EasyNodeInstalled) return;
-    nodeType.prototype.__h3EasyNodeInstalled = true;
+    const installedMarker = nodeData?.name === CONTEXT_SEGMENTS_CLASS
+        ? "__h3ContextSegmentsNodeInstalled"
+        : "__h3EasyNodeInstalled";
+    if (nodeType.prototype[installedMarker]) return;
+    nodeType.prototype[installedMarker] = true;
     const originalCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function onNodeCreatedH3Easy() {
         const result = originalCreated?.apply(this, arguments);
@@ -5332,6 +6081,27 @@ function installNode(nodeType, nodeData) {
                 syncEditorMode(this);
                 renderEditorFromNode(this);
                 requestMentionPreviewRefresh();
+                repairNodeLayout(this);
+                this.setDirtyCanvas?.(true, true);
+            };
+        }
+        const audioModeWidget = getWidget(this, "audio_mode");
+        if (audioModeWidget && !audioModeWidget.__h3ConditionalCallbackBound) {
+            audioModeWidget.__h3ConditionalCallbackBound = true;
+            const originalCallback = audioModeWidget.callback;
+            audioModeWidget.callback = (value) => {
+                originalCallback?.call(audioModeWidget, value);
+                syncModeWidgets(this);
+                this.setDirtyCanvas?.(true, true);
+            };
+        }
+        const continuityWidget = getWidget(this, "continuity_mode");
+        if (continuityWidget && !continuityWidget.__h3ConditionalCallbackBound) {
+            continuityWidget.__h3ConditionalCallbackBound = true;
+            const originalCallback = continuityWidget.callback;
+            continuityWidget.callback = (value) => {
+                originalCallback?.call(continuityWidget, value);
+                syncModeWidgets(this);
                 repairNodeLayout(this);
                 this.setDirtyCanvas?.(true, true);
             };
@@ -5372,6 +6142,12 @@ function installNode(nodeType, nodeData) {
             };
         }
         return result;
+    };
+
+    const originalConnectInput = nodeType.prototype.onConnectInput;
+    nodeType.prototype.onConnectInput = function onConnectInputH3Easy(inputIndex, type, output, originNode, originSlot) {
+        if (rejectsMixedMediaConnection(this, inputIndex, output, originNode, originSlot)) return false;
+        return originalConnectInput?.apply(this, arguments);
     };
 
     const originalExecuted = nodeType.prototype.onExecuted;
@@ -5440,6 +6216,7 @@ function installNode(nodeType, nodeData) {
         repairNodeLayout(this);
         const mediaInputIndex = getMediaInputIndex(this);
         if (mediaInputIndex >= 0 && this.inputs?.[mediaInputIndex]?.link != null) {
+            enforceMediaInputExclusivity(this);
             scheduleNativeMediaConnectionConversion(this, mediaInputIndex);
         }
         return result;
@@ -5455,6 +6232,7 @@ function installNode(nodeType, nodeData) {
             globalThis.requestAnimationFrame?.(() => syncPromptExternalConnectionState(this));
         }
         if (connected && !this.__h3VirtualWireClearing && /^media(?:_\d+)?$/i.test(String(input?.name || ""))) {
+            enforceMediaInputExclusivity(this);
             scheduleNativeMediaConnectionConversion(this, inputIndex, linkInfo);
         }
         return result;
@@ -5561,6 +6339,577 @@ function installOutputNode(nodeType, nodeData) {
     nodeType.prototype.onConfigure = function onConfigureH3Output(info) {
         const result = originalConfigure?.apply(this, arguments);
         localizeNodeInstance(this);
+        return result;
+    };
+}
+
+function installSegmentRefineNode(nodeType, nodeData) {
+    if (nodeData?.name !== SEGMENT_REFINE_CLASS) return;
+    if (nodeType.prototype.__h3SegmentRefineInstalled) return;
+    nodeType.prototype.__h3SegmentRefineInstalled = true;
+
+    const setup = (node, adjustHeight = true) => {
+        if (!node) return;
+        localizeNodeInstance(node);
+        const mode = getWidget(node, "refine_mode");
+        if (mode && !mode.__h3RefineModeBound) {
+            mode.__h3RefineModeBound = true;
+            const originalCallback = mode.callback;
+            mode.callback = (value) => {
+                originalCallback?.call(mode, value);
+                syncSegmentRefineWidgets(node);
+                node.setDirtyCanvas?.(true, true);
+            };
+        }
+        const execution = getWidget(node, "refine_execution");
+        if (execution && !execution.__h3RefineExecutionBound) {
+            execution.__h3RefineExecutionBound = true;
+            const originalCallback = execution.callback;
+            execution.callback = (value) => {
+                originalCallback?.call(execution, value);
+                syncSegmentRefineWidgets(node);
+                node.setDirtyCanvas?.(true, true);
+            };
+        }
+        syncSegmentRefineWidgets(node, { adjustHeight });
+    };
+
+    const originalCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function onNodeCreatedH3SegmentRefine() {
+        const result = originalCreated?.apply(this, arguments);
+        setup(this);
+        return result;
+    };
+    const originalAdded = nodeType.prototype.onAdded;
+    nodeType.prototype.onAdded = function onAddedH3SegmentRefine(graph) {
+        const result = originalAdded?.apply(this, arguments);
+        setup(this, false);
+        return result;
+    };
+    const originalConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function onConfigureH3SegmentRefine(info) {
+        const result = originalConfigure?.apply(this, arguments);
+        setup(this, false);
+        return result;
+    };
+}
+
+function mediaLoaderReadState(node) {
+    const state = mediaLoaderState(node);
+    return {
+        images: [...state.images],
+        audios: [...state.audios],
+        videos: [...state.videos],
+    };
+}
+
+function mediaLoaderWriteState(node, state) {
+    const unique = (values) => [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || "").trim()).filter(Boolean))];
+    const value = JSON.stringify({
+        images: unique(state.images).map((filename) => ({ filename })),
+        audios: unique(state.audios).map((filename) => ({ filename })),
+        videos: unique(state.videos).map((filename) => ({ filename })),
+    });
+    const widget = getWidget(node, "media_state");
+    if (!widget) return;
+    widget.value = value;
+    if (widget._state) widget._state.value = value;
+    node.properties ||= {};
+    node.properties.media_loader_state = value;
+    node.setDirtyCanvas?.(true, true);
+    app.graph?.setDirtyCanvas?.(true, true);
+    app.graph?.change?.();
+    requestMentionPreviewRefresh();
+}
+
+function mediaLoaderHideStateWidget(widget) {
+    if (!widget) return;
+    if (!widget.__h3MediaLoaderHidden) {
+        widget.__h3MediaLoaderHidden = true;
+        widget.__h3MediaLoaderType = widget.type;
+        widget.__h3MediaLoaderComputeSize = widget.computeSize;
+    }
+    widget.hidden = true;
+    widget.type = "hidden";
+    widget.computeSize = () => [0, -4];
+    setWidgetOption(widget, "hidden", true);
+    setWidgetOption(widget, "canvasOnly", true);
+}
+
+function formatMediaDuration(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value < 0) return "";
+    const total = Math.max(0, Math.round(value));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const remainder = total % 60;
+    if (hours > 0) {
+        return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+    }
+    return `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function mediaLoaderItemPreview(filename, type) {
+    const thumb = document.createElement("div");
+    thumb.className = `h3-media-loader-thumb is-${type}`;
+    thumb.setAttribute("aria-hidden", "true");
+    if (type === "audio") {
+        const wave = document.createElement("span");
+        wave.className = "h3-media-loader-audio-wave";
+        for (const height of [38, 68, 100, 68, 38]) {
+            const bar = document.createElement("i");
+            bar.style.setProperty("--h3-audio-bar-height", `${height}%`);
+            wave.append(bar);
+        }
+        thumb.append(wave);
+        return thumb;
+    }
+
+    const previewUrl = mediaLoaderEntryUrl(filename, type);
+
+    const media = document.createElement(type === "video" ? "video" : "img");
+    media.alt = "";
+    media.draggable = false;
+    media.src = previewUrl;
+    if (type === "video") {
+        media.muted = true;
+        media.playsInline = true;
+        media.preload = "metadata";
+
+        const duration = document.createElement("span");
+        duration.className = "h3-media-loader-duration";
+        duration.setAttribute("aria-hidden", "true");
+        duration.hidden = true;
+        media.addEventListener("loadedmetadata", () => {
+            const label = formatMediaDuration(media.duration);
+            if (!label) return;
+            duration.textContent = label;
+            duration.hidden = false;
+        }, { once: true });
+        thumb.append(duration);
+    }
+    media.addEventListener("error", () => {
+        thumb.replaceChildren();
+        const fallback = document.createElement("span");
+        fallback.className = "h3-media-loader-preview-fallback";
+        fallback.textContent = type === "video" ? "Video" : "Image";
+        thumb.append(fallback);
+    }, { once: true });
+    thumb.append(media);
+    return thumb;
+}
+
+function mediaLoaderFilenameFromUpload(response) {
+    const name = String(response?.name || response?.filename || "").trim();
+    if (!name) return "";
+    const subfolder = String(response?.subfolder || "").replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+    return subfolder ? `${subfolder}/${name}` : name;
+}
+
+function mediaLoaderTypeForFile(file) {
+    const mime = String(file?.type || "").toLowerCase();
+    if (mime.startsWith("image/")) return "image";
+    if (mime.startsWith("audio/")) return "audio";
+    if (mime.startsWith("video/")) return "video";
+    const filename = String(file?.name || "").toLowerCase();
+    const extension = filename.includes(".") ? filename.slice(filename.lastIndexOf(".") + 1) : "";
+    if (["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif", "heic"].includes(extension)) return "image";
+    if (["mp3", "wav", "flac", "ogg", "oga", "m4a", "aac", "opus", "wma"].includes(extension)) return "audio";
+    if (["mp4", "webm", "mov", "mkv", "avi", "m4v", "mpeg", "mpg", "wmv", "flv"].includes(extension)) return "video";
+    return "";
+}
+
+async function mediaLoaderUploadOne(file) {
+    if (!file) return "";
+    const form = new FormData();
+    form.append("image", file, file.name);
+    form.append("type", "input");
+    const response = await api.fetchApi("/upload/image", { method: "POST", body: form });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error || ("HTTP " + response.status));
+    const filename = mediaLoaderFilenameFromUpload(data);
+    if (!filename) throw new Error("Upload returned no filename");
+    return filename;
+}
+
+async function mediaLoaderUpload(node, input) {
+    const files = Array.from(input?.files || []);
+    if (!files.length) return;
+    const state = mediaLoaderReadState(node);
+    const pending = new Map(MEDIA_LOADER_GROUPS.map((group) => [group.type, state[group.key].length]));
+    const errors = [];
+    let unsupported = 0;
+    let skippedFull = 0;
+    let changed = false;
+    try {
+        for (const file of files) {
+            const type = mediaLoaderTypeForFile(file);
+            if (!type) {
+                unsupported += 1;
+                continue;
+            }
+            const group = MEDIA_LOADER_GROUPS.find((entry) => entry.type === type);
+            if (!group) {
+                unsupported += 1;
+                continue;
+            }
+            if (Number.isFinite(group.max) && (pending.get(type) || 0) >= group.max) {
+                skippedFull += 1;
+                continue;
+            }
+            try {
+                const filename = await mediaLoaderUploadOne(file);
+                if (!state[group.key].includes(filename)) {
+                    state[group.key].push(filename);
+                    pending.set(type, (pending.get(type) || 0) + 1);
+                    changed = true;
+                }
+            } catch (error) {
+                errors.push(String(file.name || type) + ": " + (error?.message || error));
+            }
+        }
+        if (changed) {
+            mediaLoaderWriteState(node, state);
+            mediaLoaderRender(node);
+        }
+    } finally {
+        input.value = "";
+    }
+    const notices = [];
+    if (unsupported) notices.push(TEXT.mediaLoaderUnsupported + " (" + unsupported + ")");
+    if (skippedFull) notices.push(TEXT.mediaLoaderLimit + " (" + skippedFull + ")");
+    if (errors.length) notices.push(TEXT.mediaLoaderUpload + ": " + errors.join("; "));
+    if (notices.length) globalThis.alert?.(notices.join("\n"));
+}
+
+function mediaLoaderUpdateCard(card, group, filename, index) {
+    card.dataset.index = String(index);
+    card.dataset.filename = filename;
+    card.dataset.mediaType = group.type;
+    card.title = filename;
+    card.querySelector(".h3-media-loader-tag").textContent = String(index + 1);
+    const label = card.querySelector(".h3-media-loader-label");
+    label.textContent = filename.split(/[\\/]/).pop() || filename;
+    label.title = filename;
+}
+
+function mediaLoaderCreateCard(node, group, filename) {
+    const card = document.createElement("div");
+    card.className = `h3-media-loader-card is-${group.type}`;
+    card.draggable = true;
+    card.tabIndex = 0;
+    card.append(mediaLoaderItemPreview(filename, group.type));
+
+    const tag = document.createElement("span");
+    tag.className = "h3-media-loader-tag";
+    const label = document.createElement("span");
+    label.className = "h3-media-loader-label";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "h3-media-loader-remove";
+    remove.textContent = "\u00d7";
+    remove.title = TEXT.mediaLoaderRemove;
+    remove.setAttribute("aria-label", TEXT.mediaLoaderRemove);
+    remove.addEventListener("pointerdown", (event) => event.stopPropagation());
+    remove.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const index = Number(card.dataset.index);
+        if (!Number.isInteger(index)) return;
+        const next = mediaLoaderReadState(node);
+        next[group.key].splice(index, 1);
+        mediaLoaderWriteState(node, next);
+        mediaLoaderSyncGroup(node, group, next);
+        mediaLoaderResize(node);
+    });
+    card.append(tag, label, remove);
+
+    card.addEventListener("dragstart", (event) => {
+        event.dataTransfer?.setData("application/x-h3-media-loader-type", group.type);
+        event.dataTransfer?.setData("text/plain", String(card.dataset.index));
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+        card.classList.add("is-dragging");
+    });
+    card.addEventListener("dragend", () => {
+        card.classList.remove("is-dragging");
+        card.parentElement?.querySelectorAll(".is-drop-target").forEach((item) => item.classList.remove("is-drop-target"));
+    });
+    card.addEventListener("dragover", (event) => {
+        const draggedType = event.dataTransfer?.getData("application/x-h3-media-loader-type");
+        if (draggedType && draggedType !== group.type) return;
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+        card.classList.add("is-drop-target");
+    });
+    card.addEventListener("dragleave", () => card.classList.remove("is-drop-target"));
+    card.addEventListener("drop", (event) => {
+        const draggedType = event.dataTransfer?.getData("application/x-h3-media-loader-type");
+        if (draggedType && draggedType !== group.type) return;
+        event.preventDefault();
+        card.classList.remove("is-drop-target");
+        const from = Number(event.dataTransfer?.getData("text/plain"));
+        const index = Number(card.dataset.index);
+        if (!Number.isInteger(from) || !Number.isInteger(index) || from === index) return;
+        const next = mediaLoaderReadState(node);
+        // The entire target card is the hit area. Swap cards directly instead
+        // of requiring the pointer to land on a particular half of the tile.
+        [next[group.key][from], next[group.key][index]] = [
+            next[group.key][index],
+            next[group.key][from],
+        ];
+        mediaLoaderWriteState(node, next);
+        mediaLoaderSyncGroup(node, group, next);
+    });
+    return card;
+}
+
+function mediaLoaderSyncGroup(node, group, state = mediaLoaderReadState(node)) {
+    const panel = node?.__h3MediaLoaderPanel;
+    const list = panel?.querySelector?.(`[data-media-loader-section="${group.type}"] .h3-media-loader-list`);
+    if (!list) return;
+    const entries = state[group.key] || [];
+    const cards = new Map([...list.querySelectorAll(".h3-media-loader-card")]
+        .map((card) => [card.dataset.filename, card]));
+    list.querySelectorAll(".h3-media-loader-empty").forEach((empty) => empty.remove());
+
+    for (const [filename, card] of cards) {
+        if (!entries.includes(filename)) card.remove();
+    }
+    if (!entries.length) {
+        const empty = document.createElement("div");
+        empty.className = "h3-media-loader-empty";
+        empty.textContent = TEXT.mediaLoaderEmpty;
+        list.append(empty);
+        return;
+    }
+    entries.forEach((filename, index) => {
+        const card = cards.get(filename) || mediaLoaderCreateCard(node, group, filename);
+        mediaLoaderUpdateCard(card, group, filename, index);
+        // Appending an existing card only moves it. Its image/video element stays
+        // alive, so reordering another group cannot reload or flash previews.
+        list.append(card);
+    });
+}
+
+function mediaLoaderRender(node) {
+    const panel = node?.__h3MediaLoaderPanel;
+    if (!panel) return;
+    const state = mediaLoaderReadState(node);
+    const total = MEDIA_LOADER_GROUPS.reduce((sum, group) => sum + (state[group.key]?.length || 0), 0);
+    const capacities = MEDIA_LOADER_GROUPS.map((group) => Number(group.max));
+    const finiteCapacity = capacities.every((capacity) => Number.isFinite(capacity));
+    if (node.__h3MediaLoaderCount) node.__h3MediaLoaderCount.textContent = finiteCapacity
+        ? String(total) + "/" + String(capacities.reduce((sum, capacity) => sum + capacity, 0))
+        : String(total);
+    for (const group of MEDIA_LOADER_GROUPS) mediaLoaderSyncGroup(node, group, state);
+    mediaLoaderResize(node);
+}
+
+function mediaLoaderResize(node) {
+    const panel = node?.__h3MediaLoaderPanel;
+    const domWidget = node?.__h3MediaLoaderWidget;
+    if (!panel || !domWidget) return;
+    const measure = () => {
+        // Measure the natural content while the panel is not filling a previously
+        // stretched DOM slot. The measured value is only the minimum, never a cap.
+        panel.style.height = "auto";
+        panel.style.minHeight = "0px";
+        panel.style.maxHeight = "none";
+        panel.style.flex = "0 0 auto";
+        const contentHeight = Math.max(1, Math.ceil(panel.scrollHeight || panel.getBoundingClientRect?.().height || 0));
+        const widgetHeight = Math.max(1, contentHeight + 8);
+        node.__h3MediaLoaderMinWidgetHeight = widgetHeight;
+
+        // Restore the fill layout after measuring. LiteGraph gives a DOM widget
+        // its extra height through computedHeight when the user resizes the node.
+        panel.style.height = "100%";
+        panel.style.minHeight = `${contentHeight}px`;
+        panel.style.maxHeight = "100%";
+        panel.style.flex = "1 1 auto";
+        domWidget.options ||= {};
+        const getWidgetHeight = () => Math.max(1, Number(node.__h3MediaLoaderMinWidgetHeight) || widgetHeight);
+        // No fixed computeSize or maxHeight here. This is the same growable DOM
+        // widget contract used by the batch text-card node: extra node height is
+        // allocated to the panel instead of becoming an empty node background.
+        try {
+            delete domWidget.computeSize;
+        } catch {
+            domWidget.computeSize = undefined;
+        }
+        domWidget.computeLayoutSize = () => {
+            const height = getWidgetHeight();
+            return { minHeight: height, maxHeight: undefined, minWidth: 0 };
+        };
+        domWidget.options.getMinHeight = getWidgetHeight;
+        delete domWidget.options.getMaxHeight;
+        delete domWidget.options.getHeight;
+        const currentWidth = Number(node.size?.[0]) || 300;
+        // Compute the fixed node chrome independently. Only grow a too-small
+        // node to its content minimum; never shrink a user-resized node.
+        const wasHidden = domWidget.hidden;
+        const wasType = domWidget.type;
+        let fixedSize = null;
+        try {
+            domWidget.hidden = true;
+            domWidget.type = "hidden";
+            fixedSize = node.computeSize?.();
+        } finally {
+            domWidget.hidden = wasHidden;
+            domWidget.type = wasType;
+        }
+        if (Array.isArray(fixedSize) && typeof node.setSize === "function") {
+            const width = Math.max(currentWidth, 320);
+            const minimumHeight = Math.max(1, Math.ceil((fixedSize[1] || 0) + widgetHeight + 4));
+            const currentHeight = Number(node.size?.[1]) || 0;
+            if (currentHeight + 1 < minimumHeight) {
+                node.setSize([width, minimumHeight]);
+                if (Array.isArray(node.size)) {
+                    node.size[0] = width;
+                    node.size[1] = minimumHeight;
+                }
+            }
+        }
+        node._widgetSlotsDirty = true;
+        node.setDirtyCanvas?.(true, true);
+        app.graph?.setDirtyCanvas?.(true, true);
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(measure);
+    else setTimeout(measure, 0);
+}
+
+function installMediaLoaderStyles() {
+    let style = document.getElementById("h3-media-loader-styles");
+    if (!style) {
+        style = document.createElement("style");
+        style.id = "h3-media-loader-styles";
+        document.head.append(style);
+    }
+    style.textContent = `
+      .h3-media-loader-panel { display:flex; flex-direction:column; gap:8px; width:100%; height:100%; min-height:0; max-height:100%; flex:1 1 auto; align-self:stretch; box-sizing:border-box; padding:8px; border:1px solid #111; border-radius:6px; background:#222; color:var(--h3-native-widget-text,#ddd); font-size:12px; overflow:hidden; }
+      .h3-media-loader-toolbar { display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:28px; padding-bottom:1px; }
+      .h3-media-loader-heading { display:flex; align-items:baseline; gap:7px; min-width:0; }
+      .h3-media-loader-title { font-weight:650; color:#eee; }
+      .h3-media-loader-count { color:#888; font-size:10px; font-variant-numeric:tabular-nums; }
+      .h3-media-loader-upload { border:1px solid #444; border-radius:4px; background:#2a2a2a; color:#ddd; padding:4px 8px; cursor:pointer; font-size:11px; line-height:1.35; }
+      .h3-media-loader-upload:hover { background:#333; border-color:#666; color:#fff; }
+      .h3-media-loader-groups { display:flex; flex:1 1 auto; flex-direction:column; gap:8px; min-width:0; min-height:0; }
+      .h3-media-loader-section { min-width:0; border-top:1px solid #353535; padding-top:7px; }
+      .h3-media-loader-header { display:flex; align-items:center; justify-content:space-between; gap:6px; margin:0 0 5px; color:#bdbdbd; font-size:10px; font-weight:650; line-height:1.2; }
+      .h3-media-loader-list { display:grid; grid-template-columns:repeat(auto-fill,76px); gap:8px; min-height:26px; }
+      .h3-media-loader-empty { display:flex; grid-column:1 / -1; align-items:center; min-height:26px; padding:0 5px; border:1px dashed #3c3c3c; border-radius:4px; color:#6f6f6f; font-size:10px; }
+      .h3-media-loader-card { position:relative; display:block; min-width:0; aspect-ratio:1; overflow:visible; border:1px solid #393939; border-radius:5px; background:#161616; cursor:grab; outline:none; transition:border-color .14s ease, background .14s ease, transform .14s ease; }
+      .h3-media-loader-card:hover, .h3-media-loader-card:focus-visible { border-color:#6b829b; background:#1a1d20; }
+      .h3-media-loader-card:active { cursor:grabbing; }
+      .h3-media-loader-card.is-dragging { opacity:.4; transform:scale(.96); }
+      .h3-media-loader-card.is-drop-target { border-color:#7ea6cb; box-shadow:0 0 0 1px rgba(126,166,203,.45); }
+      .h3-media-loader-thumb { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:4px; background:#101010; }
+      .h3-media-loader-thumb.is-audio { background:#10201d; }
+      .h3-media-loader-thumb.is-audio::before { content:""; position:absolute; inset:7px; border:1px solid rgba(70,206,182,.18); border-radius:3px; pointer-events:none; }
+      .h3-media-loader-thumb > img, .h3-media-loader-thumb > video { position:relative; z-index:1; width:100%; height:100%; display:block; object-fit:contain; object-position:center; }
+      .h3-media-loader-audio-wave { position:relative; z-index:1; display:flex; align-items:center; justify-content:center; gap:4px; width:48%; height:42%; }
+      .h3-media-loader-audio-wave i { display:block; width:4px; height:var(--h3-audio-bar-height); border-radius:3px; background:#35cdb9; box-shadow:0 0 0 1px rgba(0,0,0,.08); }
+      .h3-media-loader-preview-fallback { color:#777; font-size:10px; }
+      .h3-media-loader-card.is-audio::after { content:""; position:absolute; inset:48% 0 0; border-radius:0 0 4px 4px; pointer-events:none; background:linear-gradient(180deg,transparent,rgba(0,0,0,.86)); }
+      .h3-media-loader-tag { position:absolute; bottom:4px; left:4px; z-index:2; min-width:12px; padding:2px 4px; border-radius:3px; background:rgba(8,8,8,.7); color:#e7e7e7; font-size:9px; line-height:1.15; text-align:center; font-variant-numeric:tabular-nums; pointer-events:none; }
+      .h3-media-loader-duration { position:absolute; right:4px; bottom:4px; z-index:2; padding:2px 4px; border-radius:3px; background:rgba(8,8,8,.35); color:#f1f1f1; font-size:9px; line-height:1.15; font-variant-numeric:tabular-nums; text-shadow:0 1px 2px rgba(0,0,0,.45); pointer-events:none; }
+      .h3-media-loader-label { position:absolute; right:4px; bottom:4px; left:25px; z-index:1; overflow:hidden; color:#eee; font-size:9px; line-height:1.2; text-overflow:ellipsis; white-space:nowrap; pointer-events:none; }
+      .h3-media-loader-card.is-image .h3-media-loader-label, .h3-media-loader-card.is-video .h3-media-loader-label { display:none; }
+      .h3-media-loader-remove { position:absolute; top:-7px; right:-7px; z-index:3; width:17px; height:17px; padding:0; border:2px solid #222; border-radius:50%; background:#3b434a; color:#f1f1f1; cursor:pointer; display:flex; align-items:center; justify-content:center; font-family:Arial,sans-serif; font-size:15px; font-weight:400; line-height:1; opacity:0; visibility:hidden; transform:scale(.82); transition:opacity .15s ease, visibility .15s ease, transform .15s ease, background .15s ease; }
+      .h3-media-loader-card:hover .h3-media-loader-remove, .h3-media-loader-card:focus-within .h3-media-loader-remove { opacity:1; visibility:visible; transform:scale(1); }
+      .h3-media-loader-remove:hover { background:#8b4242; color:#fff; }
+    `;
+}
+
+function installMediaLoaderNode(nodeType, nodeData) {
+    if (nodeData?.name !== MEDIA_LOADER_CLASS) return;
+    if (nodeType.prototype.__h3EasyMediaLoaderInstalled) return;
+    nodeType.prototype.__h3EasyMediaLoaderInstalled = true;
+    installMediaLoaderStyles();
+    const setup = (node) => {
+        if (!node || node.__h3MediaLoaderSetup || typeof node.addDOMWidget !== "function") return;
+        node.__h3MediaLoaderSetup = true;
+        localizeNodeInstance(node);
+        const stateWidget = getWidget(node, "media_state");
+        mediaLoaderHideStateWidget(stateWidget);
+        const panel = document.createElement("div");
+        panel.className = "h3-media-loader-panel";
+        panel.addEventListener("pointerdown", (event) => event.stopPropagation());
+        panel.addEventListener("wheel", (event) => {
+            // This node has no wheel-scrolling surface. Forward every wheel event
+            // to LiteGraph so the canvas keeps its normal zoom behavior.
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation?.();
+            app.canvas?.processMouseWheel?.(event);
+        }, { passive: false, capture: true });
+        const toolbar = document.createElement("div");
+        toolbar.className = "h3-media-loader-toolbar";
+        const heading = document.createElement("div");
+        heading.className = "h3-media-loader-heading";
+        const title = document.createElement("span");
+        title.className = "h3-media-loader-title";
+        title.textContent = TEXT.mediaLoaderAll;
+        const count = document.createElement("span");
+        count.className = "h3-media-loader-count";
+        heading.append(title, count);
+        const upload = document.createElement("button");
+        upload.type = "button";
+        upload.className = "h3-media-loader-upload";
+        upload.textContent = TEXT.mediaLoaderUpload;
+        upload.title = TEXT.mediaLoaderUpload;
+        upload.addEventListener("click", () => {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = "image/*,audio/*,video/*";
+            input.multiple = true;
+            input.addEventListener("change", () => mediaLoaderUpload(node, input), { once: true });
+            input.click();
+        });
+        toolbar.append(heading, upload);
+        const groups = document.createElement("div");
+        groups.className = "h3-media-loader-groups";
+        panel.append(toolbar, groups);
+        node.__h3MediaLoaderCount = count;
+        for (const group of MEDIA_LOADER_GROUPS) {
+            const section = document.createElement("section");
+            section.className = "h3-media-loader-section";
+            section.dataset.mediaLoaderSection = group.type;
+            const header = document.createElement("div");
+            header.className = "h3-media-loader-header";
+            const sectionTitle = document.createElement("span");
+            sectionTitle.textContent = group.type === "image" ? TEXT.mediaLoaderImages : group.type === "audio" ? TEXT.mediaLoaderAudio : TEXT.mediaLoaderVideos;
+            header.append(sectionTitle);
+            const list = document.createElement("div");
+            list.className = "h3-media-loader-list";
+            section.append(header, list);
+            groups.append(section);
+        }
+        node.__h3MediaLoaderPanel = panel;
+        const domWidget = node.addDOMWidget("h3_media_loader", "h3_media_loader", panel, {
+            getValue: () => String(getWidget(node, "media_state")?.value || ""),
+            setValue: (value) => { const widget = getWidget(node, "media_state"); if (widget) widget.value = String(value || ""); mediaLoaderRender(node); },
+            serialize: false,
+            getMinHeight: () => Math.max(1, Number(node.__h3MediaLoaderMinWidgetHeight) || 48),
+            afterResize: () => mediaLoaderResize(node),
+        });
+        if (!domWidget) return;
+        domWidget.serialize = false;
+        setWidgetOption(domWidget, "serialize", false);
+        node.__h3MediaLoaderWidget = domWidget;
+        mediaLoaderRender(node);
+        mediaLoaderResize(node);
+        repairNodeLayout(node);
+    };
+    const originalCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function onNodeCreatedH3MediaLoader() { const result = originalCreated?.apply(this, arguments); setup(this); return result; };
+    const originalAdded = nodeType.prototype.onAdded;
+    nodeType.prototype.onAdded = function onAddedH3MediaLoader(graph) { const result = originalAdded?.apply(this, arguments); setup(this); mediaLoaderRender(this); return result; };
+    const originalConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function onConfigureH3MediaLoader(info) { const result = originalConfigure?.apply(this, arguments); setup(this); mediaLoaderRender(this); return result; };
+    const originalResize = nodeType.prototype.onResize;
+    nodeType.prototype.onResize = function onResizeH3MediaLoader(size) {
+        const result = originalResize?.apply(this, arguments);
+        if (this.__h3MediaLoaderSetup) mediaLoaderResize(this);
         return result;
     };
 }
@@ -5822,8 +7171,10 @@ app.registerExtension({
         installMediaSourceNode(nodeType, nodeData);
         installLoaderNode(nodeType, nodeData);
         installAdapterNode(nodeType, nodeData);
+        installMediaLoaderNode(nodeType, nodeData);
         installMediaBridgeNode(nodeType, nodeData);
         installOutputNode(nodeType, nodeData);
+        installSegmentRefineNode(nodeType, nodeData);
         installNode(nodeType, nodeData);
     },
 });
