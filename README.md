@@ -154,7 +154,7 @@ Regular first-pass workflow:
 
 ### Optional per-segment control
 
-If you only want one chain that generates every segment, use **Segment Sample**. To adjust seeds per segment, temporarily replace one segment's prompt, or optionally rerun only the affected part later, use [`MiniMax_H3_Easy_Context_Segments_Control.json`](workflow/7.MiniMax_H3_Easy_Context_Segments_Control.json). It connects the shared Context, Model, SAMPLER, and SIGMAS once through **MiniMax H3 Easy Sample Setup**, then chains multiple **Segment Step** nodes. The first run still generates the complete video; selective reruns are an extra capability.
+If you only want one chain that generates every segment, use **Segment Sample**. To adjust seeds per segment, temporarily replace one segment's prompt, or optionally rerun only the affected part later, use [`7.MiniMax_H3_Easy_Context_Segments_Control.json`](workflow/7.MiniMax_H3_Easy_Context_Segments_Control.json). It connects the shared Context, Model, SAMPLER, and SIGMAS once through **MiniMax H3 Easy Sample Setup**, then chains multiple **Segment Step** nodes. The first run still generates the complete video; selective reruns are an extra capability.
 
 The first Step receives Setup; later Steps only connect `Previous segment`, and the segment order is inferred from the chain. Each Step has its own seed, while `Prompt override` is optional. If it is not connected, the Step keeps using the segment prompt and `@` media from Context Segments. The example contains 3 Steps; add or remove Steps as needed.
 
