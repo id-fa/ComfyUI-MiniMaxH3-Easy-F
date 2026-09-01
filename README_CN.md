@@ -1,294 +1,35 @@
-# ComfyUI-MiniMaxH3-Easy 中文说明
+# ComfyUI-MiniMaxH3-Easy
 
 [English README](README.md)
 
-`ComfyUI-MiniMaxH3-Easy` 为 MiniMax H3 提供一套紧凑的 ComfyUI 工作流入口，整合
-文生视频、图生视频、首尾帧生成和完整参考生视频。
-
-主节点坚持使用一个支持多线连接的 `Media` 端口，而不是暴露固定数量的图片、视频和
-音频输入口。同时提供 `@` 素材引用、结构化台词块、真正的原始提示词视图、外部文本
-输入、按模式选择的 Prompt Guide，以及可选的 API 提示词优化。
-
-采样器、LoRA 和注意力补丁、解码、视频组装与保存节点仍然放在主节点外部，继续保持
-与 ComfyUI 生态的自由组合能力。
-
-## 核心功能
-
-### 单一多线 `Media` 输入
-
-图片、视频和独立音频都连接到同一个可见的 `Media` 端口，并允许多条线同时接入。
-
-- 图片、视频、音频分别独立编号；
-- 不同媒体类型使用不同的连线颜色和预览样式；
-- 工作流保存和重新加载后仍保留连接顺序；
-- 从 `Media` 端口向左拖到空白画布，可快速创建兼容的媒体加载节点；
-- 点击虚拟连线中间的编号，可打开删除菜单。
+一套面向实际创作的 MiniMax H3 ComfyUI 节点：用更少的节点完成文生、图生、首尾帧、参考生视频、数字人和长视频上下文分段，并提供统一媒体管理、可视化素材引用、提示词优化与分段二采。
 
 <p align="center">
-  <img src="images/mixed-media-input-zh.png" alt="多线媒体输入" width="560">
+  <img src="images/media-loader-zh.png" alt="MiniMax H3 Easy 媒体加载器与主节点" width="960">
 </p>
 
-<p align="center">
-  <img src="images/quick-create-node-zh.png" alt="快速创建媒体节点" width="460">
-</p>
-
-单一端口是核心设计。前端通过隐藏的执行输入传输有序媒体，不会把节点重新变成一排
-固定插槽。
-
-### `@` 素材引用
-
-在**参考生视频**模式中输入 `@`，即可选择已连接的图片、视频或独立音频。选择器按照
-图片、视频、音频的顺序显示，并在可用时提供预览。
-
-<p align="center">
-  <img src="images/mention-popup-zh.png" alt="素材引用选择器" width="320">
-</p>
-
-<p align="center">
-  <img src="images/reference-editor-zh.png" alt="参考生视频编辑器" width="720">
-</p>
-
-引用可以按序号或文件名显示。真正执行时，节点会自动转换为 MiniMax H3 使用的
-`<Picture N>`、`<Video N>` 和 `<Audio N>` 标签。
-
-视频自带的同步音轨会继续与对应视频配对，独立音频则单独编号。在多个视频或独立音频
-导致关系可能不明确时，节点会在运行时提示词中补充视频与音轨的来源关系。
-
-已断开的 `@` 引用不会被静默删除；引用数量与媒体数量不一致时，也不会阻止工作流
-运行。是否重新连接或删除失效引用，由用户自行决定。
-
-### 台词块与原始提示词视图
-
-在结构化编辑器中输入 `#`，即可创建台词块。
-
-<p align="center">
-  <img src="images/dialogue-block-zh.png" alt="台词块" width="560">
-</p>
-
-- `Enter`：退出当前台词块；
-- `Shift+Enter`：在台词块内部换行；
-- 执行和保存时转换为 `<d>...</d>`；
-- 台词和歌词保留原始语言，不会强制变成中文。
-
-编辑器右下角的 `@` / `</>` 按钮用于切换结构化视图和真正的原始提示词视图。原始
-视图会直接显示 `<Picture N>`、`<Video N>`、`<Audio N>` 和 `<d>...</d>`，不会
-继续渲染成引用芯片或台词块。
-
-### 原生外部文本连接
-
-提示词参数可以转换为输入，并连接普通 ComfyUI `STRING` 文本节点。存在外部文本连接
-时：
-
-- 自定义编辑器进入只读状态；
-- 工作流实际使用外部传入的字符串；
-- 节点内部文本不会追加到外部文本；
-- 该编辑器的提示词优化按钮会被禁用。
-
-在编辑器中按 `Ctrl+S` / `Cmd+S` 会先同步提示词，再让 ComfyUI 的原生工作流保存
-快捷键继续执行。输入、退格、撤销/重做和画布缩放逻辑仍保持可用。
-
-## 提示词优化
-
-点击提示词编辑器右下角的 `✦`，即可使用已配置的 API 重写当前提示词。请求进行中会
-显示加载状态和已用时间。
-
-目前支持：
-
-- OpenAI-compatible Chat Completions API；
-- OpenAI Responses API；
-- Gemini Native `generateContent` API；
-- 自定义 API URL、API Key 和模型名；
-- 按节点模式选择 MiniMax H3 Prompt Guide；
-- 可选读取已连接媒体；
-- 600 秒请求超时；
-- 请求最大输出 50,000 tokens。
-
-实际输出长度仍取决于模型和渠道本身的限制。渠道上限更低时，可能截断结果或拒绝该
-参数。
-
-### API 设置弹窗
-
-打开**高级选项**，将**提示词优化 API 设置**临时切换为 `true`，即可打开独立设置
-弹窗。弹窗关闭后，该开关会自动恢复为 `false`。
-
-弹窗包含：
-
-- API 格式：OpenAI 兼容、OpenAI Responses 或 Gemini 原生；
-- API 地址；
-- API Key；
-- 模型名；
-- 是否读取已连接媒体。
-
-这些设置保存在：
-
-```text
-ComfyUI/custom_nodes/ComfyUI-MiniMaxH3-Easy/prompt_optimizer.json
-```
-
-该文件由当前 ComfyUI 安装中的所有 MiniMax H3 Easy 主节点共用，并已加入
-`.gitignore`。API Key 输入框使用密码样式，但 JSON 文件本身仍以明文保存 Key，
-不要公开、打包或上传该文件。
-
-**提示词方案**仍是普通的节点参数，会跟随工作流保存，不属于全局 API 配置。
-
-### Prompt Guide 选择
-
-提示词优化始终加载 H3 通用规则，再按照节点模式选择对应规则：
-
-- 图生或首尾帧模式加载 T2VA、I2VA、FL2VA、L2VA 基础规则；
-- 参考生视频模式加载完整 Ref2VA 参考规则；
-- 用户选中的场景方案及其 references 文件会在存在时追加。
-
-当前内置场景方案包括：3D 动画短片、品牌宣传片、合作游戏开场、手绘实拍融合、极简
-产品广告、音乐视频字幕、纸张拼贴和纸艺定格动画。
-
-### 读取媒体与证据规则
-
-打开**读取已连接媒体**后，可解析且单个不超过 32 MiB 的本地文件会尝试附加到优化
-请求：
-
-- Gemini Native 可附加图片、视频和音频；
-- OpenAI-compatible Chat Completions 和 OpenAI Responses 当前都只实际附加图片；
-- 不支持、找不到或体积过大的文件会被跳过。
-
-系统规则明确要求优化模型不得编造媒体内容。如果没有实际附加文件，或者所选模型无法
-理解该媒体模态，模型只能保留相关引用标签，并根据用户原始文本和明确要求推理，不能
-假装看见或听见素材。
-
-### 重新优化逻辑
-
-如果编辑器内容仍然等于上一次优化结果，再次点击 `✦` 会从当时的原始提示词重新生成，
-而不是在生成结果上反复改写。用户手动修改优化结果后，修改后的内容会成为下一次优化的
-输入。
-
-## 节点说明
-
-### MiniMax H3 Easy Loader
-
-一体化加载器选择：
-
-- FL2VA 主模型；
-- Ref2VA 主模型；
-- Qwen3-VL 文本编码器；
-- 视频 VAE；
-- 音频 VAE。
-
-其中一种主模型可以设置为“无”，剩余模型会自动承担所有模式。两种模型都已配置时，
-文生、图生和首尾帧优先使用 FL2VA，完整参考生视频优先使用 Ref2VA。
-
-主模型按实际模式延迟加载。当模式切换到另一个模型文件时，加载器会释放自身缓存的主
-模型，请求 ComfyUI 清理软缓存，然后再加载另一种模型。
-
-文件名匹配支持常见社区命名和量化变体，包括 `.safetensors` 与 `.gguf`。
-
-### MiniMax H3 Easy Model Bridge
-
-模型中转节点可以把普通 ComfyUI 加载器的输出组合成 H3 模型包，接受：
-
-- 必接的 `CLIP`、视频 `VAE`、音频 `VAE`；
-- 可选的 FL2VA `MODEL`；
-- 可选的 Ref2VA `MODEL`；
-- 两个主模型可以只连接其中一个，也可以同时连接。
-
-因此可以继续使用原生、社区或 GGUF 加载器。需要注意：如果上游同时加载了两个主模型，
-它们是否同时驻留显存由 ComfyUI 的模型管理和上游节点决定。希望尽量降低显存占用时，
-只连接一个主模型。
-
-### MiniMax H3 Easy
-
-主节点负责提示词编辑、媒体排序、尺寸、时长、模式选择、Conditioning 和 Latent 准备，
-输出：
-
-- `Model`：连接模型 LoRA、注意力补丁、加速节点或采样器；
-- `H3 Context`：连接到 **MiniMax H3 Easy Output**。
-
-### MiniMax H3 Easy Output
-
-将 `H3 Context` 展开为标准工作流输出：
-
-- Conditioning；
-- Latent；
-- Video VAE；
-- Audio VAE；
-- FPS。
-
-## 模式与媒体限制
-
-### 图生或首尾帧
-
-- 不连接媒体：文生视频；
-- 一张图片：根据高级选项作为首帧或尾帧；
-- 两张图片：首尾帧生成；
-- 此模式拒绝视频和音频；
-- 最多两张图片。
-
-### 参考生视频
-
-- 最多九张图片、三条视频、三条独立音频；
-- 可见媒体连接总数最多十五个；
-- 至少需要一张图片或一条视频，不能只连接音频；
-- 图片、视频、音频的编号分别独立。
-
-## 参数设计
-
-### 分辨率和宽高比
-
-分辨率预设采用 megapixel 预算：
-
-`360P`、`416P`、`480P`、`540P`、`640P`、`720P`、`768P`、`832P`、
-`928P`、`1024P`、`1080P` 和 `Custom`。
-
-宽高比包括 `1:1`、`2:3`、`3:2`、`3:4`、`4:3`、`9:16`、`16:9` 和
-`21:9`。预设和自定义宽高最终都会对齐到 32 的倍数。
-
-### 秒数和帧率
-
-- 秒数：`0.2` 到 `30.0`，步进 `0.1` 秒；
-- FPS：`1` 到 `120`，位于高级选项中；
-- 默认 FPS：`24`。
-
-MiniMax H3 的实际帧数会对齐到合法的 `5 + 17n`。因此最终帧数是最接近的支持值，
-不一定严格等于 `秒数 × FPS`。极低的秒数和帧率组合仍至少生成五帧。
-
-### 高级选项
-
-高级选项默认关闭，不需要的参数会真正收缩节点高度。根据当前模式显示：
-
-- FPS；
-- 首帧优先或尾帧优先；
-- 参考图片尺寸：匹配生成分辨率、1K/1.5K/2K 像素面积或原图；
-- `@` 按序号或按文件名显示；
-- 提示词优化 API 设置弹窗开关；
-- 每节点 Prompt Guide。
-
-### 参考图片尺寸
-
-参考图片使用统一的缩放比例，不会分别拉伸宽度和高度，也不会裁剪图片。
-可选模式包括：
-
-- **匹配生成分辨率**：按照当前视频生成的像素面积缩放，行为接近官方 H3
-  参考生视频节点；
-- **1K 面积**：约 `1MP`，以 `1024 x 1024` 为等效标准；
-- **1.5K 面积**：约 `2.25MP`，以 `1536 x 1536` 为等效标准；
-- **2K 面积**：约 `4MP`，以 `2048 x 2048` 为等效标准；
-- **原图**：不进行图片侧缩放，直接将输入图片送入参考 VAE，高分辨率或多张
-  参考图会占用更多显存。
-
-面积档位只会缩小图片。内部会选择接近目标面积且尽量保持原始宽高比的 H3
-合法尺寸。该设置只影响参考图条件，不会改变视频生成的宽度、高度、分辨率、
-时长或 FPS。
+## 主要优势
+
+- **一个入口覆盖常用模式**：文生、图生、首尾帧、参考生视频和数字人共用同一个 Easy 主节点。
+- **统一管理图片、视频和音频**：Media Loader 支持上传、预览、排序、替换和删除，视频缩略图直接显示时长。
+- **提示词直接引用素材**：输入 `@` 即可插入图片、视频或音频引用，不必手写 `<Picture N>` 等标签。
+- **长视频分段生成**：每段可使用独立提示词和参考素材，同时把上一段的画面或音视频上下文传给下一段。
+- **内置分段二采**：支持 Pixel Resize、3D Latent Upscale，以及显存不足时的 Low VRAM Tile。
+- **保持 ComfyUI 的可组合性**：采样器、LoRA、注意力优化、解码和保存仍可自由连接。
 
 ## 安装
 
-将项目安装到：
+请先更新到包含 MiniMax H3 官方节点的较新版本 ComfyUI。
 
-```text
-ComfyUI/custom_nodes/ComfyUI-MiniMaxH3-Easy
+在 `ComfyUI/custom_nodes` 中安装：
+
+```bash
+git clone https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy.git
 ```
 
-安装或更新 Python 文件后需要重启 ComfyUI。只更新前端文件时通常刷新页面即可。
+也可以通过 ComfyUI Manager 搜索 `ComfyUI-MiniMaxH3-Easy` 安装。**请在版本选择中安装 Nightly 版本，Nightly 才是当前最新版**；其他发布版本可能落后于本仓库。安装或更新 Python 文件后请重启 ComfyUI。
 
-模型放入标准目录：
+常规模型放入：
 
 ```text
 ComfyUI/models/diffusion_models/
@@ -296,26 +37,241 @@ ComfyUI/models/text_encoders/
 ComfyUI/models/vae/
 ```
 
-使用 `.gguf` 主模型或文本编码器时，请安装
-[ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) 并重启 ComfyUI。普通
-safetensors 继续使用 ComfyUI 原生加载器。
+使用 Latent Upscale 二采时，将对应的 H3 3D latent 放大模型放入：
 
-示例工作流位于 [`workflow`](workflow) 目录。
+```text
+ComfyUI/models/latent_upscale_models/
+```
 
-## 注意事项
+Easy Loader 可以直接选择 FL2VA、Ref2VA、文本编码器和两个 VAE。模型加载器已经取消文件名白名单和命名筛选，会显示 ComfyUI 对应模型目录中的全部可用文件；请根据模型用途选择正确的文件。如果希望使用其他原生、社区或 GGUF 加载器，也可以通过 **MiniMax H3 Easy Model Adapter** 接入。
 
-- 同时支持 ComfyUI 旧画布和 Nodes 2.0；
-- 中文浏览器显示中文参数，其他浏览器显示英文参数；
-- 工作流序列化会保留普通节点参数和编辑器内容；
-- 模型 LoRA 和注意力补丁应连接在主节点 `Model` 输出之后；
-- 提示词优化只是可选编辑工具，不影响节点正常执行 MiniMax H3 生成。
+## 快速开始
 
-## 开源协议和署名
+最快的方式是导入 [`workflow/1.MiniMax_H3_Easy.json`](workflow/1.MiniMax_H3_Easy.json)，然后：
 
-本项目采用 [MIT 协议](LICENSE) 发布。
+1. 在 **MiniMax H3 Easy Loader** 中选择模型；
+2. 在 **MiniMax H3 Easy** 中选择模式；
+3. 输入提示词，并按需要连接图片、视频或音频；
+4. 设置分辨率、宽高比和时长；
+5. Queue 工作流。
 
-如果参考、复用或改写本项目的较大部分代码，请在项目文档中注明原作者和
-`ComfyUI-MiniMaxH3-Easy` 项目。
+手动搭建时，基本结构是：
 
-请不要将本项目的多线媒体单输入、`@` 引用编辑器、台词块转换机制或相关实现完整描述
-为自己的原创工作。
+```text
+Easy Loader → MiniMax H3 Easy → Easy Output → 采样 / 解码 / 保存
+```
+
+主节点输出的 `Model` 可继续连接 LoRA、模型补丁或采样器；`H3 Context` 连接 **MiniMax H3 Easy Output**。
+
+## 生成模式
+
+| 目标 | 模式与输入 |
+|---|---|
+| 文生视频 | 选择“图生或首尾帧”或“参考生视频”，不连接任何媒体 |
+| 图生视频 | 选择“图生或首尾帧”，连接 1 张图片 |
+| 首尾帧视频 | 选择“图生或首尾帧”，连接 2 张图片 |
+| 参考生视频 | 选择“参考生视频”，连接图片、视频或独立音频；必须至少有一张图片或一个视频 |
+| 数字人 | 选择“数字人”，连接视觉参考和且仅一条驱动音频 |
+
+首尾帧图片会按目标画布进行必要的中心裁切，不会被横向或纵向拉伸。
+
+“图生或首尾帧”和“参考生视频”两种模式在没有连接任何素材时都会自动走文生视频，不需要为了文生单独切换到固定模式。
+
+当 Loader 同时配置 FL2VA 和 Ref2VA 时，普通文生/图生优先使用 FL2VA，完整参考生视频优先使用 Ref2VA；只配置一个模型时，该模型会承担所有模式。
+
+### 数字人
+
+数字人模式会把 Media 中唯一的一条音频作为驱动音轨锁定到生成结果，不再把它当成普通参考音频。视觉参考可以是图片或视频；如果没有提供音频，节点会自动退回普通参考生视频，不会直接报错。
+
+<p align="center">
+  <img src="images/digital-human-mode-zh.png" alt="数字人模式" width="640">
+</p>
+
+## 媒体与提示词
+
+### 四种媒体输入方式
+
+| 方式 | 适合场景 |
+|---|---|
+| **Media Loader** | 推荐的日常用法；集中管理素材，并支持视频参考解码缓存 |
+| **直接连接 Media 口** | 从普通图片、视频、音频节点直接连接；同一个可见端口支持多条虚拟连线 |
+| **Media Bridge** | 工作流 API、无头运行或需要显式输入口的工作流 |
+| **Media Splitter** | 将 Media Bundle 拆成可接入其他工作流的独立图片、视频和音频输出 |
+
+Media Loader 本身可以保存较大的素材库，实际数量限制由使用它的 Easy 或 Context Segments 节点检查。**四种方式中，只有 Media Loader 会缓存视频参考的解码结果**：同一个视频首次解码后，后续生成可通过 ComfyUI 的节点缓存直接复用，从而减少重复使用视频参考时的加载和解码时间。更换文件或文件内容变化后缓存会自动失效。直接连接 Media 口、Media Bridge 和 Media Splitter 不提供这项视频解码缓存；它节省的是生成前的视频处理时间，不会缩短模型本身的采样时间。
+
+`Media Splitter` 是 Media Loader / Media Bridge 的反向工具：把一个 `Media Bundle` 拆成标准的 `IMAGE`、`VIDEO`、`AUDIO` 输出。设置三类数量后，节点只显示对应数量的输出口；不需要的输出不会占用画布空间，适合把同一套素材分给其他 ComfyUI 工作流。
+
+直接连接 Media 口时，可以从端口拖到空白画布快速创建媒体节点，也可以点击虚拟连线编号删除对应素材。
+
+<p align="center">
+  <img src="images/mixed-media-input-zh.png" alt="多线 Media 输入" width="620">
+</p>
+
+### `@` 素材引用
+
+在参考生视频或上下文提示词中输入 `@`，即可选择已经连接的图片、视频或音频。界面可以按序号或文件名显示引用，运行时会自动转换为 H3 需要的标签。
+
+图片、视频和音频分别独立编号。例如 `@图片1`、`@视频1` 和 `@音频1` 可以同时存在。
+
+<p align="center">
+  <img src="images/mention-popup-zh.png" alt="素材引用选择器" width="360">
+</p>
+
+### 台词块与原始视图
+
+输入 `#` 可以创建台词块，运行时自动转换为 `<d>...</d>`。编辑器右下角的按钮用于提示词优化和结构化/原始提示词视图切换。
+
+<p align="center">
+  <img src="images/dialogue-block-zh.png" alt="结构化台词块" width="560">
+</p>
+
+提示词参数也可以转换为普通 `STRING` 输入。连接外部文本后，节点内编辑器会进入只读状态，并以外部字符串为准。
+
+## 上下文分段长视频
+
+上下文分段把一条长视频拆成多个连续片段。每段保留自己的提示词、时长和参考素材，同时从上一段取得连续性信息。
+
+最基本的链路是：
+
+```text
+Context Segments → Segment Sample → Segment Decode → 第一采视频
+                         ↓
+                  Segment Refine → Segment Decode → 二采视频
+```
+
+### 基本用法
+
+1. 用单独一行 `---` 分隔每段提示词；在结构化编辑器中输入 `~` 会自动插入这个分隔符；
+2. 在“分段秒数”中填写对应时长，例如 `5,5,5`；
+3. 通过 `@` 为各段指定需要的媒体；
+4. 选择连续方式和上下文帧数；
+5. 将 `H3 Context` 连接到 **Segment Sample**。
+
+普通第一采工作流：
+
+- [`4.MiniMax_H3_Easy_Context_Segments.json`](workflow/4.MiniMax_H3_Easy_Context_Segments.json)
+
+### 逐段控制（可选）
+
+如果只想一条链完成所有分段，直接使用 **Segment Sample** 即可。需要逐段调整 Seed、临时替换某段提示词，或以后只重跑受影响的分段时，可使用 [`MiniMax_H3_Easy_Context_Segments_Control.json`](workflow/7.MiniMax_H3_Easy_Context_Segments_Control.json)。它用 **MiniMax H3 Easy Sample Setup** 接收一次公共的 Context、Model、SAMPLER 和 SIGMAS，再把多个 **Segment Step** 串联起来；第一次运行仍会完整生成，局部重跑只是额外能力。
+
+第一个 Step 接 Setup，后续 Step 只连接 `Previous segment`，分段顺序由连线自动确定。每个 Step 都有自己的 Seed，`Prompt override` 是可选输入；不连接时继续使用 Context Segments 中的分段提示词和 `@` 素材。示例工作流放了 3 个 Step，可按需要增加或减少。
+
+### 分段提示词与参考媒体
+
+所有连接到 Context Segments 的素材组成一个共享素材库，但不会自动全部参与每一段。**每个分段只会直接使用该段提示词中通过 `@` 明确引用的图片、视频或音频**；引用不会从上一段继承。同一份素材需要用于多段时，应在每个相关分段中再次 `@` 引用。
+
+未被当前分段引用的素材不会送入该段生成，避免不同片段的参考内容互相干扰。编辑器会在运行时把 `@` 引用转换为 H3 所需的标签，并按当前分段使用的素材重新编号；即使某段没有直接引用素材，所选连续方式仍会把上一段的上下文传给它。
+
+### 连续方式
+
+| 连续方式 | 作用 | 可用上下文帧数 |
+|---|---|---|
+| **Latent Guide** | 直接传递上一段的视频 latent，通常是最适合先尝试的模式 | `5 / 22 / 39 / 56 / 73` |
+| **RGB Guide** | 将上一段尾帧作为多帧视觉 Guide 重新编码 | `5 / 22 / 39 / 56 / 73` |
+| **Soft AV Prefix** | 同时传递画面和音频前缀，并柔和释放音频边界 | `39 / 90 / 141` |
+| **Hard AV Prefix** | 严格保持画面和音频的重叠前缀 | `39 / 90 / 141` |
+
+<p align="center">
+  <img src="images/context-continuity-modes-zh.png" alt="上下文连续方式" width="620">
+</p>
+
+如果更重视说话人或歌手声音的连续性，优先使用 AV Prefix，或提供明确的音频参考。单纯的 RGB Guide 主要传递视觉边界，不能可靠锁定音色。
+
+Context Segments 也支持数字人音频模式：连接且仅连接一条音频后，它会按整条时间线自动切片，并作为最终完整音轨。
+
+### 分段二采
+
+**MiniMax H3 Easy Segment Refine** 会逐段放大和重新采样，并继续把上一段二采结果传给下一段，因此不会把不同段的提示词和参考素材混在一起。
+
+- **Pixel Resize**：先解码、缩放、再编码；不需要 latent 放大模型。
+- **Latent Upscale**：使用内置 3D latent 放大节点，避免以像素缩放作为放大步骤。
+- **Low VRAM Tile**：将当前片段按空间切块二采，以更多耗时换取更低显存占用。
+
+对应示例：
+
+- [`6.MiniMax_H3_Easy_Context_Segments_Pixel_Refine.json`](workflow/6.MiniMax_H3_Easy_Context_Segments_Pixel_Refine.json)
+- [`5.MiniMax_H3_Easy_Context_Segments_Latent_Refine.json`](workflow/5.MiniMax_H3_Easy_Context_Segments_Latent_Refine.json)
+
+Segment Decode 会逐段解码并写入临时视频文件，最终输出带音频的完整 ComfyUI `VIDEO`，因此不需要在内存中保留整条 RGB 视频。
+
+## 提示词优化
+
+点击提示词编辑器右下角的 `✦` 可以手动优化当前提示词，也可以在设置中开启“运行工作流时自动优化”。支持：
+
+- OpenAI-compatible Chat Completions；
+- OpenAI Responses；
+- Gemini Native；
+- Ollama；
+- 可选读取已连接媒体；
+- 按生成模式加载对应的 MiniMax H3 Prompt Guide。
+
+<p align="center">
+  <img src="images/prompt-editor-controls-en.png" alt="提示词优化和视图切换按钮" width="520">
+</p>
+
+### Context Segments 的专用优化
+
+“分段秒数”同时决定优化器需要输出多少段。例如填写 `5,5,5` 时，可以只在输入框中写一整段故事或创意，再点击 `✦`（或开启运行时自动优化），优化器会把它规划成 **3 段**独立提示词，并自动用 `---` 分隔。
+
+- **整体优化**：一次理解整条视频。既可以把一整段创意拆成开端、发展和结尾，也可以整体润色已经分好的脚本，同时保留各段原有动作和顺序。
+- **逐段优化**：适合已经写好的多个分段。它会按设置的并发数分别优化，每次只改当前段；前面各段仅作为只读的连续性背景，不会被反复重写。
+
+这套优化不是简单扩写：它会根据每段时长安排动作密度，保留必要的主体外观、场景、道具状态和声音线索，让每段提示词都能独立使用，同时避免输出“第 2 段”“接着上一段”这类模型无法直接利用的规划文字。开启“读取媒体”后，优化器还会保留或分配真正需要的 `@` 引用；最终生成时仍严格遵守“每段只使用本段引用素材”的规则。
+
+自动优化会记录已经处理过的提示词；当提示词、优化设置和媒体都没有变化时，不会在每次运行时重复改写。
+
+<p align="center">
+  <img src="images/context-prompt-optimization-zh.png" alt="上下文提示词优化方式" width="620">
+</p>
+
+API 设置保存在插件目录的 `prompt_optimizer.json`。API Key 在该文件中以明文保存，请勿公开或上传。
+
+## 节点一览
+
+| 节点 | 用途 |
+|---|---|
+| MiniMax H3 Easy Loader | 选择 H3 模型、文本编码器和两个 VAE |
+| MiniMax H3 Easy Model Adapter | 接入外部 MODEL、CLIP 和 VAE 加载器 |
+| MiniMax H3 Easy Media Loader | 可视化管理图片、音频和视频 |
+| MiniMax H3 Easy Media Bridge | 为 API 或无头工作流提供显式媒体输入 |
+| MiniMax H3 Easy Media Splitter | 将 Media Bundle 拆成独立的 IMAGE、VIDEO 和 AUDIO 输出；最多 27 张图片、9 个视频和 9 个音频 |
+| MiniMax H3 Easy | 普通生成、参考生成与数字人 |
+| MiniMax H3 Easy Output | 将 H3 Context 展开为标准 Conditioning、Latent、VAE、FPS 和驱动音频 |
+| MiniMax H3 Easy Context Segments | 创建长视频分段计划 |
+| MiniMax H3 Easy Segment Sample | 执行分段第一采 |
+| MiniMax H3 Easy Sample Setup | 为逐段控制工作流提供一次公共采样设置 |
+| MiniMax H3 Easy Segment Step | 处理单个分段；可独立设置 Seed 和提示词覆盖 |
+| MiniMax H3 Easy Segment Collect | 汇总串联后的分段结果 |
+| MiniMax H3 Easy Segment Refine | 执行 Pixel 或 Latent 分段二采 |
+| MiniMax H3 Easy Segment Decode | 流式解码并输出完整 VIDEO |
+| MiniMax H3 Easy Aspect Ratio | 将一采宽高比传给下游分辨率节点 |
+| MiniMax H3 Easy Second Pass Conditioning | 为传统外部二采重建分辨率相关条件 |
+| MiniMax H3 Easy 3D Latent Upscale | 内置 H3 视频 latent 放大节点 |
+
+## 使用限制与注意事项
+
+- 普通参考生视频每次最多使用 9 张图片、3 个视频和 3 条独立音频，总数最多 15。
+- Context Segments 的共享媒体库最多支持 27 张图片、9 个视频和 9 条音频；每个片段仍遵守普通单次参考限制。
+- 数字人模式只能使用一条驱动音频。
+- Media Loader 缓存的是解码后的帧；长时间、高分辨率参考视频可能占用较多系统内存。
+- 常规的 Segment Sample 和 Segment Refine 当前每次 Queue 都会重新执行，即使 Seed 和输入没有变化；逐段控制工作流中的 Segment Step 可以利用 ComfyUI 原生缓存复用未改变的前置分段。
+- Segment Decode 需要可用的 FFmpeg；项目会优先使用 `imageio-ffmpeg`，也支持系统 PATH 中的 FFmpeg。
+- 提示词优化是可选工具，不影响节点在未配置 API 时正常生成。
+
+## 其他说明
+
+- 支持经典 ComfyUI 画布和 Nodes 2.0。
+- 中文浏览器显示中文界面，其他语言环境默认显示英文。
+- 示例工作流位于 [`workflow`](workflow) 目录；不同工作流可能需要额外模型、LoRA 或自定义节点。
+
+## 致谢
+
+上下文连续生成的设计思路受到 [NikoDemon80/ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context) 及其衍生项目 [ethanfel/ComfyUI-MiniMaxH3-Contex-Loop](https://github.com/ethanfel/ComfyUI-MiniMaxH3-Contex-Loop) 的启发，代码与节点实现均独立完成。
+
+## License 与署名
+
+本项目使用 [MIT License](LICENSE)。
+
+如果项目中复用或改编了本项目较多代码或重要实现，请在项目说明中注明 `ComfyUI-MiniMaxH3-Easy` 及原作者，并请勿将复用的部分声明为完全独立原创。少量参考、普通调用或仅使用本节点不受此署名说明约束。
