@@ -67,6 +67,7 @@ const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     model: "",
     read_media: false,
     optimize_on_run: false,
+    remote_unload_after: false,
     video_sample: VIDEO_SAMPLE_DEFAULT,
     local_max_length: LOCAL_MAX_LENGTH_DEFAULT,
     gguf_model: "",
@@ -192,6 +193,12 @@ const TEXT = {
     readMedia: ZH_BROWSER ? "\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53" : "Read connected media",
     videoSample: ZH_BROWSER ? "\u89c6\u9891\u53c2\u8003\u5e27\u6570" : "Video reference frames",
     optimizeOnRun: ZH_BROWSER ? "\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u81ea\u52a8\u4f18\u5316" : "Optimize when workflow runs",
+    // Upstream's `unloadOllamaAfterOptimize`, reworded: this fork frees
+    // LM Studio's model through the same probe, so the label may not name
+    // one vendor.
+    remoteUnloadAfter: ZH_BROWSER
+        ? "\u4f18\u5316\u5b8c\u6210\u540e\u5378\u8f7d\u6a21\u578b\uff08LM Studio / Ollama\uff09"
+        : "Unload the model after optimizing (LM Studio / Ollama)",
     optimizerMissing: ZH_BROWSER ? "\u8bf7\u586b\u5199 API \u5730\u5740\u548c\u6a21\u578b\u540d\uff1bGemini \u539f\u751f\u8fd8\u9700\u8981 API Key\u3002" : "Enter the API URL and model; Gemini Native also requires an API key.",
     optimizerFailed: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u4f18\u5316\u5931\u8d25" : "Prompt optimization failed",
     optimizerRunning: ZH_BROWSER ? "\u6b63\u5728\u4f18\u5316" : "Optimizing",
@@ -4070,6 +4077,7 @@ function normalizePromptOptimizerSettings(value) {
         model: String(source.model || "").trim(),
         read_media: asBoolean(source.read_media, false),
         optimize_on_run: asBoolean(source.optimize_on_run, false),
+        remote_unload_after: asBoolean(source.remote_unload_after, false),
         video_sample: canonicalVideoSample(source.video_sample),
         // Named clip_max_length before the GGUF format shared the setting.
         local_max_length: clamp(
@@ -4096,6 +4104,18 @@ function isClipOptimizerFormat(value) {
 
 function isGgufOptimizerFormat(value) {
     return String(value || "").toLowerCase() === OPTIMIZER_FORMAT_GGUF;
+}
+
+/**
+ * Whether this backend holds a server-side model the pack may free.
+ *
+ * The same two formats `syncPromptOptimizerUnloadButton` shows its button for:
+ * a local LM Studio or Ollama sits behind an OpenAI-shaped URL. Which of the
+ * two it is stays the server's answer to a probe, never a setting.
+ */
+function canRemoteUnloadFormat(value) {
+    const format = String(value || "").toLowerCase();
+    return format === OPTIMIZER_FORMAT_OPENAI || format === OPTIMIZER_FORMAT_RESPONSES;
 }
 
 async function loadGgufModelCatalog() {
@@ -4234,6 +4254,7 @@ function makePromptOptimizerSelect(initialValue, onChange = null, optionList = n
         activeIndex = nextIndex;
         render();
         close();
+        root.dispatchEvent(new Event("change"));
         trigger.focus();
         onChange?.(value);
     };
@@ -4452,6 +4473,13 @@ async function openPromptOptimizerSettings(node) {
     const optimizeOnRunText = document.createElement("span");
     optimizeOnRunText.textContent = TEXT.optimizeOnRun;
     optimizeOnRunLabel.append(optimizeOnRunText, optimizeOnRun);
+    const remoteUnloadLabel = document.createElement("div");
+    remoteUnloadLabel.className = "h3-optimizer-settings-check";
+    const remoteUnload = makePromptOptimizerSwitch(promptOptimizerSettingsCache.remote_unload_after);
+    remoteUnload.setAttribute("aria-label", TEXT.remoteUnloadAfter);
+    const remoteUnloadText = document.createElement("span");
+    remoteUnloadText.textContent = TEXT.remoteUnloadAfter;
+    remoteUnloadLabel.append(remoteUnloadText, remoteUnload);
     const hint = document.createElement("p");
     hint.className = "h3-optimizer-settings-hint";
     const apiUrlRow = makePromptOptimizerSettingsRow(TEXT.apiUrl, apiUrl);
@@ -4479,6 +4507,7 @@ async function openPromptOptimizerSettings(node) {
         videoSampleRow,
         ggufDescribeLabel,
         optimizeOnRunLabel,
+        remoteUnloadLabel,
     );
     // Each format uses a different half of this form, so only its own rows stay
     // visible. Read connected media applies to all of them.
@@ -4497,6 +4526,10 @@ async function openPromptOptimizerSettings(node) {
         // Optimizing on run is an HTTP-only path server-side: `clip` optimizes
         // from inside the node and `gguf` from this editor, so neither reads it.
         optimizeOnRunLabel.hidden = local;
+        // The automatic counterpart of the editor's unload button, so it is
+        // offered exactly where that button is: Gemini has nothing to free, and
+        // the local formats have `gguf_unload_after` instead.
+        remoteUnloadLabel.hidden = !canRemoteUnloadFormat(apiFormat.value);
         localMaxLengthRow.hidden = !local;
         hint.hidden = !local;
         hint.textContent = gguf ? TEXT.ggufHint : TEXT.optimizerClipHint;
@@ -4582,6 +4615,7 @@ async function openPromptOptimizerSettings(node) {
                 gguf_unload_after: ggufUnload.checked,
                 gguf_describe_media: ggufDescribe.checked,
                 optimize_on_run: optimizeOnRun.checked,
+                remote_unload_after: remoteUnload.checked,
             });
             notifyPromptOptimizer(TEXT.settingsSaved, "success");
             close();

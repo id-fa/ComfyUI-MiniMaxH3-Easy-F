@@ -129,7 +129,7 @@ PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS = 120
 PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS = 60
 PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
 PROMPT_OPTIMIZER_MARKER_VERSION = 1
-PROMPT_OPTIMIZER_CONFIG_VERSION = 2
+PROMPT_OPTIMIZER_CONFIG_VERSION = 3
 OPTIMIZER_FORMAT_OPENAI = "openai"
 # OpenAI's Responses API. Same servers as `openai` but a different endpoint,
 # payload and reply shape, which is why it is a format rather than a URL.
@@ -150,6 +150,12 @@ OPTIMIZER_FORMATS = (
 # call rather than a model this process has to load.
 OPTIMIZER_HTTP_FORMATS = (OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_RESPONSES, OPTIMIZER_FORMAT_GEMINI)
 OPTIMIZER_LOCAL_FORMATS = (OPTIMIZER_FORMAT_CLIP, OPTIMIZER_FORMAT_GGUF)
+# The formats `_optimizer_remote_unload` has something to free for: the two
+# OpenAI-shaped ones, because the servers people run locally behind them (LM
+# Studio, Ollama) are the only ones with a management route. `gemini` is a cloud
+# endpoint and `clip` is ComfyUI's own model; `gguf` frees its own `Llama`
+# instead, through `gguf_unload_after`.
+OPTIMIZER_REMOTE_UNLOAD_FORMATS = (OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_RESPONSES)
 PROMPT_OPTIMIZER_CLIP_MAX_LENGTH = 1024
 PROMPT_OPTIMIZER_CLIP_MIN_LENGTH = 16
 PROMPT_OPTIMIZER_CLIP_LENGTH_LIMIT = 32768
@@ -241,6 +247,7 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "model": "",
     "read_media": False,
     "optimize_on_run": False,
+    "remote_unload_after": False,
     "video_sample": OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
     "local_max_length": PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
     "gguf_model": "",
@@ -565,6 +572,9 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     describe = source.get("gguf_describe_media", False)
     if isinstance(describe, str):
         describe = describe.strip().lower() in {"1", "true", "yes", "on"}
+    remote_unload = source.get("remote_unload_after", False)
+    if isinstance(remote_unload, str):
+        remote_unload = remote_unload.strip().lower() in {"1", "true", "yes", "on"}
     return {
         "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
         "api_format": api_format,
@@ -573,6 +583,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "model": str(source.get("model") or "").strip(),
         "read_media": bool(read_media),
         "optimize_on_run": bool(optimize_on_run),
+        "remote_unload_after": bool(remote_unload),
         "video_sample": video_sample,
         "local_max_length": local_max_length,
         "gguf_model": str(source.get("gguf_model") or "").strip(),
@@ -949,6 +960,7 @@ def _optimizer_http_json(
     user_prompt: str,
     media_parts: list[dict[str, Any]] | None = None,
     timeout_seconds: float = PROMPT_OPTIMIZER_TIMEOUT_SECONDS,
+    unload_after: bool = False,
 ) -> str:
     url = _normalize_optimizer_url(api_url, api_format, model)
     api_key = str(api_key or "").strip()
@@ -1002,9 +1014,16 @@ def _optimizer_http_json(
         else:
             content = user_prompt
         payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": content}], "stream": False, "temperature": 0.35, "max_tokens": PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS}
-    data = _optimizer_http_post(
-        url, headers, payload, _optimizer_thinking_off_payload(api_format), timeout_seconds=timeout_seconds,
-    )
+    try:
+        data = _optimizer_http_post(
+            url, headers, payload, _optimizer_thinking_off_payload(api_format), timeout_seconds=timeout_seconds,
+        )
+    finally:
+        # In `finally` rather than after the answer: a request that failed can
+        # still have left the model resident, and this setting exists to get the
+        # VRAM back before the workflow runs.
+        if unload_after:
+            _optimizer_auto_remote_unload(api_url, api_key, model, api_format)
     if api_format == "gemini":
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates:
@@ -2062,6 +2081,29 @@ def _optimizer_remote_unload(settings: Mapping[str, Any]) -> tuple[int, str]:
     )
 
 
+def _optimizer_auto_remote_unload(api_url: str, api_key: str, model: str, api_format: str) -> None:
+    """Free the server-side model after an optimization, best effort.
+
+    `remote_unload_after` is the counterpart of `gguf_unload_after` for the two
+    OpenAI-shaped formats: the same work the editor's `⏏` does, decided by the
+    same probing rather than by a declared vendor, so one setting covers LM
+    Studio and Ollama alike instead of an API format per server.
+
+    Nothing here may fail the optimization — the answer is already in hand by
+    the time this runs, and "this endpoint has no unload route" is the normal
+    reply from a cloud server, not an error the user did anything about.
+    """
+    if str(api_format or "").strip().lower() not in OPTIMIZER_REMOTE_UNLOAD_FORMATS:
+        return
+    try:
+        count, _ = _optimizer_remote_unload({"api_url": api_url, "api_key": api_key, "model": model})
+    except Exception as exc:
+        _optimizer_log("automatic unload skipped: %s", exc)
+        return
+    if count:
+        _optimizer_log("model unloaded after optimization")
+
+
 _OPTIMIZER_GGUF_LOCK = threading.RLock()
 _OPTIMIZER_GGUF_STATE: dict[str, Any] = {"signature": None, "llm": None, "vision": False}
 # How many runs are inside the local backend right now. The unload button can
@@ -2636,6 +2678,7 @@ def _optimize_prompt_on_run(
             request_prompt,
             media_parts,
             timeout_seconds=PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS,
+            unload_after=bool(settings.get("remote_unload_after", False)),
         )
         cleaned = re.sub(r"^```(?:text)?\s*", "", str(optimized or ""), flags=re.I)
         cleaned = re.sub(r"\s*```$", "", cleaned).strip()
@@ -2755,7 +2798,7 @@ def _register_prompt_optimizer_route() -> bool:
                 if state == "unloaded":
                     _optimizer_log("model unloaded")
                 return web.json_response({"ok": True, "unloaded": state == "unloaded"})
-            if api_format not in {OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_RESPONSES}:
+            if api_format not in OPTIMIZER_REMOTE_UNLOAD_FORMATS:
                 return web.json_response(
                     {"ok": False, "error": "This backend has no model to unload"}, status=400,
                 )
@@ -2871,7 +2914,10 @@ def _register_prompt_optimizer_route() -> bool:
                         should_stop, described, describe,
                     )
                 else:
-                    result = await asyncio.to_thread(_optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts)
+                    result = await asyncio.to_thread(
+                        _optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts,
+                        unload_after=bool(settings.get("remote_unload_after", False)),
+                    )
             finally:
                 if local:
                     _optimizer_gguf_hold(-1)

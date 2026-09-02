@@ -98,6 +98,29 @@ This matters here more than it would elsewhere: the optimizer's model and H3
 itself compete for the same VRAM, and the optimizer runs from the editor, before
 the graph is queued. This is the way to hand the card back before pressing Run.
 
+#### Unload the model after optimizing
+
+**OpenAI-compatible** and **OpenAI Responses** also carry a switch of that name
+in the prompt optimization settings, off by default. With it on, every
+optimization — from the **✦** button and from **Optimize when workflow runs**
+alike — ends by doing exactly what the **⏏** button does, so the card is free by
+the time the graph is queued without a click in between. It is the remote
+counterpart of the GGUF format's **Unload the model after use**.
+
+Nothing about it can fail an optimization: the prompt is already in hand when it
+runs, and a server with no management route — the normal answer from a cloud
+endpoint — is written to the ComfyUI log and nothing more. The switch is hidden
+for **Gemini native**, **Text encoder** and **GGUF**, which is where the **⏏**
+button is hidden or has its own setting.
+
+This supersedes upstream 1.0.13's **Ollama** feature, which added a fourth
+`api_format` named `ollama` and an `unload_ollama_after_optimize` setting shown
+only for it. Ollama is reached here through **OpenAI-compatible**, as it always
+was, and the vendor is worked out by the probe described above — so the same one
+switch also frees LM Studio, and no format has to be declared to get it. A
+`prompt_optimizer.json` carrying upstream's `ollama` format or its setting key
+falls back to `openai` with the switch off.
+
 ### Stopping a running optimization
 
 While a request is running, `✦` turns into a stop button (`■`). Pressing it ends

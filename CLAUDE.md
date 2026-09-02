@@ -323,6 +323,14 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   the route is refused (`busy`) instead, and the whole decision including `llm.close()` happens under
   `_OPTIMIZER_GGUF_LOCK`. The optimize route holds it across the describe pass and the final pass
   together, not per call.
+- `remote_unload_after` is that button run automatically, in the `finally` of `_optimizer_http_json`
+  via `_optimizer_auto_remote_unload`, so it covers the editor route and `_optimize_prompt_on_run`
+  from one place; `OPTIMIZER_REMOTE_UNLOAD_FORMATS` gates both it and the route. It is the remote
+  counterpart of `gguf_unload_after` and, like it, defaults to **off**, and it must never raise: the
+  prompt already exists when it runs, and "no management route" is the ordinary answer from a cloud
+  endpoint. Upstream 1.0.13 solved the same problem with an `ollama` api_format plus
+  `unload_ollama_after_optimize`; this fork has no such format — the vendor is a probe, not a setting
+  (see `_optimizer_remote_unload`) — so do not reintroduce it when merging upstream.
 - Cancelling a GGUF run releases the model (`_optimizer_gguf_release`) regardless of
   `gguf_unload_after`, from inside the worker thread — never from the `asyncio.CancelledError` handler,
   which returns while `asyncio.to_thread` is still generating.
