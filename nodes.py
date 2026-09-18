@@ -2182,6 +2182,7 @@ def _register_prompt_optimizer_route() -> bool:
             api_format = str(settings.get("api_format") or "openai").lower()
             mode = str(payload.get("mode") or MODE_IMAGE)
             audio_mode = str(payload.get("audio_mode") or CONTEXT_AUDIO_GENERATED)
+            context_segmented = mode == MODE_SEGMENTS or bool(payload.get("context_segmented"))
             optimizer_mode = MODE_DIGITAL_HUMAN if mode == MODE_SEGMENTS and audio_mode == CONTEXT_AUDIO_DIGITAL_HUMAN else mode
             scene_guide = str(payload.get("scene_guide") or "none")
             seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(payload.get("seconds") or 5.0)))
@@ -2190,7 +2191,7 @@ def _register_prompt_optimizer_route() -> bool:
             if not prompt.strip() or not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
             raw_counts = payload.get("media_counts") if isinstance(payload.get("media_counts"), dict) else {}
-            resource_limit = SEGMENT_MAX_MEDIA if mode == MODE_SEGMENTS else MAX_MEDIA
+            resource_limit = SEGMENT_MAX_MEDIA if context_segmented else MAX_MEDIA
             counts = {kind: max(0, min(resource_limit, int(raw_counts.get(kind, 0) or 0))) for kind in ("image", "video", "audio")}
             resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
             resources = [item for item in resources[:resource_limit] if isinstance(item, Mapping)]
@@ -2200,9 +2201,9 @@ def _register_prompt_optimizer_route() -> bool:
             previous_prompts = payload.get("previous_prompts") if isinstance(payload.get("previous_prompts"), list) else []
             previous_prompts = [str(item) for item in previous_prompts]
             segment_seconds_raw = str(payload.get("segment_seconds") or "")
-            expected_segments = _segment_expected_count(segment_seconds_raw) if mode == MODE_SEGMENTS else 0
+            expected_segments = _segment_expected_count(segment_seconds_raw) if context_segmented else 0
             if (
-                mode == MODE_SEGMENTS
+                context_segmented
                 and optimizer_scope == CONTEXT_PROMPT_OPTIMIZER_PER_SEGMENT
                 and segment_count >= 2
                 and segment_index < segment_count
@@ -2232,7 +2233,7 @@ def _register_prompt_optimizer_route() -> bool:
                 return web.json_response({"ok": True, "prompt": result, "segment_index": segment_index})
 
             read_media = bool(settings.get("read_media"))
-            if mode == MODE_SEGMENTS and not _optimizer_media_read_allowed(resources):
+            if context_segmented and not _optimizer_media_read_allowed(resources):
                 read_media = False
             media_parts = _optimizer_media_parts(resources, api_format, resource_limit) if read_media else []
             language = _normalize_optimizer_language(settings.get("language"))
@@ -2266,7 +2267,7 @@ def _register_prompt_optimizer_route() -> bool:
                 unload_ollama_after_optimize=bool(settings.get("unload_ollama_after_optimize", True)),
                 max_output_tokens=(
                     CONTEXT_PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS
-                    if mode == MODE_SEGMENTS
+                    if context_segmented
                     else PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS
                 ),
             )

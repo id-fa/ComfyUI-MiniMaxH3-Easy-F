@@ -1154,6 +1154,18 @@ function linkedInputValue(node, inputName) {
     return { found: false, value: undefined };
 }
 
+function linkedInputSourceNode(node, inputName) {
+    const input = node?.inputs?.find((candidate) => String(candidate?.name || "") === String(inputName || ""));
+    if (!input || input.link == null) return null;
+    const graph = node?.graph || app.graph;
+    const link = getNativeGraphLink(graph, input.link);
+    if (!link) return null;
+    const sourceId = link.origin_id ?? link.originId ?? link.from_id ?? link.fromId;
+    const directSource = link.origin_node || link.originNode || link.fromNode || link.sourceNode;
+    if (directSource && typeof directSource === "object") return directSource;
+    return graph?.getNodeById?.(Number(sourceId)) || null;
+}
+
 function asBoolean(value, fallback = false) {
     if (typeof value === "boolean") return value;
     if (typeof value === "number") return value !== 0;
@@ -3043,6 +3055,38 @@ function getNodeVideoSrc(node) {
         if (video?.currentSrc || video?.src) return video.currentSrc || video.src;
     }
     return mediaViewUrlFromWidgets(node, ["video", "file", "filename", "video_file", "videofile"]);
+}
+
+async function readSelectedVideoDurationSeconds(node) {
+    const sourceNode = linkedInputSourceNode(node, "selected_video");
+    if (!sourceNode) return null;
+    for (const widget of sourceNode.widgets || []) {
+        const element = widget?.element;
+        const video = element?.matches?.("video") ? element : element?.querySelector?.("video");
+        const duration = Number(video?.duration);
+        if (Number.isFinite(duration) && duration > 0) return duration;
+    }
+    const sourceUrl = getNodeVideoSrc(sourceNode);
+    if (!sourceUrl) return null;
+    return await new Promise((resolve) => {
+        const video = document.createElement("video");
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            video.removeAttribute("src");
+            video.load?.();
+            resolve(Number.isFinite(value) && value > 0 ? value : null);
+        };
+        const timeout = setTimeout(() => finish(null), 4000);
+        video.preload = "metadata";
+        video.muted = true;
+        video.addEventListener("loadedmetadata", () => finish(Number(video.duration)), { once: true });
+        video.addEventListener("error", () => finish(null), { once: true });
+        video.src = sourceUrl;
+        video.load?.();
+    });
 }
 
 function refreshMentionPreviews() {
@@ -5270,7 +5314,10 @@ function splitContextPromptSegments(value) {
         .filter(Boolean);
 }
 
-function contextSegmentDurations(node, count) {
+function contextSegmentDurations(node, count, override = null) {
+    if (Array.isArray(override) && override.length === count && override.every((value) => Number.isFinite(Number(value)) && Number(value) > 0)) {
+        return override.map((value) => Number(value));
+    }
     const raw = String(getWidgetValue(node, "segment_seconds", "") || "")
         .replace(/\uff0c/g, ",");
     const values = raw.split(",")
@@ -5279,6 +5326,35 @@ function contextSegmentDurations(node, count) {
     if (values.length === count) return values;
     const fallback = Number(getWidgetValue(node, "seconds", 5)) || 5;
     return Array.from({ length: count }, () => fallback);
+}
+
+function selectedVideoSegmentDurationPlan(node, totalSeconds) {
+    const mode = canonicalOption(
+        "selected_video_segment_mode",
+        getWidgetValue(node, "segment_mode", SELECTED_VIDEO_SEGMENT_WHOLE),
+    );
+    if (mode === SELECTED_VIDEO_SEGMENT_WHOLE) return null;
+    const raw = String(getWidgetValue(node, "segment_cuts", "") || "").replace(/\uff0c/g, ",");
+    const tokens = raw.split(",").map((item) => item.trim()).filter(Boolean);
+    const entries = tokens.map((item) => Number.parseFloat(item));
+    const total = Number(totalSeconds);
+    if (!Number.isFinite(total) || total <= 0 || !entries.length || entries.some((item) => !Number.isFinite(item))) return null;
+    const cuts = mode === SELECTED_VIDEO_SEGMENT_FRAME_CUTS
+        ? entries.map((value) => value / 24)
+        : entries;
+    if (cuts.some((value) => value <= 0 || value >= total)) return null;
+    for (let index = 1; index < cuts.length; index += 1) {
+        if (cuts[index] <= cuts[index - 1]) return null;
+    }
+    const boundaries = [0, ...cuts, total];
+    const durations = boundaries.slice(1).map((end, index) => end - boundaries[index]);
+    if (durations.some((value) => value < 0.2)) return null;
+    return {
+        totalSeconds: total,
+        segmentCount: durations.length,
+        durations,
+        segmentSeconds: durations.map((value) => value.toFixed(6)).join(","),
+    };
 }
 
 async function requestPromptOptimization(payload, signal) {
@@ -5293,10 +5369,10 @@ async function requestPromptOptimization(payload, signal) {
     return data;
 }
 
-async function optimizeContextSegmentsIndividually({ node, sourcePrompt, commonPayload, concurrency, signal, requestId }) {
+async function optimizeContextSegmentsIndividually({ node, sourcePrompt, commonPayload, concurrency, durationsOverride, signal, requestId }) {
     const segments = splitContextPromptSegments(sourcePrompt);
     if (segments.length < 2) return null;
-    const durations = contextSegmentDurations(node, segments.length);
+    const durations = contextSegmentDurations(node, segments.length, durationsOverride);
     const results = Array.from({ length: segments.length }, () => "");
     let nextIndex = 0;
     let completed = 0;
@@ -5574,7 +5650,9 @@ async function optimizePromptFromEditor(node) {
     const mediaCounts = { image: 0, video: 0, audio: 0 };
     resources.forEach((item) => { mediaCounts[item.type] = (mediaCounts[item.type] || 0) + 1; });
     const requestMode = canonicalOption("mode", getWidgetValue(node, "mode", MODE_IMAGE));
-    const segmentMode = requestMode === MODE_SEGMENTS;
+    const selectedVideoSegmented = isSelectedVideoContextSegmented(node);
+    const segmentMode = requestMode === MODE_SEGMENTS || selectedVideoSegmented;
+    let selectedVideoPlan = null;
     const requestId = Symbol("h3-prompt-optimizer");
     const abortController = new AbortController();
     node.__h3OptimizerRequestId = requestId;
@@ -5584,6 +5662,13 @@ async function optimizePromptFromEditor(node) {
     setPromptOptimizerStatus(node, "loading");
     syncPromptOptimizerButton(node);
     try {
+        if (selectedVideoSegmented) {
+            const duration = await readSelectedVideoDurationSeconds(node);
+            selectedVideoPlan = selectedVideoSegmentDurationPlan(node, duration);
+            if (!selectedVideoPlan) {
+                throw new Error("无法读取候选视频时长，或时间/帧切点无效；请先确保候选视频已加载并重新运行后再优化。");
+            }
+        }
         const optimizerMode = segmentMode
             ? canonicalOption("context_prompt_optimizer_mode", getWidgetValue(node, "context_prompt_optimizer_mode", "whole_sequence"))
             : "whole_sequence";
@@ -5592,13 +5677,15 @@ async function optimizePromptFromEditor(node) {
             scene_guide: state.scene_guide,
             prompt_optimizer_language: state.language,
             mode: requestMode,
+            context_segmented: segmentMode,
             audio_mode: segmentMode
                 ? canonicalOption("audio_mode", getWidgetValue(node, "audio_mode", CONTEXT_AUDIO_GENERATED))
                 : "",
             seconds: segmentMode
-                ? Number(getWidgetValue(node, "seconds", 5)) || 5
+                ? selectedVideoPlan?.totalSeconds || Number(getWidgetValue(node, "seconds", 5)) || 5
                 : Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Number(getWidgetValue(node, "seconds", 5)) || 5)),
-            segment_seconds: segmentMode ? String(getWidgetValue(node, "segment_seconds", "") || "") : "",
+            segment_seconds: selectedVideoPlan?.segmentSeconds
+                || (segmentMode ? String(getWidgetValue(node, "segment_seconds", "") || "") : ""),
             media_counts: mediaCounts,
             resources,
             optimizer_mode: optimizerMode,
@@ -5611,6 +5698,7 @@ async function optimizePromptFromEditor(node) {
                 sourcePrompt,
                 commonPayload,
                 concurrency: getWidgetValue(node, "context_prompt_optimizer_concurrency", 3),
+                durationsOverride: selectedVideoPlan?.durations,
                 signal: abortController.signal,
                 requestId,
             });
