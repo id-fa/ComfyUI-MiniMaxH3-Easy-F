@@ -180,6 +180,7 @@ const TEXT = {
         ? "\u901a\u8fc7 llama-cpp-python \u52a0\u8f7d models/text_encoders \u6216 models/LLM \u4e0b\u7684 GGUF \u6a21\u578b\uff0c\u4e0d\u9700\u8981 API\u3002\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53\u9700\u8981\u914d\u5957\u7684 mmproj \u89c6\u89c9\u6295\u5f71\u6587\u4ef6\u3002"
         : "Loads a GGUF from models/text_encoders or models/LLM through llama-cpp-python; no API involved. Reading connected media needs a matching mmproj vision projector.",
     optimizerClip: ZH_BROWSER ? "\u4f18\u5316\u5668\u6587\u672c\u7f16\u7801\u5668" : "Optimizer text encoder",
+    triggerWords: ZH_BROWSER ? "LoRA \u89e6\u53d1\u8bcd" : "LoRA trigger words",
     optimizerClipHint: ZH_BROWSER
         ? "\u4f7f\u7528\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u7684\u6587\u672c\u7f16\u7801\u5668\u3002\u8be5\u7f16\u7801\u5668\u53ea\u5728\u5de5\u4f5c\u6d41\u8fd0\u884c\u65f6\u5b58\u5728\uff0c\u56e0\u6b64\u63d0\u793a\u8bcd\u4f18\u5316\u4f1a\u5728\u961f\u5217\u6267\u884c\u65f6\u8fdb\u884c\uff0c\u800c\u4e0d\u662f\u70b9\u51fb\u65f6\u3002\u5f00\u542f\u4e0b\u65b9\u5f00\u5173\u540e\uff0c\u6bcf\u4e2a\u5df2\u8fde\u63a5\u7d20\u6750\u4f1a\u5148\u7531\u8be5\u7f16\u7801\u5668\u9010\u4e2a\u751f\u6210\u63cf\u8ff0\uff0c\u518d\u4f5c\u4e3a\u6587\u672c\u968f\u63d0\u793a\u8bcd\u4e00\u8d77\u4f7f\u7528\u3002"
         : "Uses the text encoder connected to the optimizer_clip input. That encoder only exists while the workflow runs, so the prompt is optimized when the workflow is queued, not on click. With the switch below on, each connected asset is described by the encoder one at a time and those descriptions are passed along as text.",
@@ -713,6 +714,7 @@ function localizeNodeInstance(node) {
         if (input.name === "h3_bundle") setLocalizedSlotLabel(input, TEXT.bundle);
         if (input.name === "media") setLocalizedSlotLabel(input, TEXT.inputMedia);
         if (input.name === "optimizer_clip") setLocalizedSlotLabel(input, TEXT.optimizerClip);
+        if (input.name === "trigger_words") setLocalizedSlotLabel(input, TEXT.triggerWords);
     }
     const outputLabels = { model: TEXT.outputModel, h3_context: TEXT.outputContext };
     for (const output of node.outputs || []) {

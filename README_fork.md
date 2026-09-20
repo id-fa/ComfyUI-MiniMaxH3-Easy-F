@@ -687,6 +687,50 @@ bundle exactly as upstream wrote it.
 
 ---
 
+## LoRA trigger words
+
+The main node has an optional **`trigger_words`** input (shown as *LoRA trigger
+words*). It is a socket only — connect any `STRING` output, typically the
+trigger-word output of the node that loads the LoRA. Upstream has no equivalent;
+this does not supersede any upstream section.
+
+- Entries are separated by commas or newlines (`,` `，` `、` also work) and
+  de-duplicated case-insensitively.
+- The missing entries are **prepended** to the prompt as `word, word, prompt…` —
+  the position LoRA captions are trained on.
+- An entry the prompt already spells out (whole word or phrase, any case) is left
+  where you wrote it and not added again, so placing a trigger by hand inside a
+  sentence still works.
+- Nothing connected, or an empty string, changes nothing.
+
+### Where it happens
+
+The words are inserted **last**, right before the prompt is tokenized — after
+`@` references were resolved and after any prompt optimization (the
+"optimize when workflow runs" HTTP pass and the text-encoder format alike). Two
+consequences, both deliberate:
+
+- An optimizer never sees the trigger words, so it cannot reword or drop them.
+- They are never written back to the editor. The *Optimized* field and the
+  `prompt` widget keep showing the prompt without them, and swapping the LoRA
+  swaps the trigger words without leaving the old ones baked into a tab.
+
+Because nothing in the editor shows the final prompt, the insertion is logged to
+the ComfyUI console: `MiniMax H3 Easy: inserting trigger words into the prompt: …`.
+
+In reference mode a prompt that starts with soundtrack provenance lines
+(`<Audio 1> is the synchronized audio track of <Video 1>.`) gets the trigger
+words in front of those lines as well.
+
+### Scope
+
+`nodes.py` (`_trigger_word_list`, `_insert_trigger_words`, `_with_trigger_words`)
+and one slot label in `web/minimax_h3_easy_f_ui.js`. **Restart ComfyUI and hard
+refresh.** Workflows saved before this change load unchanged; the new socket
+simply appears unconnected.
+
+---
+
 ## Frontend file name and prompt editor globals
 
 This fork's frontend is `web/minimax_h3_easy_f_ui.js`. Upstream calls it

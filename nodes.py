@@ -3378,6 +3378,57 @@ def _resolve_reference_prompt(
     return resolved
 
 
+def _trigger_word_list(value: Any) -> list[str]:
+    """Split the `trigger_words` input into its comma/newline separated entries."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        value = ", ".join(str(item) for item in value if item is not None)
+    words: list[str] = []
+    seen: set[str] = set()
+    for word in re.split(r"[,，、\r\n]+", str(value)):
+        word = word.strip()
+        if word and word.lower() not in seen:
+            seen.add(word.lower())
+            words.append(word)
+    return words
+
+
+def _insert_trigger_words(prompt: str, trigger_words: list[str]) -> str:
+    # A trigger the prompt already spells out is left where the user put it;
+    # only the missing ones are prepended, the position LoRA captions train on.
+    source = str(prompt or "")
+    missing = [
+        word for word in trigger_words
+        if not re.search(rf"(?<!\w){re.escape(word)}(?!\w)", source, re.IGNORECASE)
+    ]
+    if not missing:
+        return source
+    logging.info("MiniMax H3 Easy: inserting trigger words into the prompt: %s", ", ".join(missing))
+    prefix = ", ".join(missing)
+    if not source.strip():
+        return prefix
+    return f"{prefix}, {source.lstrip()}"
+
+
+def _with_trigger_words(prompt_transform, trigger_words: list[str]):
+    """Insert the trigger words after any optimizer pass, right before tokenizing.
+
+    An optimizer is free to reword or drop them, and an optimized prompt is
+    pushed back into the editor - where a baked-in trigger would outlive the
+    LoRA it belonged to. So they are added last and never reported back.
+    """
+    if not trigger_words:
+        return prompt_transform
+
+    def transform(text: str, labels: Mapping[int, str] | None = None) -> str:
+        if prompt_transform is not None:
+            text = prompt_transform(text, labels)
+        return _insert_trigger_words(text, trigger_words)
+
+    return transform
+
+
 def _align_canvas_dimension(value: float) -> int:
     return max(h3.CANVAS_MULTIPLE, round(float(value) / h3.CANVAS_MULTIPLE) * h3.CANVAS_MULTIPLE)
 
@@ -3576,6 +3627,9 @@ class MiniMaxH3Easy:
             # Kept out of the H3 bundle on purpose: this is the LLM that
             # rewrites the prompt, not one of the H3 generation models.
             "optimizer_clip": ("CLIP",),
+            # LoRA trigger words, comma or newline separated. Socket-only: the
+            # text belongs to whatever loads the LoRA, not to the prompt tabs.
+            "trigger_words": ("STRING", {"forceInput": True}),
             # Transport-only: the editor reports whether its Optimized tab is
             # still empty. Defaults to True so an API/headless run with the
             # text encoder format configured still optimizes.
@@ -3770,6 +3824,7 @@ class MiniMaxH3Easy:
         )
         prompt = optimization.prompt
         prompt_transform, optimized_prompt = cls._clip_prompt_transform(mode, seconds, items, kwargs)
+        prompt_transform = _with_trigger_words(prompt_transform, _trigger_word_list(kwargs.get("trigger_words")))
         if mode == MODE_REFERENCE and items:
             if len(items) > MAX_MEDIA:
                 raise ValueError("Reference mode accepts at most fifteen media resources")
@@ -3788,11 +3843,14 @@ class MiniMaxH3Easy:
         else:
             first_frame, last_frame = cls._keyframes(items, keyframe_role)
             model = h3_bundle.model_for("fl2va")
+            # Kept apart from `prompt`: that one is reported back to the editor
+            # below and must stay free of the trigger words.
+            keyframe_prompt = prompt
             if prompt_transform is not None:
-                prompt = prompt_transform(prompt, cls._keyframe_labels(items, keyframe_role))
+                keyframe_prompt = prompt_transform(prompt, cls._keyframe_labels(items, keyframe_role))
             conditioning, latent, keyframe_sources = _empty_image_conditioning(
                 h3_bundle,
-                prompt,
+                keyframe_prompt,
                 width,
                 height,
                 length,

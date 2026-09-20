@@ -120,6 +120,16 @@ The frontend→backend prompt protocol:
 synchronized soundtrack registered immediately before it → standalone audio). When a video's
 soundtrack could be confused with standalone audio, a provenance line is prepended to the prompt.
 
+### LoRA trigger words
+
+The optional socket-only `trigger_words` input is applied by `_with_trigger_words`, which wraps the
+`prompt_transform` callback so the words are inserted **after** every optimizer pass and right before
+tokenizing. Keep it there: an optimizer that saw them could reword or drop them, and anything that is
+reported back to the editor (`_notify_prompt_optimized`, the `auto_optimized_prompt` ui payload) must
+stay trigger-free — a trigger baked into the Optimized field outlives the LoRA it belonged to. That is
+why the image branch of `generate` tokenizes `keyframe_prompt` and leaves `prompt` alone.
+`_insert_trigger_words` skips entries the prompt already contains (whole-phrase, case-insensitive).
+
 ### Mode behaviour
 
 - `mode = image` (`MODE_IMAGE`): 0–2 images → text-to-video / first-frame / last-frame / first+last;
