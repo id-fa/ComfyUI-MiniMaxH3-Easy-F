@@ -24,7 +24,12 @@ const PROMPT_TAB_LIMIT = 20;
 const PROMPT_OPTIMIZER_SETTINGS_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_settings";
 const PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized";
 const PROMPT_OPTIMIZER_GGUF_ENDPOINT = "/minimax_h3_easy/gguf_models";
+const PROMPT_OPTIMIZER_CLIP_ENDPOINT = "/minimax_h3_easy/clip_models";
 const PROMPT_OPTIMIZER_UNLOAD_ENDPOINT = "/minimax_h3_easy/prompt_optimizer_unload";
+// Mirrors OPTIMIZER_TOKEN_HEADER in nodes.py. The server mints the value per
+// process and hands it out with the settings; every other route refuses a
+// request without it.
+const PROMPT_OPTIMIZER_TOKEN_HEADER = "X-MiniMax-H3-Easy-Token";
 const OPTIMIZER_FORMAT_OPENAI = "openai";
 const OPTIMIZER_FORMAT_RESPONSES = "responses";
 const OPTIMIZER_FORMAT_GEMINI = "gemini";
@@ -76,6 +81,10 @@ const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     gguf_gpu_layers: -1,
     gguf_unload_after: false,
     gguf_describe_media: false,
+    clip_model: "",
+    clip_unload_after: false,
+    // Read-only, from the server: the key itself is never sent to the editor.
+    api_key_set: false,
 });
 let promptOptimizerSettingsCache = { ...PROMPT_OPTIMIZER_SETTINGS_DEFAULTS };
 let promptOptimizerSettingsLoaded = false;
@@ -164,6 +173,7 @@ const TEXT = {
     apiFormat: ZH_BROWSER ? "API \u683c\u5f0f" : "API format",
     apiUrl: ZH_BROWSER ? "API \u5730\u5740" : "API URL",
     apiKey: "API Key",
+    apiKeyStored: ZH_BROWSER ? "\u5df2\u4fdd\u5b58 - \u8f93\u5165\u4ee5\u66ff\u6362" : "stored - type to replace it",
     apiModel: ZH_BROWSER ? "\u6a21\u578b\u540d" : "Model",
     localMaxLength: ZH_BROWSER ? "\u751f\u6210\u4e0a\u9650 (tokens)" : "Max generated tokens",
     ggufModel: ZH_BROWSER ? "GGUF \u6a21\u578b" : "GGUF model",
@@ -182,14 +192,16 @@ const TEXT = {
     optimizerClip: ZH_BROWSER ? "\u4f18\u5316\u5668\u6587\u672c\u7f16\u7801\u5668" : "Optimizer text encoder",
     triggerWords: ZH_BROWSER ? "LoRA \u89e6\u53d1\u8bcd" : "LoRA trigger words",
     optimizerClipHint: ZH_BROWSER
-        ? "\u4f7f\u7528\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u7684\u6587\u672c\u7f16\u7801\u5668\u3002\u8be5\u7f16\u7801\u5668\u53ea\u5728\u5de5\u4f5c\u6d41\u8fd0\u884c\u65f6\u5b58\u5728\uff0c\u56e0\u6b64\u63d0\u793a\u8bcd\u4f18\u5316\u4f1a\u5728\u961f\u5217\u6267\u884c\u65f6\u8fdb\u884c\uff0c\u800c\u4e0d\u662f\u70b9\u51fb\u65f6\u3002\u5f00\u542f\u4e0b\u65b9\u5f00\u5173\u540e\uff0c\u6bcf\u4e2a\u5df2\u8fde\u63a5\u7d20\u6750\u4f1a\u5148\u7531\u8be5\u7f16\u7801\u5668\u9010\u4e2a\u751f\u6210\u63cf\u8ff0\uff0c\u518d\u4f5c\u4e3a\u6587\u672c\u968f\u63d0\u793a\u8bcd\u4e00\u8d77\u4f7f\u7528\u3002"
-        : "Uses the text encoder connected to the optimizer_clip input. That encoder only exists while the workflow runs, so the prompt is optimized when the workflow is queued, not on click. With the switch below on, each connected asset is described by the encoder one at a time and those descriptions are passed along as text.",
+        ? "\u4f7f\u7528 ComfyUI \u683c\u5f0f\u7684\u6587\u672c\u7f16\u7801\u5668\u4f5c\u4e3a LLM\u3002\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u7684\u7f16\u7801\u5668\u4f18\u5148\uff0c\u4f46\u5b83\u53ea\u5728\u5de5\u4f5c\u6d41\u8fd0\u884c\u65f6\u5b58\u5728\uff0c\u56e0\u6b64\u4f18\u5316\u4f1a\u5728\u961f\u5217\u6267\u884c\u65f6\u8fdb\u884c\u3002\u5728\u4e0b\u65b9\u9009\u62e9 models/text_encoders \u4e2d\u7684 .safetensors \u540e\uff0c\u65e0\u9700\u8fde\u63a5\u5373\u53ef\u70b9\u51fb \u2726 \u76f4\u63a5\u4f18\u5316\uff08\u5de5\u4f5c\u6d41\u8fd0\u884c\u671f\u95f4\u4f1a\u88ab\u62d2\u7edd\uff09\u3002\u5fc5\u987b\u662f\u57fa\u4e8e LLM \u7684\u7f16\u7801\u5668\uff08Qwen3-VL\u3001Qwen3.5\u3001Gemma\uff09\uff0c\u4e0d\u80fd\u662f CLIP \u6216 T5\u3002\u5f00\u542f\u8bfb\u53d6\u5a92\u4f53\u540e\uff0c\u6bcf\u4e2a\u5df2\u8fde\u63a5\u7d20\u6750\u4f1a\u5148\u7531\u8be5\u7f16\u7801\u5668\u9010\u4e2a\u751f\u6210\u63cf\u8ff0\uff0c\u518d\u4f5c\u4e3a\u6587\u672c\u968f\u63d0\u793a\u8bcd\u4e00\u8d77\u4f7f\u7528\u3002"
+        : "Runs a text encoder in ComfyUI's own format as the LLM. One connected to the optimizer_clip input wins, but it only exists while the workflow runs, so the prompt is then optimized when the workflow is queued. Pick a .safetensors from models/text_encoders below and \u2726 optimizes on click with nothing connected (refused while a workflow is running). It has to be an LLM-based encoder (Qwen3-VL, Qwen3.5, Gemma), not a CLIP or T5. With Read connected media on, each connected asset is described by the encoder one at a time and those descriptions are passed along as text.",
+    clipModel: ZH_BROWSER ? "\u6587\u672c\u7f16\u7801\u5668" : "Text encoder",
+    clipModelNone: ZH_BROWSER ? "\u4e0d\u52a0\u8f7d\uff08\u4f7f\u7528 optimizer_clip \u8f93\u5165\uff09" : "None (use the optimizer_clip input)",
     optimizerDeferred: ZH_BROWSER
         ? "\u5df2\u9009\u62e9\u6587\u672c\u7f16\u7801\u5668\u683c\u5f0f\uff1a\u8fd0\u884c\u5de5\u4f5c\u6d41\u65f6\u4f1a\u81ea\u52a8\u4f18\u5316\u63d0\u793a\u8bcd\uff0c\u5e76\u5199\u5165\u5f53\u524d\u6807\u7b7e\u9875\u7684\u201c\u4f18\u5316\u540e\u201d\u3002"
         : "Text encoder format selected: the prompt is optimized when the workflow runs, and the result lands in the open tab's Optimized field.",
     optimizerClipMissing: ZH_BROWSER
-        ? "\u8bf7\u5148\u5c06\u6587\u672c\u7f16\u7801\u5668\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\u3002"
-        : "Connect a text encoder to the optimizer_clip input first.",
+        ? "\u8bf7\u5148\u5c06\u6587\u672c\u7f16\u7801\u5668\u8fde\u63a5\u5230 optimizer_clip \u8f93\u5165\uff0c\u6216\u5728\u8bbe\u7f6e\u4e2d\u9009\u62e9\u4e00\u4e2a\u3002"
+        : "Connect a text encoder to the optimizer_clip input, or select one in the settings, first.",
     promptGuide: ZH_BROWSER ? "\u63d0\u793a\u8bcd\u65b9\u6848" : "Prompt Guide",
     readMedia: ZH_BROWSER ? "\u8bfb\u53d6\u5df2\u8fde\u63a5\u5a92\u4f53" : "Read connected media",
     videoSample: ZH_BROWSER ? "\u89c6\u9891\u53c2\u8003\u5e27\u6570" : "Video reference frames",
@@ -4092,6 +4104,9 @@ function normalizePromptOptimizerSettings(value) {
         gguf_gpu_layers: clamp(source.gguf_gpu_layers, -1, -1, 1024),
         gguf_unload_after: asBoolean(source.gguf_unload_after, false),
         gguf_describe_media: asBoolean(source.gguf_describe_media, false),
+        clip_model: String(source.clip_model || "").trim(),
+        clip_unload_after: asBoolean(source.clip_unload_after, false),
+        api_key_set: asBoolean(source.api_key_set, false),
     };
 }
 
@@ -4120,8 +4135,29 @@ function canRemoteUnloadFormat(value) {
     return format === OPTIMIZER_FORMAT_OPENAI || format === OPTIMIZER_FORMAT_RESPONSES;
 }
 
+let promptOptimizerRouteToken = "";
+
+/**
+ * `api.fetchApi` with the route token on it.
+ *
+ * The token dies with the server process, so a page that outlived a restart
+ * gets a 403 on its first call: the settings are fetched again, which renews
+ * the token, and the call is repeated once. Every optimizer route but the
+ * settings GET refuses a request that did not come through here.
+ */
+async function callPromptOptimizerRoute(endpoint, options = {}, retry = true) {
+    if (!promptOptimizerRouteToken) await loadPromptOptimizerSettings({ force: true }).catch(() => {});
+    const response = await api.fetchApi(endpoint, {
+        ...options,
+        headers: { ...(options.headers || {}), [PROMPT_OPTIMIZER_TOKEN_HEADER]: promptOptimizerRouteToken },
+    });
+    if (response.status !== 403 || !retry) return response;
+    promptOptimizerRouteToken = "";
+    return callPromptOptimizerRoute(endpoint, options, false);
+}
+
 async function loadGgufModelCatalog() {
-    const response = await api.fetchApi(PROMPT_OPTIMIZER_GGUF_ENDPOINT);
+    const response = await callPromptOptimizerRoute(PROMPT_OPTIMIZER_GGUF_ENDPOINT);
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
     return {
@@ -4129,6 +4165,24 @@ async function loadGgufModelCatalog() {
         mmproj: Array.isArray(data.mmproj) ? data.mmproj : [],
         roots: Array.isArray(data.roots) ? data.roots : [],
     };
+}
+
+async function loadClipModelCatalog() {
+    const response = await callPromptOptimizerRoute(PROMPT_OPTIMIZER_CLIP_ENDPOINT);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+    return Array.isArray(data.models) ? data.models : [];
+}
+
+/** "None" first, then the catalog, plus `selected` when the scan no longer finds it. */
+function clipModelOptionList(selected, catalog = []) {
+    const options = [
+        { value: "", label: TEXT.clipModelNone },
+        ...catalog.map((value) => ({ value, label: value })),
+    ];
+    const wanted = String(selected || "").trim();
+    if (wanted && !options.some((item) => item.value === wanted)) options.push({ value: wanted, label: wanted });
+    return options;
 }
 
 function optimizerClipInputSlot(node) {
@@ -4154,6 +4208,7 @@ async function loadPromptOptimizerSettings({ force = false } = {}) {
         const response = await api.fetchApi(PROMPT_OPTIMIZER_SETTINGS_ENDPOINT);
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        promptOptimizerRouteToken = String(data.token || "");
         promptOptimizerSettingsCache = normalizePromptOptimizerSettings(data.settings);
         promptOptimizerSettingsLoaded = true;
         syncPromptOptimizerNodes();
@@ -4164,12 +4219,14 @@ async function loadPromptOptimizerSettings({ force = false } = {}) {
     return promptOptimizerSettingsPromise;
 }
 
-async function savePromptOptimizerSettings(value) {
+async function savePromptOptimizerSettings(value, keepApiKey = false) {
     const settings = normalizePromptOptimizerSettings(value);
-    const response = await api.fetchApi(PROMPT_OPTIMIZER_SETTINGS_ENDPOINT, {
+    const response = await callPromptOptimizerRoute(PROMPT_OPTIMIZER_SETTINGS_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
+        // The dialog never received the stored key, so an untouched field has
+        // to say "leave it" rather than send its own emptiness.
+        body: JSON.stringify({ ...settings, api_key_keep: keepApiKey }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
@@ -4410,7 +4467,13 @@ async function openPromptOptimizerSettings(node) {
     apiKey.type = "password";
     apiKey.autocomplete = "off";
     apiKey.spellcheck = false;
-    apiKey.value = promptOptimizerSettingsCache.api_key;
+    // Empty even when a key is stored: the server keeps it to itself. Typing
+    // replaces it (typing and clearing removes it), and leaving the field alone
+    // keeps it.
+    apiKey.value = "";
+    apiKey.placeholder = promptOptimizerSettingsCache.api_key_set ? TEXT.apiKeyStored : "";
+    let apiKeyTouched = false;
+    apiKey.addEventListener("input", () => { apiKeyTouched = true; });
     const model = document.createElement("input");
     model.className = "h3-optimizer-settings-control";
     model.type = "text";
@@ -4441,6 +4504,19 @@ async function openPromptOptimizerSettings(node) {
         null,
         mmprojOptionList(promptOptimizerSettingsCache.gguf_mmproj),
     );
+    // Seeded with the saved file for the same reason as the projector below.
+    const clipModel = makePromptOptimizerSelect(
+        promptOptimizerSettingsCache.clip_model,
+        null,
+        clipModelOptionList(promptOptimizerSettingsCache.clip_model),
+    );
+    const clipUnloadLabel = document.createElement("div");
+    clipUnloadLabel.className = "h3-optimizer-settings-check";
+    const clipUnload = makePromptOptimizerSwitch(promptOptimizerSettingsCache.clip_unload_after);
+    clipUnload.setAttribute("aria-label", TEXT.ggufUnload);
+    const clipUnloadText = document.createElement("span");
+    clipUnloadText.textContent = TEXT.ggufUnload;
+    clipUnloadLabel.append(clipUnloadText, clipUnload);
     const ggufUnloadLabel = document.createElement("div");
     ggufUnloadLabel.className = "h3-optimizer-settings-check";
     const ggufUnload = makePromptOptimizerSwitch(promptOptimizerSettingsCache.gguf_unload_after);
@@ -4492,6 +4568,7 @@ async function openPromptOptimizerSettings(node) {
     const ggufMmprojRow = makePromptOptimizerSettingsRow(TEXT.ggufMmproj, ggufMmproj);
     const ggufContextRow = makePromptOptimizerSettingsRow(TEXT.ggufContext, ggufContext);
     const ggufGpuLayersRow = makePromptOptimizerSettingsRow(TEXT.ggufGpuLayers, ggufGpuLayers);
+    const clipModelRow = makePromptOptimizerSettingsRow(TEXT.clipModel, clipModel);
     const videoSampleRow = makePromptOptimizerSettingsRow(TEXT.videoSample, videoSample);
     form.append(
         makePromptOptimizerSettingsRow(TEXT.apiFormat, apiFormat),
@@ -4503,8 +4580,10 @@ async function openPromptOptimizerSettings(node) {
         ggufMmprojRow,
         ggufContextRow,
         ggufGpuLayersRow,
+        clipModelRow,
         localMaxLengthRow,
         ggufUnloadLabel,
+        clipUnloadLabel,
         readMediaLabel,
         videoSampleRow,
         ggufDescribeLabel,
@@ -4519,6 +4598,10 @@ async function openPromptOptimizerSettings(node) {
         const local = clip || gguf;
         for (const row of [apiUrlRow, apiKeyRow, modelRow]) row.hidden = local;
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadLabel]) row.hidden = !gguf;
+        clipModelRow.hidden = !clip;
+        // Only a `clip_model` encoder is this pack's to unload; one wired to
+        // optimizer_clip belongs to the workflow.
+        clipUnloadLabel.hidden = !clip || !clipModel.value;
         // Describing media one at a time only means something once media is read.
         ggufDescribeLabel.hidden = !gguf || !readMedia.checked;
         // How a video is sampled only matters once media is read. It stays
@@ -4536,6 +4619,22 @@ async function openPromptOptimizerSettings(node) {
         hint.hidden = !local;
         hint.textContent = gguf ? TEXT.ggufHint : TEXT.optimizerClipHint;
         if (gguf) refreshGgufOptions();
+        if (clip) refreshClipOptions();
+    };
+    clipModel.addEventListener("change", () => syncFormatRows());
+    let clipCatalogLoaded = false;
+    const refreshClipOptions = () => {
+        if (clipCatalogLoaded) return;
+        clipCatalogLoaded = true;
+        loadClipModelCatalog().then((names) => {
+            const selected = clipModel.value;
+            clipModel.setOptions(clipModelOptionList(selected, names));
+            clipModel.value = selected;
+        }).catch((catalogError) => {
+            clipCatalogLoaded = false;
+            error.textContent = String(catalogError?.message || catalogError);
+            error.hidden = false;
+        });
     };
     // The catalog is only worth fetching once the GGUF format is selected.
     let ggufCatalogLoaded = false;
@@ -4593,6 +4692,7 @@ async function openPromptOptimizerSettings(node) {
     overlay.addEventListener("pointerdown", (event) => {
         if (!apiFormat.contains?.(event.target)) apiFormat.__h3CloseMenu?.();
         if (!videoSample.contains?.(event.target)) videoSample.__h3CloseMenu?.();
+        if (!clipModel.contains?.(event.target)) clipModel.__h3CloseMenu?.();
         if (event.target === overlay) close();
     });
     closeButton.addEventListener("click", close);
@@ -4616,9 +4716,11 @@ async function openPromptOptimizerSettings(node) {
                 gguf_gpu_layers: ggufGpuLayers.value,
                 gguf_unload_after: ggufUnload.checked,
                 gguf_describe_media: ggufDescribe.checked,
+                clip_model: clipModel.value,
+                clip_unload_after: clipUnload.checked,
                 optimize_on_run: optimizeOnRun.checked,
                 remote_unload_after: remoteUnload.checked,
-            });
+            }, promptOptimizerSettingsCache.api_key_set && !apiKeyTouched);
             notifyPromptOptimizer(TEXT.settingsSaved, "success");
             close();
         } catch (saveError) {
@@ -4642,10 +4744,11 @@ function promptOptimizerApiKeyRequired(apiFormat) {
 }
 
 function promptOptimizerConfigured(state) {
+    // `api_key_set`, never `api_key`: the server does not send the key back.
     return Boolean(
         state?.api_url?.trim()
         && state?.model?.trim()
-        && (state?.api_key?.trim() || !promptOptimizerApiKeyRequired(state?.api_format))
+        && (state?.api_key_set || !promptOptimizerApiKeyRequired(state?.api_format))
     );
 }
 
@@ -4714,12 +4817,14 @@ function syncPromptOptimizerButton(node) {
     const button = node?.__h3PromptOptimizeButton;
     if (!button) return;
     const state = promptOptimizerState(node);
-    const clip = isClipOptimizerFormat(state.api_format);
+    // Deferred means "nothing to run from the editor": the text encoder format
+    // with no `clip_model`, where the only encoder is the wired one.
+    const clip = isClipOptimizerFormat(state.api_format) && !state.clip_model.trim();
     // The local formats need no credentials: the CLIP one is configured as soon
-    // as an encoder is wired to the input, the GGUF one as soon as a model file
-    // is picked.
-    const configured = clip
-        ? optimizerClipIsConnected(node)
+    // as an encoder is wired to the input or picked in the settings, the GGUF
+    // one as soon as a model file is picked.
+    const configured = isClipOptimizerFormat(state.api_format)
+        ? optimizerClipIsConnected(node) || Boolean(state.clip_model.trim())
         : isGgufOptimizerFormat(state.api_format)
             ? Boolean(state.gguf_model.trim())
             : promptOptimizerConfigured(state);
@@ -4759,16 +4864,18 @@ function syncPromptOptimizerButton(node) {
 /**
  * Show the unload button only for the backends that hold a model somewhere.
  *
- * `gguf` caches its `Llama` in this process, and an OpenAI-compatible URL is
- * usually LM Studio or Ollama on the same machine. Gemini holds nothing, and
- * `clip` is ComfyUI's own model — unloading that behind ComfyUI's back is not
- * this button's business.
+ * `gguf` caches its `Llama` in this process and so does a `clip_model` text
+ * encoder, and an OpenAI-compatible URL is usually LM Studio or Ollama on the
+ * same machine. Gemini holds nothing, and an encoder wired to optimizer_clip is
+ * the workflow's own model — unloading that behind ComfyUI's back is not this
+ * button's business.
  */
 function syncPromptOptimizerUnloadButton(node, state, pending) {
     const button = node?.__h3PromptUnloadButton;
     if (!button) return;
     const format = String(state?.api_format || "").toLowerCase();
-    const local = format === OPTIMIZER_FORMAT_GGUF;
+    const local = format === OPTIMIZER_FORMAT_GGUF
+        || (format === OPTIMIZER_FORMAT_CLIP && Boolean(String(state?.clip_model || "").trim()));
     button.hidden = !local && format !== OPTIMIZER_FORMAT_OPENAI && format !== OPTIMIZER_FORMAT_RESPONSES;
     button.disabled = Boolean(pending);
     button.title = local ? TEXT.optimizerUnload : TEXT.optimizerUnloadHttp;
@@ -4792,7 +4899,7 @@ async function unloadPromptOptimizerModel(node) {
     if (!button || button.disabled) return;
     button.disabled = true;
     try {
-        const response = await api.fetchApi(PROMPT_OPTIMIZER_UNLOAD_ENDPOINT, { method: "POST" });
+        const response = await callPromptOptimizerRoute(PROMPT_OPTIMIZER_UNLOAD_ENDPOINT, { method: "POST" });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data?.ok) throw new Error(data?.error || `HTTP ${response.status}`);
         // `detail` carries the server's own wording, e.g. which models it does
@@ -4919,9 +5026,10 @@ async function optimizePromptFromEditor(node) {
         return;
     }
     const state = promptOptimizerState(node);
-    if (isClipOptimizerFormat(state.api_format)) {
-        // The optimizer CLIP is only alive during execution, so this format
-        // cannot run from the editor. Say when it will run instead.
+    if (isClipOptimizerFormat(state.api_format) && !state.clip_model.trim()) {
+        // An encoder wired to optimizer_clip is only alive during execution, so
+        // without a `clip_model` this format cannot run from the editor. Say
+        // when it will run instead.
         notifyPromptOptimizer(
             optimizerClipIsConnected(node) ? TEXT.optimizerDeferred : TEXT.optimizerClipMissing,
             optimizerClipIsConnected(node) ? "info" : "warn",
@@ -4933,7 +5041,7 @@ async function optimizePromptFromEditor(node) {
             notifyPromptOptimizer(TEXT.ggufMissing);
             return;
         }
-    } else if (!promptOptimizerConfigured(state)) {
+    } else if (!isClipOptimizerFormat(state.api_format) && !promptOptimizerConfigured(state)) {
         notifyPromptOptimizer(TEXT.optimizerMissing);
         return;
     }
@@ -4961,7 +5069,7 @@ async function optimizePromptFromEditor(node) {
     setPromptOptimizerStatus(node, "loading");
     syncPromptOptimizerButton(node);
     try {
-        const response = await api.fetchApi("/minimax_h3_easy/prompt_optimize", {
+        const response = await callPromptOptimizerRoute("/minimax_h3_easy/prompt_optimize", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             signal: controller?.signal,
@@ -5010,7 +5118,7 @@ function cancelPromptOptimization(node) {
     // Tell the server first: it stops a local GGUF mid-generation, and the
     // abort below only stops this browser from waiting.
     if (requestId) {
-        api.fetchApi("/minimax_h3_easy/prompt_optimize_cancel", {
+        callPromptOptimizerRoute("/minimax_h3_easy/prompt_optimize_cancel", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ request_id: requestId }),

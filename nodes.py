@@ -16,11 +16,15 @@ import threading
 import time
 import base64
 import asyncio
+import contextlib
 import io
 import inspect
 import hashlib
+import hmac
+import ipaddress
 import json
 import mimetypes
+import secrets
 import tempfile
 import urllib.parse
 from collections.abc import Mapping, Sequence
@@ -130,12 +134,21 @@ PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS = 60
 PROMPT_OPTIMIZER_MAX_OUTPUT_TOKENS = 50000
 PROMPT_OPTIMIZER_MARKER_VERSION = 1
 PROMPT_OPTIMIZER_CONFIG_VERSION = 3
+# Every optimizer route wants this header, and only a page served by this
+# ComfyUI can know its value: it is minted per process and handed out by
+# GET prompt_optimizer_settings, which a cross-origin page cannot read. A custom
+# header also makes the request non-simple, so a browser preflights it instead
+# of just sending it. Duplicated in the JS.
+OPTIMIZER_TOKEN_HEADER = "X-MiniMax-H3-Easy-Token"
+_OPTIMIZER_ROUTE_TOKEN = secrets.token_urlsafe(32)
 OPTIMIZER_FORMAT_OPENAI = "openai"
 # OpenAI's Responses API. Same servers as `openai` but a different endpoint,
 # payload and reply shape, which is why it is a format rather than a URL.
 OPTIMIZER_FORMAT_RESPONSES = "responses"
 OPTIMIZER_FORMAT_GEMINI = "gemini"
-# Local text generation through the CLIP input instead of an HTTP API.
+# Local text generation through a ComfyUI text encoder instead of an HTTP API:
+# the one wired to the `optimizer_clip` input, or the `clip_model` file this pack
+# loads on its own when nothing is wired.
 OPTIMIZER_FORMAT_CLIP = "clip"
 # Local text generation through a GGUF model loaded by llama-cpp-python.
 OPTIMIZER_FORMAT_GGUF = "gguf"
@@ -153,8 +166,8 @@ OPTIMIZER_LOCAL_FORMATS = (OPTIMIZER_FORMAT_CLIP, OPTIMIZER_FORMAT_GGUF)
 # The formats `_optimizer_remote_unload` has something to free for: the two
 # OpenAI-shaped ones, because the servers people run locally behind them (LM
 # Studio, Ollama) are the only ones with a management route. `gemini` is a cloud
-# endpoint and `clip` is ComfyUI's own model; `gguf` frees its own `Llama`
-# instead, through `gguf_unload_after`.
+# endpoint; `gguf` and a `clip_model` encoder free their own cache instead,
+# through `gguf_unload_after` / `clip_unload_after`.
 OPTIMIZER_REMOTE_UNLOAD_FORMATS = (OPTIMIZER_FORMAT_OPENAI, OPTIMIZER_FORMAT_RESPONSES)
 PROMPT_OPTIMIZER_CLIP_MAX_LENGTH = 1024
 PROMPT_OPTIMIZER_CLIP_MIN_LENGTH = 16
@@ -168,6 +181,14 @@ OPTIMIZER_GGUF_CONTEXT = 16384
 OPTIMIZER_GGUF_CONTEXT_MIN = 512
 OPTIMIZER_GGUF_CONTEXT_LIMIT = 1048576
 OPTIMIZER_GGUF_GPU_LAYERS = -1
+# Where the `clip_model` setting looks: a text encoder in ComfyUI's own
+# safetensors format, loaded through `comfy.sd.load_clip`.
+OPTIMIZER_CLIP_DIR = "text_encoders"
+OPTIMIZER_CLIP_EXTENSIONS = (".safetensors", ".sft")
+# comfy's Qwen image preprocessor keeps up to 12.8 MP, which is several thousand
+# vision tokens for one photo. A reference read from a file is shrunk to this
+# side before it is handed over.
+OPTIMIZER_CLIP_IMAGE_MAX_SIDE = 1024
 # Caps for the media handed to a local text encoder. Every still costs the
 # encoder a block of soft tokens, so reference sets are trimmed rather than
 # sent whole.
@@ -256,6 +277,11 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "gguf_gpu_layers": OPTIMIZER_GGUF_GPU_LAYERS,
     "gguf_unload_after": False,
     "gguf_describe_media": False,
+    "clip_model": "",
+    "clip_unload_after": False,
+    # Extra Host names the routes answer to, for a reverse proxy on this machine.
+    # Hand-edited only: the settings route never writes it.
+    "allowed_hosts": [],
 }
 
 
@@ -575,6 +601,10 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     remote_unload = source.get("remote_unload_after", False)
     if isinstance(remote_unload, str):
         remote_unload = remote_unload.strip().lower() in {"1", "true", "yes", "on"}
+    clip_unload = source.get("clip_unload_after", False)
+    if isinstance(clip_unload, str):
+        clip_unload = clip_unload.strip().lower() in {"1", "true", "yes", "on"}
+    hosts = source.get("allowed_hosts")
     return {
         "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
         "api_format": api_format,
@@ -592,6 +622,12 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "gguf_gpu_layers": integer("gguf_gpu_layers", OPTIMIZER_GGUF_GPU_LAYERS, -1, 1024),
         "gguf_unload_after": bool(unload),
         "gguf_describe_media": bool(describe),
+        "clip_model": str(source.get("clip_model") or "").strip(),
+        "clip_unload_after": bool(clip_unload),
+        "allowed_hosts": [
+            str(host).strip().lower() for host in (hosts if isinstance(hosts, (list, tuple)) else [])
+            if str(host).strip()
+        ],
     }
 
 
@@ -644,6 +680,89 @@ def _write_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[str,
                 except OSError:
                     pass
     return normalized
+
+
+def _public_prompt_optimizer_config(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """The settings as the editor may see them.
+
+    The API key goes in and never comes back out: the dialog only needs to know
+    that one is stored. `allowed_hosts` is not the editor's business at all.
+    """
+    public = {key: value for key, value in settings.items() if key != "allowed_hosts"}
+    public["api_key_set"] = bool(str(public.get("api_key") or "").strip())
+    public["api_key"] = ""
+    return public
+
+
+def _update_prompt_optimizer_config(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply what the settings dialog sent, which is less than the whole file."""
+    with _PROMPT_OPTIMIZER_CONFIG_LOCK:
+        stored = _read_prompt_optimizer_config()
+        merged = dict(payload)
+        # What decides who may call the routes cannot be settable through one.
+        merged["allowed_hosts"] = stored["allowed_hosts"]
+        # The dialog never had the key, so an untouched field means "as it was".
+        keep = payload.get("api_key_keep", False)
+        if isinstance(keep, str):
+            keep = keep.strip().lower() in {"1", "true", "yes", "on"}
+        if bool(keep):
+            merged["api_key"] = stored["api_key"]
+        return _write_prompt_optimizer_config(merged)
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _optimizer_request_problem(request, token: bool = True) -> str:
+    """Why this request may not use the optimizer routes, or "" when it may.
+
+    These routes write the settings file, spend the API key and read media off
+    the disk, and ComfyUI has no login, so "the editor page sent this" is the
+    only authority there is. Three things establish it:
+
+    - the page is same-origin: no cross-site fetch metadata, and an `Origin`
+      that names the host it was sent to. ComfyUI has a middleware for this,
+      but only for loopback, and not at all under `--enable-cors-header`;
+    - the `Host` of a connection from this machine is an address or
+      `localhost`. A DNS name there is what a rebinding page looks like: it is
+      same-origin with itself, so the first check and the token both pass it;
+    - the request carries the per-process token (every route but the one that
+      hands it out).
+    """
+    headers = request.headers
+    if str(headers.get("Sec-Fetch-Site") or "").lower() == "cross-site":
+        return "Cross-site requests are not accepted"
+    host = urllib.parse.urlsplit("//" + str(headers.get("Host") or "").strip().lower())
+    origin_header = str(headers.get("Origin") or "").strip().lower()
+    if origin_header:
+        origin = urllib.parse.urlsplit(origin_header)
+        same = bool(origin.hostname) and origin.hostname == host.hostname
+        try:
+            # A proxy may drop the port on one side, so it only counts when both have one.
+            if same and origin.port is not None and host.port is not None:
+                same = origin.port == host.port
+        except ValueError:
+            same = False
+        if not same:
+            return "The request's Origin does not match its Host"
+    hostname = host.hostname or ""
+    remote = str(getattr(request, "remote", "") or "")
+    local_peer = _is_ip_literal(remote) and ipaddress.ip_address(remote).is_loopback
+    if local_peer and hostname != "localhost" and not _is_ip_literal(hostname):
+        if hostname not in _read_prompt_optimizer_config()["allowed_hosts"]:
+            return (
+                f"Host '{hostname}' is not accepted from this machine. If ComfyUI is behind a local "
+                'reverse proxy, add it to "allowed_hosts" in prompt_optimizer.json.'
+            )
+    sent = str(headers.get(OPTIMIZER_TOKEN_HEADER) or "").encode("utf-8", errors="replace")
+    if token and not hmac.compare_digest(sent, _OPTIMIZER_ROUTE_TOKEN.encode("utf-8")):
+        return "Missing or stale token. Reload the page."
+    return ""
 
 
 _OPTIMIZER_KNOWN_ENDPOINT_SUFFIXES = (
@@ -1604,6 +1723,17 @@ def _stack_stills(stills: list) -> Any:
     return torch.cat(normalized, dim=0)
 
 
+def _optimizer_clip_still_media(clip, stills: list) -> dict[str, Any]:
+    """Stills on whichever image argument this tokenizer declares, or {} for none."""
+    if not stills:
+        return {}
+    if _tokenizer_accepts(clip, "images"):
+        return {"images": [image[..., :3] for image in stills]}
+    if _tokenizer_accepts(clip, "image"):
+        return {"image": _stack_stills(stills)}
+    return {}
+
+
 def _optimizer_clip_media(
     clip,
     items: list[_MediaInput],
@@ -1670,13 +1800,9 @@ def _optimizer_clip_media(
                     OPTIMIZER_CLIP_MAX_STILLS, len(stills),
                 )
             stills = stills[:OPTIMIZER_CLIP_MAX_STILLS]
-            if _tokenizer_accepts(clip, "images"):
-                media["images"] = [image[..., :3] for image in stills]
-            elif _tokenizer_accepts(clip, "image"):
-                media["image"] = _stack_stills(stills)
-            else:
-                stills = []
-            attached += len(stills)
+            channel = _optimizer_clip_still_media(clip, stills)
+            media.update(channel)
+            attached += len(stills) if channel else 0
 
     if _tokenizer_accepts(clip, "audio"):
         clips = [item.value for item in items if item.media_type == "audio" and isinstance(item.value, Mapping) and "waveform" in item.value]
@@ -1816,6 +1942,268 @@ def _optimizer_clip_descriptions(
         lines.append(f"{label}: {description}")
     _optimizer_log("described %d of %d connected media in %.1fs", len(lines), len(describable), time.perf_counter() - started)
     return "\n".join(lines), len(lines)
+
+
+_OPTIMIZER_CLIP_LOCK = threading.RLock()
+_OPTIMIZER_CLIP_STATE: dict[str, Any] = {"path": None, "clip": None}
+# Same reason as _OPTIMIZER_GGUF_BUSY: the unload button must not take the
+# weights from under a run.
+_OPTIMIZER_CLIP_BUSY = 0
+
+
+def _optimizer_clip_hold(delta: int) -> None:
+    global _OPTIMIZER_CLIP_BUSY
+    with _OPTIMIZER_CLIP_LOCK:
+        _OPTIMIZER_CLIP_BUSY = max(0, _OPTIMIZER_CLIP_BUSY + delta)
+
+
+def _optimizer_clip_catalog() -> list[str]:
+    """The safetensors text encoders ComfyUI lists, by their loader names."""
+    return sorted(
+        name for name in _category_names(OPTIMIZER_CLIP_DIR)
+        if name.lower().endswith(OPTIMIZER_CLIP_EXTENSIONS)
+    )
+
+
+def _optimizer_clip_release() -> None:
+    with _OPTIMIZER_CLIP_LOCK:
+        clip = _OPTIMIZER_CLIP_STATE.get("clip")
+        _OPTIMIZER_CLIP_STATE["clip"] = None
+        _OPTIMIZER_CLIP_STATE["path"] = None
+    if clip is None:
+        return
+    try:
+        # Dropping the reference alone leaves the weights on the GPU until
+        # comfy next collects its loaded-model list.
+        comfy.model_management.unload_model_and_clones(clip.patcher)
+        del clip
+        comfy.model_management.soft_empty_cache()
+    except Exception as exc:
+        logging.warning("MiniMax H3 Easy: could not unload the optimizer text encoder cleanly (%s).", exc)
+
+
+def _optimizer_clip_unload_now() -> str:
+    """`_optimizer_gguf_unload_now` for this backend: `busy`, `idle` or `unloaded`."""
+    with _OPTIMIZER_CLIP_LOCK:
+        if _OPTIMIZER_CLIP_BUSY > 0:
+            return "busy"
+        if _OPTIMIZER_CLIP_STATE.get("clip") is None:
+            return "idle"
+        _optimizer_clip_release()
+    return "unloaded"
+
+
+def _optimizer_clip_model(settings: Mapping[str, Any]):
+    """Load (or reuse) the configured text encoder through comfy's own loader."""
+    requested = str(settings.get("clip_model") or "").strip()
+    if not requested:
+        raise ValueError("Select a text encoder in the prompt optimization settings")
+    path = folder_paths.get_full_path(OPTIMIZER_CLIP_DIR, requested)
+    if not path:
+        raise ValueError(f"Text encoder not found in models/{OPTIMIZER_CLIP_DIR}: {requested}")
+    with _OPTIMIZER_CLIP_LOCK:
+        if _OPTIMIZER_CLIP_STATE.get("clip") is not None and _OPTIMIZER_CLIP_STATE.get("path") == path:
+            return _OPTIMIZER_CLIP_STATE["clip"]
+    _optimizer_clip_release()
+
+    import comfy.sd
+
+    _optimizer_log("loading text encoder %s...", requested)
+    started = time.perf_counter()
+    # No clip type: the generic wrapper of each family is the one that generates.
+    # A type would select an image model's conditioning variant of it instead —
+    # which is also why this is not `_load_text_encoder`, whose "minimax" type is
+    # what H3 conditions on.
+    clip = comfy.sd.load_clip(
+        ckpt_paths=[path], embedding_directory=folder_paths.get_folder_paths("embeddings"),
+    )
+    # Every comfy encoder wrapper has a `generate`; what a CLIP or T5 lacks is
+    # the language model underneath for it to forward to.
+    wrapper = clip.cond_stage_model
+    inner = getattr(wrapper, str(getattr(wrapper, "clip", "")), wrapper)
+    # A wrapper built some other way is left to fail in `generate` itself.
+    transformer = getattr(inner, "transformer", None)
+    if transformer is not None and not callable(getattr(transformer, "generate", None)):
+        del clip, wrapper, inner, transformer
+        raise ValueError(
+            f"{requested} is a text encoder ComfyUI cannot generate text with. "
+            "Pick an LLM-based one (Qwen3-VL, Qwen3.5, Gemma)."
+        )
+    _optimizer_log("text encoder loaded in %.1fs", time.perf_counter() - started)
+    with _OPTIMIZER_CLIP_LOCK:
+        _OPTIMIZER_CLIP_STATE["clip"] = clip
+        _OPTIMIZER_CLIP_STATE["path"] = path
+    return clip
+
+
+def _optimizer_clip_part_tensors(parts: Sequence[Mapping[str, Any]]) -> list[Any]:
+    """The request's image parts as the `[1, H, W, 3]` tensors comfy tokenizes.
+
+    Going back through the encoded parts rather than around them keeps one media
+    pipeline for the editor route: the sampling, the tags and the skip report
+    are already decided by the time a backend is chosen.
+    """
+    import numpy
+    from PIL import Image
+
+    tensors = []
+    for part in parts:
+        url = str((part.get("image_url") or {}).get("url") or "")
+        if not url.startswith("data:") or "," not in url:
+            continue
+        try:
+            image = Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).convert("RGB")
+        except Exception as exc:
+            logging.warning("MiniMax H3 Easy: could not decode a connected image for the text encoder (%s).", exc)
+            continue
+        longest = max(image.width, image.height)
+        if longest > OPTIMIZER_CLIP_IMAGE_MAX_SIDE:
+            scale = OPTIMIZER_CLIP_IMAGE_MAX_SIDE / float(longest)
+            image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))))
+        tensors.append(torch.from_numpy(numpy.asarray(image).astype(numpy.float32) / 255.0).unsqueeze(0))
+    return tensors
+
+
+def _optimizer_clip_workflow_running() -> bool:
+    try:
+        from server import PromptServer
+
+        queue = getattr(getattr(PromptServer, "instance", None), "prompt_queue", None)
+        return bool(getattr(queue, "currently_running", None))
+    except Exception:
+        return False
+
+
+@contextlib.contextmanager
+def _optimizer_clip_cancel_hook(should_stop):
+    """Make comfy's token loop stoppable from the editor.
+
+    `generate` takes no callback, but it ticks a `ProgressBar`, and a progress
+    bar calls the global hook. The server's hook is swapped for one that polls
+    the cancel registry — on this thread only, so a workflow queued meanwhile
+    keeps its progress. The server's own hook is not called for this run: it
+    reports to whichever node executed last.
+    """
+    if should_stop is None:
+        yield
+        return
+    import comfy.utils
+
+    original = comfy.utils.PROGRESS_BAR_HOOK
+    owner = threading.get_ident()
+
+    def hook(value, total, preview=None, **kwargs):
+        if threading.get_ident() != owner:
+            return original(value, total, preview, **kwargs) if original is not None else None
+        if should_stop():
+            raise _OptimizerCancelled("Prompt optimization was cancelled")
+        return None
+
+    comfy.utils.PROGRESS_BAR_HOOK = hook
+    try:
+        yield
+    finally:
+        if comfy.utils.PROGRESS_BAR_HOOK is hook:
+            comfy.utils.PROGRESS_BAR_HOOK = original
+
+
+def _optimizer_clip_part_descriptions(
+    clip,
+    media_items: Sequence[Mapping[str, Any]],
+    max_length: int,
+    should_stop=None,
+) -> tuple[str, int]:
+    """`_optimizer_clip_descriptions` for the editor route, where media are files.
+
+    Same one-pass-per-asset shape and the same labels, but the assets arrive as
+    the request parts `_optimizer_media_items` built, so a video is the stills
+    it was already sampled into and says so with their timestamps.
+    """
+    describable = [item for item in media_items if str(item.get("type")) in OPTIMIZER_CLIP_DESCRIBE_REQUESTS]
+    if not describable:
+        return "", 0
+    lines = []
+    length = min(int(max_length), OPTIMIZER_CLIP_DESCRIBE_LENGTH)
+    started = time.perf_counter()
+    _optimizer_log("describing %d connected media with the text encoder", len(describable))
+    for index, item in enumerate(describable, start=1):
+        if should_stop is not None and should_stop():
+            raise _OptimizerCancelled("Prompt optimization was cancelled")
+        media_type = str(item.get("type"))
+        label = str(item.get("tag") or f"{media_type} {index}")
+        stills = _optimizer_clip_part_tensors(item.get("parts") or [])[:OPTIMIZER_CLIP_MAX_STILLS]
+        media = _optimizer_clip_still_media(clip, stills)
+        if not media:
+            # Saying nothing is better than letting the prompt writer imagine
+            # the content.
+            _optimizer_log("  %s (%d/%d): skipped, nothing of this %s can be shown to the encoder", label, index, len(describable), media_type)
+            continue
+        request = (
+            OPTIMIZER_VIDEO_STILLS_REQUEST.format(
+                count=len(stills),
+                detail=_optimizer_video_sample_detail(item.get("times") or [], float(item.get("duration") or 0.0)),
+            )
+            if item.get("sampled") else OPTIMIZER_CLIP_DESCRIBE_REQUESTS[media_type]
+        )
+        _optimizer_log("  %s (%d/%d): describing the %s...", label, index, len(describable), media_type)
+        step = time.perf_counter()
+        try:
+            description = _optimizer_clip_generate(clip, OPTIMIZER_CLIP_DESCRIBE_SYSTEM, request, length, media)
+        except ValueError as exc:
+            logging.warning("MiniMax H3 Easy: could not describe %s for the prompt optimizer (%s).", label, exc)
+            continue
+        _optimizer_log("  %s (%d/%d): %.1fs, %d chars", label, index, len(describable), time.perf_counter() - step, len(description))
+        lines.append(f"{label}: {description}")
+    _optimizer_log("described %d of %d connected media in %.1fs", len(lines), len(describable), time.perf_counter() - started)
+    return "\n".join(lines), len(lines)
+
+
+def _optimizer_clip_json(
+    settings: Mapping[str, Any],
+    scene_guide: str,
+    mode: str,
+    seconds: float,
+    counts: Mapping[str, int],
+    user_prompt: str,
+    media_items: Sequence[Mapping[str, Any]],
+    should_stop=None,
+) -> str:
+    """Optimize from the editor with the `clip_model` text encoder.
+
+    The execution-time path (`MiniMaxH3Easy._clip_prompt_transform`) and this one
+    share everything after the model: per-asset descriptions, then a text-only
+    final pass through `_optimizer_clip_generate`.
+    """
+    # comfy's model management has no lock of its own: loading a model from
+    # this thread while the executor is moving its own would race over the
+    # same VRAM bookkeeping.
+    if _optimizer_clip_workflow_running():
+        raise ValueError("ComfyUI is running a workflow. Optimize again when it has finished.")
+    started = time.perf_counter()
+    max_length = int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)
+    try:
+        # The executor runs nodes under inference_mode, and a model loaded under
+        # one mode is not usable under the other, so both callers use it.
+        with torch.inference_mode():
+            clip = _optimizer_clip_model(settings)
+            _optimizer_log(
+                "optimizing the prompt with text encoder %s (mode=%s, guide=%s, media=%d)",
+                str(settings.get("clip_model") or ""), mode, scene_guide, len(media_items),
+            )
+            with _optimizer_clip_cancel_hook(should_stop):
+                described, count = _optimizer_clip_part_descriptions(clip, media_items, max_length, should_stop)
+                system = _optimizer_system_prompt(scene_guide, mode, float(seconds), counts, 0, count)
+                _optimizer_log("writing the final prompt (guide=%d chars, descriptions=%d)...", len(system), count)
+                text = _optimizer_clip_generate(clip, system, user_prompt, max_length, None, described)
+    except _OptimizerCancelled:
+        # Stopping hands the VRAM back, like the GGUF format.
+        _optimizer_clip_release()
+        raise
+    finally:
+        if bool(settings.get("clip_unload_after")):
+            _optimizer_clip_release()
+    _optimizer_log("prompt optimization finished in %.1fs (%d chars)", time.perf_counter() - started, len(text))
+    return text
 
 
 def _optimizer_gguf_roots() -> list[str]:
@@ -2748,12 +3136,46 @@ def _register_prompt_optimizer_route() -> bool:
     if routes is None or getattr(_register_prompt_optimizer_route, "_registered", False):
         return bool(getattr(_register_prompt_optimizer_route, "_registered", False))
 
+    def refused(request, token: bool = True):
+        """The 403 for a request `_optimizer_request_problem` turns away, else None."""
+        problem = _optimizer_request_problem(request, token)
+        if not problem:
+            return None
+        logging.warning("MiniMax H3 Easy: refused %s %s: %s", request.method, request.path, problem)
+        return web.json_response({"ok": False, "forbidden": True, "error": problem}, status=403)
+
     @routes.get("/minimax_h3_easy/prompt_optimizer_settings")
     async def _prompt_optimizer_settings_get(request):
-        return web.json_response({"ok": True, "settings": _read_prompt_optimizer_config()})
+        # The one route without the token: this is where the editor gets it. A
+        # page from anywhere else can send this request but not read the answer.
+        denied = refused(request, token=False)
+        if denied is not None:
+            return denied
+        return web.json_response({
+            "ok": True,
+            "settings": _public_prompt_optimizer_config(_read_prompt_optimizer_config()),
+            "token": _OPTIMIZER_ROUTE_TOKEN,
+        })
+
+    @routes.get("/minimax_h3_easy/clip_models")
+    async def _clip_models_get(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
+        try:
+            return web.json_response({
+                "ok": True,
+                "models": await asyncio.to_thread(_optimizer_clip_catalog),
+                "roots": _category_paths(OPTIMIZER_CLIP_DIR),
+            })
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
     @routes.get("/minimax_h3_easy/gguf_models")
     async def _gguf_models_get(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             models, projectors = await asyncio.to_thread(_optimizer_gguf_catalog)
             return web.json_response({
@@ -2767,10 +3189,15 @@ def _register_prompt_optimizer_route() -> bool:
 
     @routes.post("/minimax_h3_easy/prompt_optimizer_settings")
     async def _prompt_optimizer_settings_post(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             payload = await request.json()
-            settings = _write_prompt_optimizer_config(payload if isinstance(payload, dict) else {})
-            return web.json_response({"ok": True, "settings": settings})
+            settings = await asyncio.to_thread(
+                _update_prompt_optimizer_config, payload if isinstance(payload, dict) else {},
+            )
+            return web.json_response({"ok": True, "settings": _public_prompt_optimizer_config(settings)})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
@@ -2778,19 +3205,25 @@ def _register_prompt_optimizer_route() -> bool:
     async def _prompt_optimizer_unload(request):
         """Free the model the configured optimizer backend is holding.
 
-        For `gguf` that is this process's own cache; for the two OpenAI-shaped
-        formats it is a request to LM Studio's or Ollama's own management route
-        — the same servers answer both, so `responses` is included. Gemini is a
-        cloud endpoint with nothing to free and `clip` is ComfyUI's own model,
-        which is not this route's to unload; the button is hidden for both.
+        For `gguf` and a `clip_model` encoder that is this process's own cache;
+        for the two OpenAI-shaped formats it is a request to LM Studio's or
+        Ollama's own management route — the same servers answer both, so
+        `responses` is included. Gemini is a cloud endpoint with nothing to
+        free, and an encoder wired to `optimizer_clip` is the workflow's own
+        model, which is not this route's to unload.
         """
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             settings = _read_prompt_optimizer_config()
             api_format = str(settings.get("api_format") or OPTIMIZER_FORMAT_OPENAI).lower()
-            if api_format == OPTIMIZER_FORMAT_GGUF:
+            if api_format in OPTIMIZER_LOCAL_FORMATS:
                 # llm.close() blocks while the weights are freed, so it stays off
                 # the event loop like every other model-touching call here.
-                state = await asyncio.to_thread(_optimizer_gguf_unload_now)
+                state = await asyncio.to_thread(
+                    _optimizer_gguf_unload_now if api_format == OPTIMIZER_FORMAT_GGUF else _optimizer_clip_unload_now,
+                )
                 if state == "busy":
                     return web.json_response(
                         {"ok": False, "busy": True, "error": "A prompt optimization is still running"}, status=409,
@@ -2811,6 +3244,9 @@ def _register_prompt_optimizer_route() -> bool:
 
     @routes.post("/minimax_h3_easy/prompt_optimize_cancel")
     async def _prompt_optimize_cancel(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         try:
             payload = await request.json()
             request_id = str((payload or {}).get("request_id") or "")
@@ -2823,6 +3259,9 @@ def _register_prompt_optimizer_route() -> bool:
 
     @routes.post("/minimax_h3_easy/prompt_optimize")
     async def _prompt_optimize(request):
+        denied = refused(request)
+        if denied is not None:
+            return denied
         request_id = ""
         try:
             payload = await request.json()
@@ -2836,29 +3275,32 @@ def _register_prompt_optimizer_route() -> bool:
             mode = str(payload.get("mode") or MODE_IMAGE)
             scene_guide = str(payload.get("scene_guide") or "none")
             seconds = min(MAX_SECONDS, max(MIN_SECONDS, float(payload.get("seconds") or 5.0)))
-            if api_format == OPTIMIZER_FORMAT_CLIP:
-                # The optimizer CLIP only exists while the graph runs, so this
-                # format cannot be served from an editor-time request.
+            encoder = api_format == OPTIMIZER_FORMAT_CLIP
+            if encoder and not str(settings.get("clip_model") or "").strip():
+                # Without a `clip_model` the only encoder is the one wired to
+                # `optimizer_clip`, and that object only exists while the graph
+                # runs, so there is nothing an editor-time request could use.
                 return web.json_response({
                     "ok": False,
                     "error": "The text encoder format optimizes the prompt when the workflow runs.",
                     "deferred": True,
                 }, status=400)
-            if api_format not in {*OPTIMIZER_HTTP_FORMATS, OPTIMIZER_FORMAT_GGUF}:
+            if api_format not in OPTIMIZER_FORMATS:
                 return web.json_response({"ok": False, "error": "Unsupported API format"}, status=400)
             local = api_format == OPTIMIZER_FORMAT_GGUF
             if not prompt.strip():
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
             if local and not str(settings.get("gguf_model") or "").strip():
                 return web.json_response({"ok": False, "error": "Select a GGUF model in the prompt optimization settings"}, status=400)
-            if not local and not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
+            if not local and not encoder and not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
             raw_counts = payload.get("media_counts") if isinstance(payload.get("media_counts"), dict) else {}
             counts = {kind: max(0, min(MAX_MEDIA, int(raw_counts.get(kind, 0) or 0))) for kind in ("image", "video", "audio")}
             resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []
             # llama-cpp takes the same OpenAI-shaped image parts as the HTTP
-            # chat-completions format, so the media builder is shared.
-            parts_format = OPTIMIZER_FORMAT_OPENAI if local else api_format
+            # chat-completions format, so the media builder is shared. The text
+            # encoder decodes those parts back into tensors.
+            parts_format = OPTIMIZER_FORMAT_OPENAI if local or encoder else api_format
             _optimizer_raise_if_cancelled(request_id)
             # Off the event loop: reading the references means whole files
             # base64'd and every video decoded and re-encoded frame by frame,
@@ -2877,6 +3319,20 @@ def _register_prompt_optimizer_route() -> bool:
             # Held for the whole local run, describe pass included, so an unload
             # pressed mid-generation is refused instead of freeing a model that
             # is still in use.
+            if encoder:
+                # The text encoder has its own shape — one describe pass per
+                # asset, then a text-only final pass — so it does not share the
+                # branch below, only the hold and the cancel plumbing.
+                _optimizer_clip_hold(1)
+                try:
+                    result = await asyncio.to_thread(
+                        _optimizer_clip_json, settings, scene_guide, mode, seconds, counts, prompt,
+                        media_items, should_stop,
+                    )
+                finally:
+                    _optimizer_clip_hold(-1)
+                _optimizer_raise_if_cancelled(request_id)
+                return web.json_response({"ok": True, "prompt": result})
             if local:
                 _optimizer_gguf_hold(1)
             try:
@@ -2929,6 +3385,7 @@ def _register_prompt_optimizer_route() -> bool:
             # Nothing is running in a worker thread at this point, so freeing a
             # model the cancelled run had loaded is safe here.
             _optimizer_gguf_release()
+            await asyncio.to_thread(_optimizer_clip_release)
             _optimizer_log("prompt optimization cancelled")
             return web.json_response({"ok": False, "cancelled": True, "error": str(exc)}, status=409)
         except asyncio.CancelledError:
@@ -3743,13 +4200,18 @@ class MiniMaxH3Easy:
         settings = _read_prompt_optimizer_config()
         if str(settings.get("api_format") or "") != OPTIMIZER_FORMAT_CLIP:
             return None, None
-        clip = kwargs.get("optimizer_clip")
-        if clip is None:
+        wired = kwargs.get("optimizer_clip")
+        # A wired encoder wins: it is already part of this workflow's memory
+        # plan. The `clip_model` file is what runs when nothing is wired, so a
+        # headless run optimizes the same way the editor's button does.
+        loaded = wired is None and bool(str(settings.get("clip_model") or "").strip())
+        if wired is None and not loaded:
             # Generating without the encoder the user asked for would be worse
             # than generating the prompt as typed, so only say what happened.
             logging.warning(
-                "MiniMax H3 Easy: prompt optimization is set to the text encoder format, "
-                "but no encoder is connected to the optimizer_clip input. Using the prompt as typed."
+                "MiniMax H3 Easy: prompt optimization is set to the text encoder format, but no encoder is "
+                "connected to the optimizer_clip input and none is selected in the settings. "
+                "Using the prompt as typed."
             )
             return None, None
         pending = kwargs.get("prompt_needs_optimization", True)
@@ -3770,15 +4232,7 @@ class MiniMaxH3Easy:
         read_media = bool(settings.get("read_media"))
         result: list[str] = []
 
-        def transform(text: str, labels: Mapping[int, str] | None = None) -> str:
-            source = str(text or "")
-            if not source.strip():
-                return source
-            started = time.perf_counter()
-            _optimizer_log(
-                "optimizing the prompt with the connected text encoder (mode=%s, guide=%s, media=%d, read media=%s)",
-                mode, scene_guide, len(items), "on" if read_media else "off",
-            )
+        def run(clip, source: str, labels: Mapping[int, str] | None, started: float) -> str:
             # Reference videos are decoded again here; that is the price of
             # showing them to the encoder, so it only happens when asked.
             described, count = (
@@ -3795,6 +4249,28 @@ class MiniMaxH3Easy:
             )
             result.append(optimized)
             return optimized
+
+        def transform(text: str, labels: Mapping[int, str] | None = None) -> str:
+            source = str(text or "")
+            if not source.strip():
+                return source
+            started = time.perf_counter()
+            _optimizer_log(
+                "optimizing the prompt with the %s text encoder (mode=%s, guide=%s, media=%d, read media=%s)",
+                "configured" if loaded else "connected", mode, scene_guide, len(items), "on" if read_media else "off",
+            )
+            if not loaded:
+                return run(wired, source, labels, started)
+            # Held so the editor's unload button cannot take the weights from
+            # under this run. No workflow check and no cancel hook here: this
+            # thread *is* the executor, and comfy's own interrupt applies.
+            _optimizer_clip_hold(1)
+            try:
+                return run(_optimizer_clip_model(settings), source, labels, started)
+            finally:
+                _optimizer_clip_hold(-1)
+                if bool(settings.get("clip_unload_after")):
+                    _optimizer_clip_release()
 
         return transform, result
 

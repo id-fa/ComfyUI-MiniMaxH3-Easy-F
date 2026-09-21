@@ -90,9 +90,13 @@ holding, without touching the prompt:
   `/api/v1/models/unload`, Ollama is asked for a generation with `keep_alive: 0`.
   A plain OpenAI-compatible server (or a cloud endpoint) has nothing of the kind
   and says so. If the configured model is not resident, the reply names what is.
-- **Gemini native / Text encoder** — the button is hidden. Gemini is a cloud
-  endpoint with nothing to free, and the text encoder is ComfyUI's own model,
-  which is ComfyUI's to unload rather than this pack's.
+- **Text encoder with a file selected** — frees the encoder this pack loaded
+  itself (see *Loading the encoder from a file* below), with the same refusal
+  while an optimization is running.
+- **Gemini native / Text encoder with nothing selected** — the button is hidden.
+  Gemini is a cloud endpoint with nothing to free, and an encoder wired to
+  `optimizer_clip` is the workflow's own model, which is ComfyUI's to unload
+  rather than this pack's.
 
 This matters here more than it would elsewhere: the optimizer's model and H3
 itself compete for the same VRAM, and the optimizer runs from the editor, before
@@ -248,11 +252,50 @@ limits, and the final prompt-writing pass runs on text alone.
 - Each description is capped at 256 tokens, or `clip_max_length` when that is
   lower.
 
+### Loading the encoder from a file
+
+The settings popup also has a **Text encoder** dropdown listing the
+`.safetensors` / `.sft` files under `models/text_encoders`. Picking one makes the
+pack load that file itself, through `comfy.sd.load_clip`, and run it as the LLM —
+no loader node, no wire. It is loaded **without a clip type**: a type selects an
+image model's conditioning variant of the encoder, and the untyped wrapper is the
+one built to generate text. A file ComfyUI cannot generate with (a plain CLIP or
+T5) is refused with a message naming the kinds that work (Qwen3-VL, Qwen3.5,
+Gemma).
+
+The `optimizer_clip` input is still there, and the two combine like this:
+
+| `optimizer_clip` | **Text encoder** setting | `✦` in the editor | When the workflow runs |
+| --- | --- | --- | --- |
+| connected | *None* | reports that it runs with the workflow | the connected encoder |
+| connected | a file | optimizes now, with the file | the connected encoder |
+| empty | a file | optimizes now, with the file | the file |
+| empty | *None* | asks for one or the other | prompt used as typed, warning logged |
+
+A connected encoder wins during execution because it is already part of that
+workflow's memory plan. With a file selected `✦` works like it does for the GGUF
+format, including the stop button: ComfyUI's `generate` takes no stop callback,
+but it ticks a progress bar, so the pack polls the cancel request from the
+progress hook of its own thread. Stopping releases the encoder.
+
+- **Refused while a workflow is running.** ComfyUI's model management has no
+  lock, and loading a model from the editor's request next to the executor races
+  over the same VRAM bookkeeping. Optimize before queueing, or let the run do it.
+- The encoder stays loaded between clicks, registered with ComfyUI's model
+  management like any other model, so ComfyUI offloads it when H3 needs the
+  room. **Unload the model after use** (shown once a file is selected) and the
+  toolbar's **⏏** free it explicitly.
+- **Read connected media** works from the editor too. The references are read
+  from their files, exactly as for the HTTP and GGUF formats, shrunk to 1024 px
+  on the long side, and then described one asset at a time as below. A video is
+  the stills it was sampled into, described as one clip with their timestamps.
+  Audio has no file-based path to a text encoder and is skipped, not guessed at.
+
 ### When it runs
 
-The encoder only exists while the graph is running, so `✦` cannot use it at edit
-time. Clicking `✦` in this mode reports when optimization will happen instead of
-sending a request.
+An encoder wired to `optimizer_clip` only exists while the graph is running, so
+with no file selected `✦` cannot use it at edit time. Clicking `✦` then reports
+when optimization will happen instead of sending a request.
 
 Optimization runs **while the workflow executes**, and follows the same rule as
 the prompt fields:
@@ -274,8 +317,12 @@ every run.
 In this mode the settings popup hides the API URL, API key, and model rows and
 shows instead:
 
+- **Text encoder** (`clip_model`, default *None*) — see *Loading the encoder
+  from a file* above.
 - **Max generated tokens** (`clip_max_length`, default `1024`, range
   `16`–`32768`).
+- **Unload the model after use** (`clip_unload_after`, default off) — only once
+  a file is selected.
 
 **Read connected media** stays visible and applies to every format, as does
 **Video reference frames** (see *Reference videos over a chat API* below) once
@@ -288,8 +335,9 @@ it is on. All of these are stored in the same shared `prompt_optimizer.json`.
   therefore noticeably slower than an API call, and small encoders may follow
   the guide loosely. Selecting the **General only** Prompt Guide keeps it
   shortest.
-- If this format is selected but nothing is connected to `optimizer_clip`, the
-  prompt is used as typed and a warning is logged; the run is not failed.
+- If this format is selected but nothing is connected to `optimizer_clip` and no
+  file is selected, the prompt is used as typed and a warning is logged; the run
+  is not failed.
 - **Read connected media** costs one extra generation pass per connected asset,
   and decodes reference videos a second time (once for the encoder, once for
   H3's own conditioning). Leave it off if the workflow has many references and
@@ -728,6 +776,51 @@ words in front of those lines as well.
 and one slot label in `web/minimax_h3_easy_f_ui.js`. **Restart ComfyUI and hard
 refresh.** Workflows saved before this change load unchanged; the new socket
 simply appears unconnected.
+
+---
+
+## Who may call the prompt optimizer routes
+
+Upstream's `/minimax_h3_easy/*` routes answer anyone who can reach ComfyUI's
+port. `POST prompt_optimizer_settings` reads its body with `request.json()`,
+which ignores `Content-Type`, so a cross-origin `text/plain` "simple request"
+reaches it with no preflight — any web page open in the same browser could
+repoint `api_url`, and the next `✦` would send the API key, the prompt and the
+reference images to that address. ComfyUI has no login, so "the editor page sent
+this" is the only authority there is, and every route now establishes it:
+
+- **Same origin.** `Sec-Fetch-Site: cross-site` is refused, and so is an `Origin`
+  that does not name the `Host` the request was sent to. ComfyUI core has a
+  middleware like this, but only for loopback and not at all under
+  `--enable-cors-header`, so it is not relied on.
+- **A per-process token.** Every route but `GET prompt_optimizer_settings` wants
+  the `X-MiniMax-H3-Easy-Token` header. The value is minted when ComfyUI starts
+  and handed out by that one GET, whose answer a cross-origin page can request
+  but not read. A custom header also makes the request non-simple, so a browser
+  preflights it. The token dies with the server: a page that outlived a restart
+  gets one `403`, refetches the settings and repeats the call by itself.
+- **No DNS name from this machine.** A connection from loopback must have an IP
+  literal or `localhost` as its `Host`. A DNS name there is what a rebinding page
+  looks like — it is same-origin with itself and can read the token, so neither
+  other check stops it. If ComfyUI sits behind a reverse proxy on the same
+  machine, list its name under `"allowed_hosts"` in `prompt_optimizer.json`. That
+  key is hand-edited only: the settings route never writes it.
+
+**The API key no longer travels back to the editor.** The settings GET blanks it
+and reports `api_key_set` instead. The dialog's key field therefore opens empty
+with a *stored* placeholder: leave it alone and the key is kept, type to replace
+it, type and clear to remove it.
+
+A refused request is logged (`MiniMax H3 Easy: refused POST …: <reason>`) and
+answered with `403` and the same reason.
+
+### Scope
+
+`nodes.py` (`_optimizer_request_problem`, `_public_prompt_optimizer_config`,
+`_update_prompt_optimizer_config`) and `callPromptOptimizerRoute` in
+`web/minimax_h3_easy_f_ui.js`. **Restart ComfyUI and hard refresh** — an old
+page against a new server has no token and every `✦` would be refused. Scripts
+that called these routes directly must fetch the token first.
 
 ---
 

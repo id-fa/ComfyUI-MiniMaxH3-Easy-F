@@ -154,6 +154,8 @@ memory; the encode translates it back.
 Constants are duplicated between `nodes.py` and `web/minimax_h3_easy_f_ui.js` and must be edited in both:
 `MAX_MEDIA`, `MIN_SECONDS` / `MAX_SECONDS`, mode ids, `KEYFRAME_*`, `REF_IMAGE_*`,
 `REFERENCE_MENTION_*`, `RESOLUTION_CUSTOM`, the resolution/aspect lists, `OPTIMIZER_VIDEO_SAMPLES`,
+`OPTIMIZER_TOKEN_HEADER` (`PROMPT_OPTIMIZER_TOKEN_HEADER` in JS), every optimizer settings key (both
+sides normalize independently, and the server's normalization is authoritative),
 the prompt-guide id list (`PROMPT_GUIDES` in JS vs `prompt_guides/manifest.json` on the server), and the
 `__MINIMAX_H3_REF_` / `__MINIMAX_H3_UNRESOLVED_REF_` prefixes.
 
@@ -179,16 +181,42 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
 
 ## Prompt optimizer
 
+- **Route access (`_optimizer_request_problem`), ported from `ComfyUI-LLM-Widget`**, which was banned
+  from the Comfy Registry for `UNAUTHENTICATED_SIDE_EFFECT` over the same shape of route:
+  `await request.json()` ignores `Content-Type`, so a cross-origin `text/plain` "simple request" reaches
+  `POST prompt_optimizer_settings` with no preflight, repoints `api_url`, and the next `✦` sends the API
+  key, the prompt and the references to the attacker. Every route goes through `refused()`:
+  - same origin: `Sec-Fetch-Site: cross-site` and an `Origin` that does not match `Host` are refused.
+    Core has a middleware like this, but only for loopback hosts and not at all under
+    `--enable-cors-header`, so it is not relied on;
+  - `OPTIMIZER_TOKEN_HEADER` must carry `_OPTIMIZER_ROUTE_TOKEN`, minted per process and handed out only
+    by `GET prompt_optimizer_settings` (the one route checked with `token=False`). The JS sends
+    everything through `callPromptOptimizerRoute`, which refetches the settings and retries once on a
+    403, because the token dies with the server while the page lives on. **A new route must call
+    `refused(request)` first, and a new JS call must use `callPromptOptimizerRoute`, not
+    `api.fetchApi`;**
+  - a connection from loopback must have an IP literal or `localhost` as its `Host`. A DNS name there is
+    a rebinding page, which is same-origin with itself and can read the token, so neither other check
+    stops it. `allowed_hosts` in `prompt_optimizer.json` is the escape hatch for a same-machine reverse
+    proxy, and `_update_prompt_optimizer_config` deliberately never takes it from the request.
+
+  **The API key never goes back to the editor**: `_public_prompt_optimizer_config` blanks it and adds
+  `api_key_set`; the dialog sends `api_key_keep` when the field was not touched and
+  `_update_prompt_optimizer_config` keeps the stored key. `promptOptimizerConfigured` therefore reads
+  `api_key_set`, never `api_key`.
 - Routes are registered on ComfyUI's `PromptServer` by `_register_prompt_optimizer_route_when_ready()`,
   which retries on a daemon thread because `PromptServer.instance` does not exist yet at import time:
-  `GET/POST /minimax_h3_easy/prompt_optimizer_settings`, `POST /minimax_h3_easy/prompt_optimize`.
+  `GET/POST /minimax_h3_easy/prompt_optimizer_settings`, `POST /minimax_h3_easy/prompt_optimize`
+  (plus `prompt_optimize_cancel`, `prompt_optimizer_unload`, `gguf_models`, `clip_models`).
 - Settings are **installation-global** (`prompt_optimizer.json`), not per-node; only
   `prompt_optimizer_scene_guide` is a saved node widget. The `prompt_optimizer_settings` boolean is a
   momentary trigger that the frontend resets to `false` and `graphToPrompt` always forces to `false`.
 - There are **three** places a prompt can be optimized, and each one checks the configured `api_format`
   itself so only one of them ever fires:
-  - the editor route, for the HTTP formats and `gguf` (the `✦` button);
-  - `_clip_prompt_transform` inside `MiniMaxH3Easy.generate`, for `clip` only;
+  - the editor route, for the HTTP formats, `gguf`, and `clip` once a `clip_model` file is selected
+    (the `✦` button);
+  - `_clip_prompt_transform` inside `MiniMaxH3Easy.generate`, for `clip` only — with the wired
+    `optimizer_clip`, or the `clip_model` file when nothing is wired;
   - `_optimize_prompt_on_run`, upstream's `optimize_on_run` setting, **restricted in this fork to
     `OPTIMIZER_HTTP_FORMATS`**. It calls `_optimizer_http_json` directly, so handing it `clip` or
     `gguf` would POST the request to whatever URL was last left in the shared settings. The
@@ -283,8 +311,8 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   prose preambles — they will eat real prompts. The switches are what has to work.
 - `clip` runs locally through the node's optional `optimizer_clip` CLIP input using ComfyUI's
   `clip.tokenize` → `clip.generate` → `clip.decode` (same as the built-in `TextGenerate` node). That object
-  only exists during execution, so the HTTP route rejects this format and `MiniMaxH3Easy.generate` does the
-  work instead, via a `prompt_transform` callback threaded into `_reference_conditioning` — placed after
+  only exists during execution, so the HTTP route rejects this format (unless a `clip_model` file is
+  selected, see below) and `MiniMaxH3Easy.generate` does the work instead, via a `prompt_transform` callback threaded into `_reference_conditioning` — placed after
   `_resolve_reference_prompt` so the encoder sees real `<Picture N>` tags, not internal placeholders. The
   result is pushed to the editor with `PromptServer.send_sync(PROMPT_OPTIMIZER_EVENT)`. It only fires while
   the hidden `prompt_needs_optimization` transport input is true (frontend: "the open tab's Optimized
@@ -324,10 +352,12 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   the words are what carry that.
 - The editor toolbar's `⏏` (`POST /minimax_h3_easy/prompt_optimizer_unload`) frees whatever the
   configured backend holds: for `gguf` this process's cached `Llama` via `_optimizer_gguf_unload_now`,
+  for `clip` with a `clip_model` the cached encoder via `_optimizer_clip_unload_now`,
   for the two OpenAI-shaped formats the model on the server via `_optimizer_remote_unload`. Which
   server that is, is answered by probing (`/api/v1/models` is LM Studio's, `/api/ps` is Ollama's,
   neither has the other's) rather than by a setting — they are the same endpoint for every other
-  purpose. `gemini` and `clip` have nothing this route may free and the button is hidden for them.
+  purpose. `gemini` and a `clip` with only a wired encoder have nothing this route may free and the
+  button is hidden for them.
   **`_OPTIMIZER_GGUF_BUSY` / `_optimizer_gguf_hold` exist because that button can arrive mid-run**:
   closing a `Llama` a worker thread is still generating with takes llama-cpp down with the process, so
   the route is refused (`busy`) instead, and the whole decision including `llm.close()` happens under
@@ -351,6 +381,33 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   `image` whenever `video` is set, one audio clip max. Per-asset passes sidestep all of it. Descriptions are
   labelled with the same tag the prompt uses, which is why `prompt_transform` takes the `tag_by_input` map
   from `_reference_conditioning` (and `_keyframe_labels` in image mode).
+- **The `clip` format has two sources of encoder.** The wired `optimizer_clip` is upstream-of-this-fork
+  behaviour and stays; `clip_model` (ported from `ComfyUI-LLM-Widget`) is a `.safetensors` under
+  `models/text_encoders` that `_optimizer_clip_model` loads itself and caches in `_OPTIMIZER_CLIP_STATE`.
+  During execution the wired one wins (it is already in that workflow's memory plan) and the file is the
+  fallback; from the editor only the file can run, so `✦` stays "deferred" while `clip_model` is empty.
+  Things that are not obvious:
+  - **No `clip_type` is passed to `load_clip`.** A type selects an image model's conditioning variant;
+    the untyped default is the generic wrapper, and that is the one built to generate. This is why it is
+    not `_load_text_encoder`, whose `"minimax"` type is what H3 conditions on.
+  - **`generate` takes no stop callback.** It ticks a `comfy.utils.ProgressBar`, so
+    `_optimizer_clip_cancel_hook` swaps `PROGRESS_BAR_HOOK` for the duration, polling the cancel
+    registry *on the owning thread only* and forwarding every other thread to the server's hook. During
+    execution no hook is installed and comfy's own interrupt applies.
+  - **The route refuses while a workflow is running** (`_optimizer_clip_workflow_running`): comfy's
+    model management has no lock, and `load_models_gpu` from a worker thread next to the executor races
+    over the same bookkeeping. The execution path skips the check, because there the caller *is* the
+    executor. Both wrap the run in `torch.inference_mode()`, as the executor does, so the cached model
+    is usable from either.
+  - `_OPTIMIZER_CLIP_STATE` / `_optimizer_clip_hold` / `_optimizer_clip_unload_now` mirror the GGUF
+    trio. Release goes through `unload_model_and_clones`; dropping the reference alone leaves the
+    weights on the GPU. `⏏` and `clip_unload_after` only ever touch this cache, never a wired encoder.
+  - The editor path does not fork the media pipeline: it takes the same OpenAI-shaped `parts` as `gguf`
+    and `_optimizer_clip_part_tensors` decodes them back (capped at `OPTIMIZER_CLIP_IMAGE_MAX_SIDE`),
+    then `_optimizer_clip_part_descriptions` does the per-asset passes. Execution keeps
+    `_optimizer_clip_descriptions`, which has the real tensors. Both end in the same
+    `_optimizer_clip_generate`, so LLM-Widget's hand-built ChatML was deliberately *not* ported — one
+    prompt shape for both encoder sources.
 - `_optimizer_clip_media` still routes a *single* asset onto whatever argument the encoder has, probing with
   `_tokenizer_accepts`: every tokenizer takes `**kwargs`, so an unsupported media argument is *silently
   dropped* rather than raising, and the signature is the only reliable capability check. Qwen3-VL exposes
