@@ -275,12 +275,24 @@ The `optimizer_clip` input is still there, and the two combine like this:
 A connected encoder wins during execution because it is already part of that
 workflow's memory plan. With a file selected `✦` works like it does for the GGUF
 format, including the stop button: ComfyUI's `generate` takes no stop callback,
-but it ticks a progress bar, so the pack polls the cancel request from the
-progress hook of its own thread. Stopping releases the encoder.
+so the pack stops it the way ComfyUI's own Cancel button would, through the
+interrupt flag every kernel checks — only while no workflow is running, since the
+flag is global. Stopping releases the encoder.
 
 - **Refused while a workflow is running.** ComfyUI's model management has no
   lock, and loading a model from the editor's request next to the executor races
   over the same VRAM bookkeeping. Optimize before queueing, or let the run do it.
+- **Keep Max generated tokens near the size of a prompt** (the default `1024` is
+  plenty; an H3 prompt is a few hundred tokens). ComfyUI allocates the encoder's
+  KV cache for *prompt + Max generated tokens* up front, so a value in the tens
+  of thousands adds gigabytes of VRAM on top of the weights for nothing.
+- A Qwen3 encoder decodes through CUDA graphs that ComfyUI captures on the first
+  run and normally discards after each node. This pack generates several times
+  per run (one description per asset, then the prompt) and discards them itself
+  after every call — without that, the second generation writes into the first
+  one's freed KV cache and the whole ComfyUI process aborts with
+  `scatter gather kernel index out of bounds`. If you ever see that message, it
+  is not out-of-memory; report it.
 - The encoder stays loaded between clicks, registered with ComfyUI's model
   management like any other model, so ComfyUI offloads it when H3 needs the
   room. **Unload the model after use** (shown once a file is selected) and the

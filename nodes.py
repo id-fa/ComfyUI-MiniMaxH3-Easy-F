@@ -1828,6 +1828,33 @@ def _optimizer_clip_tokens(clip, text: str, media: Mapping[str, Any] | None = No
             return clip.tokenize(text)
 
 
+def _optimizer_clip_after_generate() -> None:
+    """What the executor does after every node, for a `generate` that was not one.
+
+    A Qwen3 encoder decodes through per-layer CUDA graphs that
+    `comfy.model_prefetch` captures on the first decode step and replays for as
+    long as the layer's weights sit in the same VRAM block. Nothing else is
+    compared, so the *second* `generate()` on a loaded model replays graphs that
+    write into the first call's KV cache — freed by then — and the scatter into
+    it dies with a device-side assert that takes the whole process down.
+    `execution.py` drops the graphs in the `finally` of each node; this pack
+    calls `generate` several times per node (one describe pass per asset, then
+    the final pass) and from the editor route, so it drops them itself after
+    every call. Cheap when there is nothing to drop.
+    """
+    try:
+        import comfy.model_prefetch
+    except Exception:
+        return
+    cleanup = getattr(comfy.model_prefetch, "cleanup_prefetch_queues", None)
+    if cleanup is None:
+        return
+    try:
+        cleanup()
+    except Exception as exc:
+        logging.warning("MiniMax H3 Easy: could not drop the text encoder's decode graphs (%s).", exc)
+
+
 def _optimizer_clip_generate(
     clip,
     system_prompt: str,
@@ -1877,6 +1904,8 @@ def _optimizer_clip_generate(
             "The connected text encoder cannot generate text. Use an LLM-backed encoder "
             f"such as Gemma, or select an HTTP API format instead ({type(exc).__name__}: {exc})."
         ) from exc
+    finally:
+        _optimizer_clip_after_generate()
     result = _strip_optimizer_output(clip.decode(generated))
     if not result:
         raise ValueError("The connected text encoder returned an empty prompt")
@@ -1949,12 +1978,40 @@ _OPTIMIZER_CLIP_STATE: dict[str, Any] = {"path": None, "clip": None}
 # Same reason as _OPTIMIZER_GGUF_BUSY: the unload button must not take the
 # weights from under a run.
 _OPTIMIZER_CLIP_BUSY = 0
+# The request id of the editor-route run that is generating right now, so the
+# cancel route can tell whether comfy's interrupt flag would stop *our* run.
+_OPTIMIZER_CLIP_ACTIVE_REQUEST = ""
 
 
 def _optimizer_clip_hold(delta: int) -> None:
     global _OPTIMIZER_CLIP_BUSY
     with _OPTIMIZER_CLIP_LOCK:
         _OPTIMIZER_CLIP_BUSY = max(0, _OPTIMIZER_CLIP_BUSY + delta)
+
+
+def _optimizer_clip_set_active(request_id: str) -> None:
+    global _OPTIMIZER_CLIP_ACTIVE_REQUEST
+    with _OPTIMIZER_CLIP_LOCK:
+        _OPTIMIZER_CLIP_ACTIVE_REQUEST = str(request_id or "")
+
+
+def _optimizer_clip_interrupt(request_id: str) -> bool:
+    """Stop the editor-route text encoder run `request_id` through comfy's own interrupt.
+
+    Every op the encoder runs calls `throw_exception_if_processing_interrupted`,
+    so this stops the generation at the next kernel — the progress-bar hook only
+    hears from `ProgressBar` every 0.5 % of the budget, which at a few seconds a
+    token is minutes. The flag is global, so it is only raised while no workflow
+    is executing (the route refused to start next to one, but one may have been
+    queued since) — a workflow resets it at its own start anyway.
+    """
+    with _OPTIMIZER_CLIP_LOCK:
+        if not request_id or request_id != _OPTIMIZER_CLIP_ACTIVE_REQUEST:
+            return False
+    if _optimizer_clip_workflow_running():
+        return False
+    comfy.model_management.interrupt_current_processing(True)
+    return True
 
 
 def _optimizer_clip_catalog() -> list[str]:
@@ -2167,6 +2224,7 @@ def _optimizer_clip_json(
     user_prompt: str,
     media_items: Sequence[Mapping[str, Any]],
     should_stop=None,
+    request_id: str = "",
 ) -> str:
     """Optimize from the editor with the `clip_model` text encoder.
 
@@ -2179,8 +2237,13 @@ def _optimizer_clip_json(
     # same VRAM bookkeeping.
     if _optimizer_clip_workflow_running():
         raise ValueError("ComfyUI is running a workflow. Optimize again when it has finished.")
+    # The Cancel button sets this flag even when nothing is running, and it then
+    # stays up until the next workflow resets it — or until our first kernel
+    # trips over it. Nothing is running (checked above), so it is stale.
+    comfy.model_management.interrupt_current_processing(False)
     started = time.perf_counter()
     max_length = int(settings.get("local_max_length") or PROMPT_OPTIMIZER_CLIP_MAX_LENGTH)
+    _optimizer_clip_set_active(request_id)
     try:
         # The executor runs nodes under inference_mode, and a model loaded under
         # one mode is not usable under the other, so both callers use it.
@@ -2195,11 +2258,20 @@ def _optimizer_clip_json(
                 system = _optimizer_system_prompt(scene_guide, mode, float(seconds), counts, 0, count)
                 _optimizer_log("writing the final prompt (guide=%d chars, descriptions=%d)...", len(system), count)
                 text = _optimizer_clip_generate(clip, system, user_prompt, max_length, None, described)
+    except comfy.model_management.InterruptProcessingException as exc:
+        # A BaseException, so the route's `except Exception` never sees it. Our
+        # own stop button raises it through `_optimizer_clip_interrupt`; anything
+        # else is ComfyUI's Cancel button pressed during the run.
+        _optimizer_clip_release()
+        if should_stop is not None and should_stop():
+            raise _OptimizerCancelled("Prompt optimization was cancelled") from exc
+        raise ValueError("ComfyUI's interrupt stopped the text encoder. Press ✦ again.") from exc
     except _OptimizerCancelled:
         # Stopping hands the VRAM back, like the GGUF format.
         _optimizer_clip_release()
         raise
     finally:
+        _optimizer_clip_set_active("")
         if bool(settings.get("clip_unload_after")):
             _optimizer_clip_release()
     _optimizer_log("prompt optimization finished in %.1fs (%d chars)", time.perf_counter() - started, len(text))
@@ -3253,6 +3325,10 @@ def _register_prompt_optimizer_route() -> bool:
             if not _optimizer_cancel(request_id):
                 return web.json_response({"ok": False, "error": "A request id is required"}, status=400)
             _optimizer_log("cancel requested for prompt optimization %s", request_id)
+            # The GGUF loop polls the registry between tokens; a text encoder run
+            # is stopped through comfy's interrupt, which its next op checks.
+            if _optimizer_clip_interrupt(request_id):
+                _optimizer_log("interrupting the text encoder")
             return web.json_response({"ok": True})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
@@ -3327,7 +3403,7 @@ def _register_prompt_optimizer_route() -> bool:
                 try:
                     result = await asyncio.to_thread(
                         _optimizer_clip_json, settings, scene_guide, mode, seconds, counts, prompt,
-                        media_items, should_stop,
+                        media_items, should_stop, request_id,
                     )
                 finally:
                     _optimizer_clip_hold(-1)

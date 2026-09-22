@@ -390,10 +390,26 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   - **No `clip_type` is passed to `load_clip`.** A type selects an image model's conditioning variant;
     the untyped default is the generic wrapper, and that is the one built to generate. This is why it is
     not `_load_text_encoder`, whose `"minimax"` type is what H3 conditions on.
-  - **`generate` takes no stop callback.** It ticks a `comfy.utils.ProgressBar`, so
-    `_optimizer_clip_cancel_hook` swaps `PROGRESS_BAR_HOOK` for the duration, polling the cancel
-    registry *on the owning thread only* and forwarding every other thread to the server's hook. During
-    execution no hook is installed and comfy's own interrupt applies.
+  - **Every `generate()` is followed by `_optimizer_clip_after_generate()`**, which is
+    `comfy.model_prefetch.cleanup_prefetch_queues()` — what `execution.py` runs in the `finally` of each
+    node. A Qwen3 encoder (`fixed_kv` / `graph_dynamic_vbar_blocks` in its config) decodes through
+    per-layer CUDA graphs captured on the first decode step and replayed whenever the layer's weights
+    are still in the same VRAM block; the KV cache and position tensors are not part of that check, so
+    the *second* `generate()` on a loaded model replays graphs writing into the first call's freed KV
+    cache: `ScatterGatherKernel.cu … index out of bounds`, a sticky CUDA error, `Fatal Python error:
+    Aborted`. Core never sees it because `TextGenerate` generates once per node; this pack generates
+    once per asset plus once for the prompt. Do not remove the call to make a run faster.
+  - **`generate` takes no stop callback**, and `comfy.model_management.InterruptProcessingException` is
+    a `BaseException`, so the route's `except Exception` never sees it. The editor route therefore (a)
+    clears a stale interrupt flag before starting — ComfyUI's Cancel button raises it even with nothing
+    running and it stays up until the next workflow, which is what tripped the first attempt in the
+    field; (b) stops a run through that same flag: the cancel route calls `_optimizer_clip_interrupt`,
+    which raises it only while `_OPTIMIZER_CLIP_ACTIVE_REQUEST` is the cancelled id and no workflow is
+    executing, and `_optimizer_clip_json` turns the resulting exception into `_OptimizerCancelled` when
+    `should_stop()` agrees and into a visible error otherwise. `_optimizer_clip_cancel_hook` (the
+    `PROGRESS_BAR_HOOK` swap) is still installed but is only a backstop: `ProgressBar` throttles the hook
+    to 0.5 % of the budget, which with a large `local_max_length` is dozens of tokens. During execution
+    neither is used and comfy's own interrupt applies.
   - **The route refuses while a workflow is running** (`_optimizer_clip_workflow_running`): comfy's
     model management has no lock, and `load_models_gpu` from a worker thread next to the executor races
     over the same bookkeeping. The execution path skips the check, because there the caller *is* the
