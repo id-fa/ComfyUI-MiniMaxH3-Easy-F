@@ -418,23 +418,41 @@ below.
 The optimizer's answer becomes the H3 prompt verbatim, so thinking is always
 switched off — there is no toggle for it:
 
-- Qwen-family models get the inline `/no_think` switch, and Qwen chat handlers
-  are constructed with `force_reasoning=False`.
-- Every chat request also carries `chat_template_kwargs.enable_thinking=false`,
-  which newer Qwen templates read instead of `/no_think`. OpenAI-compatible
-  servers (llama.cpp, vLLM, SGLang, LM Studio, Ollama) read the same field;
-  Gemini gets `thinkingConfig.thinkingBudget=0` instead.
-- The same `chat_template_kwargs` also carries `reasoning_effort=low`. Qwen3.8
+- Qwen-family models get the inline `/no_think` switch.
+- For the GGUF format the switch is set **inside the model's own chat
+  template**: a turn without media is rendered through llama-cpp's Jinja
+  formatter over the GGUF's `tokenizer.chat_template` with
+  `enable_thinking = false` and `reasoning_effort = low` prepended, so it
+  works on every llama-cpp-python build. llama-cpp-python 0.4.x has no
+  `chat_template_kwargs` argument at all; earlier versions of this pack sent
+  it, got a `TypeError`, retried without it and ran with the model's default,
+  which for Qwen3.5 is *thinking*. A Qwen3.5 GGUF then spent the whole answer
+  length reasoning ("The model spent all N tokens reasoning…") however large
+  N was set. A turn *with* media goes through the vision chat handler, which
+  renders its own template and is constructed with whichever switch its class
+  declares (`enable_thinking=False` on 0.4.x, `force_reasoning=False` on the
+  older Qwen handlers). The handler family is chosen from the filename, and
+  `qwen3.5` / `qwen3.6` / … pick the Qwen3.5 handler rather than the Qwen3-VL
+  one, whose template has no switch to turn.
+- The HTTP formats carry `chat_template_kwargs.enable_thinking=false`, which
+  newer Qwen templates read instead of `/no_think`. OpenAI-compatible servers
+  (llama.cpp, vLLM, SGLang, LM Studio, Ollama) read the same field; Gemini
+  gets `thinkingConfig.thinkingBudget=0` instead.
+- The same request (and the GGUF template prefix) also carries
+  `reasoning_effort=low`. Qwen3.8
   replaced the on/off switch with a depth and defaults it to `xhigh`, which is
   enough to spend an entire answer on the thought; `low` is the shallowest value
   its template accepts (`none` is not one of them). It is sent *in addition to*
   `enable_thinking`, since older templates only read that one, and a template
   that does not know the variable ignores it.
-- An endpoint that rejects that unknown field (400/404/422) — or a llama-cpp
-  build too old to accept the argument — gets the request again without it, so a
-  stricter API still answers.
-- Gemma takes none of them (its handler rejects the flag), so it relies on the
-  cleanup below.
+- An endpoint that rejects that unknown field (400/404/422) gets the request
+  again without it, so a stricter API still answers. A llama-cpp build whose
+  signature lacks the argument never receives it; the template prefix covers
+  it.
+- Gemma 4 (12B and larger) reads `enable_thinking` in its template and its
+  0.4.x chat handler takes the same flag; the E2B/E4B variants do not think in
+  the first place. On older llama-cpp builds the Gemma handler has no switch
+  and relies on the cleanup below.
 - Turn markers (`<|im_end|>`, `<end_of_turn>`, …) are passed as stop strings.
 - Whatever a model emits anyway is cleaned up: everything up to and including
   the **last** closing `</think>` / `</thinking>` / `</reasoning>` is removed.
@@ -463,8 +481,12 @@ use its non-thinking variant.
 OpenAI-compatible format does, since llama-cpp takes the same message shape:
 images as-is, reference videos as sampled frames (see *Reference videos over a
 chat API* below). This needs a multimodal GGUF **and** its mmproj projector; the
-handler is chosen from the model's filename (Qwen, Gemma, MiniCPM, LLaVA)
-against whatever `llama_cpp.llama_chat_format` provides in the installed build.
+handler is chosen from the model's filename (Qwen3.5+, Qwen3-VL, Qwen2.5-VL,
+Gemma, MiniCPM, LLaVA) against whatever the installed build provides
+(`llama_cpp.llama_multimodal` on 0.4.x, `llama_cpp.llama_chat_format` before).
+The family matters beyond vision: a Qwen3.5 file handed the Qwen3-VL handler
+renders through a template with no thinking switch and reasons through the
+whole answer length.
 With no projector resolved, the prompt is optimized from text alone and a
 warning is logged.
 
@@ -510,17 +532,19 @@ It is **off by default**, so an existing setup keeps sending media with the
 prompt.
 
 The describing pass has a token budget of its own. A model whose reasoning
-**cannot be switched off** — Gemma has no `/no_think` and its chat handler
-rejects the flag — spends that budget on the thought, and an output cut off
+**cannot be switched off** — Gemma has no `/no_think`, and on llama-cpp builds
+before 0.4 its chat handler has no switch — spends that budget on the thought,
+and an output cut off
 mid-thought contains no description at all, since the closing marker never
 arrives. Gemma-family models therefore get extra headroom on top of the 256
 tokens (separate from the answer length, because it pays for text that is
 discarded anyway).
 
 Any other model that keeps thinking anyway gets the same headroom the moment it
-costs a description: a vision chat handler renders no chat template, so neither
-`enable_thinking` nor `reasoning_effort` reaches the model on that path and the
-budget is the only thing left. The first asset lost to an unterminated thought
+costs a description: a vision chat handler renders its own chat template, so
+nothing sent with the request reaches the model on that path, and where the
+handler class has no constructor switch the budget is the only thing left. The
+first asset lost to an unterminated thought
 is retried with the headroom, and the rest of the run keeps the raised budget,
 so only one pass is paid for the discovery.
 

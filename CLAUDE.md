@@ -237,9 +237,27 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   and `LLM` (the folders ComfyUI-QwenVL-F uses) and `GET /minimax_h3_easy/gguf_models` feeds the dropdown.
   The loaded `Llama` is cached in `_OPTIMIZER_GGUF_STATE` keyed by (model, mmproj, ctx, gpu layers) and
   released when that changes or when `gguf_unload_after` is set. Vision needs an mmproj plus a chat
-  handler class, whose name varies per llama-cpp build/fork, so `_optimizer_gguf_chat_handler` probes
-  candidates by model-name family and degrades to text-only. llama-cpp takes the same OpenAI-shaped
-  `image_url` parts, so `_optimizer_media_items(..., "openai")` is reused verbatim.
+  handler class, whose name and module vary per llama-cpp build/fork (`llama_multimodal` on 0.4.x,
+  `llama_chat_format` before), so `_optimizer_gguf_chat_handler` probes candidates by model-name
+  family (`_optimizer_gguf_handler_candidates`) and degrades to text-only. **`qwen3.5` and later must
+  map to `Qwen35ChatHandler`, not `Qwen3VLChatHandler`**: the Qwen3-VL template has no thinking
+  switch, and a Qwen3.5 model rendered through it thinks through the entire answer budget (that was
+  the `_OptimizerThinkingOverflow` at 8192 tokens). The handler is constructed with whichever switch
+  its signature declares (`enable_thinking` on 0.4.x, `force_reasoning` on the older Qwen handlers),
+  because a vision handler renders its own template and nothing in the request reaches it. llama-cpp
+  takes the same OpenAI-shaped `image_url` parts, so `_optimizer_media_items(..., "openai")` is
+  reused verbatim.
+- **llama-cpp-python 0.4.x has no `chat_template_kwargs`** — `create_chat_completion` has a fixed
+  signature, so `enable_thinking=false` never reached the template and every text-only turn ran with
+  the model's default (Qwen3.5 pre-opens `<think>`). Text-only turns therefore go through
+  `_optimizer_gguf_text_handler`: llama-cpp's own `Jinja2ChatFormatter` over the GGUF's
+  `tokenizer.chat_template` with `OPTIMIZER_GGUF_TEMPLATE_PREFIX` (`{% set enable_thinking = false %}`,
+  `{% set reasoning_effort = … %}`) prepended, which sets the variables inside the template and so
+  works on every build. `_optimizer_gguf_call` routes a request without media there, sends a request
+  with media to the vision handler, and drops `chat_template_kwargs` up front when the signature lacks
+  it (`_optimizer_gguf_accepts_template_kwargs`). Both are cached next to the `Llama` in
+  `_OPTIMIZER_GGUF_STATE`. Do not replace the prefix with render kwargs: the handler wrapper passes
+  none through, and older formatters do not forward them either.
 - `gguf_describe_media` switches the GGUF format to the clip format's two-stage shape:
   `_optimizer_gguf_describe` runs one small vision pass per image, then `_optimizer_gguf_json` gets the
   descriptions as `context` and no images. It exists because a guide-sized multimodal prompt makes one
@@ -254,8 +272,9 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
     back empty. `OPTIMIZER_DESCRIBE_THINKING_HEADROOM` is added for the families with no working
     switch (gemma), and is deliberately not tied to the answer length: it buys room for text that is
     discarded either way.
-  - **A vision chat handler renders no chat template**, so neither switch reaches the model on the
-    describe path and the budget is the only lever left. `_optimizer_gguf_chat` raises
+  - **A vision chat handler renders its own chat template**, so nothing in the request reaches the
+    model on the describe path; where its class has no constructor switch the budget is the only
+    lever left. `_optimizer_gguf_chat` raises
     `_OptimizerThinkingOverflow` for exactly that failure, and `_optimizer_gguf_describe_each` retries
     the asset with `OPTIMIZER_DESCRIBE_THINKING_HEADROOM` and keeps the raised budget for the rest of
     the run — one wasted pass, not one lost description per asset.
@@ -281,9 +300,11 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   served until that finishes is not a cancel. Do not call it inline again; it is the window the stop
   button is pressed in most often, because it is the one before anything appears to happen.
 - Reasoning is always off — the answer *is* the prompt. Each backend suppresses it its own way (`clip`:
-  `thinking=False`; `gguf` and the HTTP pair: `chat_template_kwargs.enable_thinking=false` plus
-  `reasoning_effort=OPTIMIZER_REASONING_EFFORT`, and `/no_think` and `force_reasoning=False` for Qwen
-  and family-specific `stop` markers; Gemini: `thinkingConfig.thinkingBudget=0`), and
+  `thinking=False`; `gguf`: `enable_thinking=false` and `reasoning_effort=OPTIMIZER_REASONING_EFFORT`
+  set inside the model's own template (`OPTIMIZER_GGUF_TEMPLATE_PREFIX`) for text-only turns and passed
+  to the vision handler's constructor for turns with media, plus `/no_think` for Qwen and
+  family-specific `stop` markers; the HTTP pair: `chat_template_kwargs.enable_thinking=false` plus
+  `reasoning_effort`; Gemini: `thinkingConfig.thinkingBudget=0`), and
   `_strip_optimizer_output` is the shared backstop. Qwen3.8 reads the *depth* rather than the switch and
   defaults to `xhigh`, hence `low`; both fields go in the same dict because older templates read only
   `enable_thinking`, and `none` is not a value that template accepts.
@@ -293,8 +314,9 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
      model behind an OpenAI-compatible endpoint wrote its thoughts straight into the H3 prompt while
      this file claimed otherwise. The switches now go through `_optimizer_thinking_off_payload`, and
      `_optimizer_http_post` retries once **without** them on 400/404/422 because an endpoint that has
-     never heard of `chat_template_kwargs` errors rather than ignoring it. `_optimizer_gguf_call` does
-     the same for llama-cpp builds too old to accept the argument.
+     never heard of `chat_template_kwargs` errors rather than ignoring it. `_optimizer_gguf_call` keeps
+     the same retry but no longer depends on it: a build whose signature lacks the argument never
+     gets it, and the switch lives in the template instead.
   2. **`_strip_optimizer_output` required an opening `<think>`.** Most Qwen chat templates *pre-open*
      the tag in the assistant turn, so the response begins with bare reasoning prose and the only tag
      in it is the closing one — the whole block leaked. `_OPTIMIZER_THINK_CLOSE_RE` therefore makes the
