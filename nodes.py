@@ -1084,7 +1084,22 @@ def _normalize_optimizer_url(api_url: str, api_format: str, model: str) -> str:
     return _optimizer_url_with_query(base + endpoint, parsed.query)
 
 
+_OPTIMIZER_RESPONSES_REASONING_ITEM_TYPES = frozenset({"reasoning"})
+_OPTIMIZER_RESPONSES_REASONING_PART_TYPES = frozenset({"reasoning_text", "reasoning", "summary_text"})
+
+
 def _optimizer_responses_text(data: Any) -> str:
+    """The answer text of a Responses API reply, without the model's reasoning.
+
+    A reasoning model answers with a ``reasoning`` output item ahead of the
+    ``message`` item, and some servers (vLLM, llama.cpp, LM Studio) also render
+    the thought as a ``reasoning_text`` part *inside* the message's ``content``
+    next to the ``output_text`` part. Both are the thought, not the prompt, so
+    only ``output_text`` parts (and untyped ``text`` parts, for servers that
+    omit the type) are read; a ``reasoning_text`` part is skipped by its type,
+    not by its content, because nothing in the text itself marks where the
+    thought ends.
+    """
     if not isinstance(data, Mapping):
         return ""
     direct = data.get("output_text")
@@ -1096,11 +1111,18 @@ def _optimizer_responses_text(data: Any) -> str:
         for item in output:
             if not isinstance(item, Mapping):
                 continue
+            if item.get("type") in _OPTIMIZER_RESPONSES_REASONING_ITEM_TYPES:
+                continue
             content = item.get("content")
             if not isinstance(content, list):
                 continue
             for part in content:
                 if not isinstance(part, Mapping):
+                    continue
+                part_type = part.get("type")
+                if part_type in _OPTIMIZER_RESPONSES_REASONING_PART_TYPES:
+                    continue
+                if part_type is not None and part_type != "output_text":
                     continue
                 value = part.get("text")
                 if isinstance(value, str):
@@ -1190,9 +1212,10 @@ def _optimizer_thinking_off_payload(api_format: str) -> dict[str, Any]:
     if api_format == OPTIMIZER_FORMAT_RESPONSES:
         # Nothing to send. `chat_template_kwargs` is a chat-completions extension
         # that the Responses API does not accept, and the Responses API keeps a
-        # model's reasoning in its own `reasoning` output items, which
-        # `_optimizer_responses_text` never reads. Sending the chat switch here
-        # would only cost every request a rejected first attempt.
+        # model's reasoning in `reasoning` output items or `reasoning_text`
+        # content parts, which `_optimizer_responses_text` skips by type.
+        # Sending the chat switch here would only cost every request a
+        # rejected first attempt.
         return {}
     return {"chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": OPTIMIZER_REASONING_EFFORT}}
 

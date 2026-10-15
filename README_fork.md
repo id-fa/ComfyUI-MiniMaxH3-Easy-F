@@ -470,6 +470,16 @@ The same cleanup applies to the HTTP and text-encoder formats, so a reasoning
 model behind an OpenAI-compatible endpoint cannot leak its thoughts either. The
 text-encoder format additionally passes `thinking=False` to the tokenizer.
 
+The **OpenAI Responses** format is the one place where the reasoning does not
+arrive as text to clean up but as structure: a `reasoning` output item ahead of
+the `message`, and — on vLLM, llama.cpp, LM Studio and similar servers — a
+`reasoning_text` part *inside* the message's `content` next to the
+`output_text` part. The reply parser used to read every `text` it found there,
+so both parts came out joined, thought first, as the optimized prompt. It now
+reads only `output_text` parts (and untyped `text` parts, for servers that omit
+the type) and skips `reasoning` items and `reasoning_text` / `summary_text`
+parts by type. **Restart ComfyUI.**
+
 Reasoning that carries **no marker at all** ("Here's a thinking process: 1.
 Analyze user input…" as plain text) cannot be separated from the prompt —
 nothing says where it stops. If a model leaks like that despite the switches,
