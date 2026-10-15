@@ -126,8 +126,15 @@ MIN_SECONDS = 0.2
 MAX_SECONDS = 30.0
 PROMPT_GUIDES_DIR = os.path.join(os.path.dirname(__file__), "prompt_guides")
 PROMPT_GUIDE_MANIFEST = os.path.join(PROMPT_GUIDES_DIR, "manifest.json")
+# How long one HTTP request to the optimizer may take, as the default of the
+# `http_timeout` setting: a reasoning model behind a slow endpoint, or a large
+# set of references, can legitimately run past any fixed number, and the user
+# is the one who knows how long their server needs. `requests` applies it to the
+# connect and to each read separately, so it is "no bytes for this long", not a
+# cap on the whole exchange.
 PROMPT_OPTIMIZER_TIMEOUT_SECONDS = 600
-PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS = 120
+PROMPT_OPTIMIZER_TIMEOUT_MIN_SECONDS = 10
+PROMPT_OPTIMIZER_TIMEOUT_LIMIT_SECONDS = 7200
 # Unloading is a management call to a server on the same machine, not a
 # generation, so it gets a short timeout of its own.
 PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS = 60
@@ -296,6 +303,7 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "read_media": False,
     "optimize_on_run": False,
     "remote_unload_after": False,
+    "http_timeout": PROMPT_OPTIMIZER_TIMEOUT_SECONDS,
     "video_sample": OPTIMIZER_VIDEO_SAMPLE_DEFAULT,
     "local_max_length": PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
     "gguf_model": "",
@@ -620,6 +628,10 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "local_max_length", PROMPT_OPTIMIZER_CLIP_MAX_LENGTH,
         PROMPT_OPTIMIZER_CLIP_MIN_LENGTH, PROMPT_OPTIMIZER_CLIP_LENGTH_LIMIT, "clip_max_length",
     )
+    http_timeout = integer(
+        "http_timeout", PROMPT_OPTIMIZER_TIMEOUT_SECONDS,
+        PROMPT_OPTIMIZER_TIMEOUT_MIN_SECONDS, PROMPT_OPTIMIZER_TIMEOUT_LIMIT_SECONDS,
+    )
     mmproj = str(source.get("gguf_mmproj") or OPTIMIZER_GGUF_MMPROJ_AUTO).strip() or OPTIMIZER_GGUF_MMPROJ_AUTO
     unload = source.get("gguf_unload_after", False)
     if isinstance(unload, str):
@@ -648,6 +660,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
         "read_media": bool(read_media),
         "optimize_on_run": bool(optimize_on_run),
         "remote_unload_after": bool(remote_unload),
+        "http_timeout": http_timeout,
         "video_sample": video_sample,
         "local_max_length": local_max_length,
         "gguf_model": str(source.get("gguf_model") or "").strip(),
@@ -1194,6 +1207,87 @@ def _optimizer_merge_payload(base: Mapping[str, Any], extra: Mapping[str, Any]) 
     return merged
 
 
+# LM Studio's OpenAI-compatible server answers this to an `image_url` whose data
+# URL it will not decode. It is not about base64 at all: the reference *is* a
+# base64 data URL, but the server only decodes JPEG and PNG and says this for
+# WebP (lmstudio-bug-tracker #1752). ComfyUI inputs are often WebP, so the
+# request is retried once with every image transcoded to JPEG.
+_OPTIMIZER_IMAGE_REJECTED_RE = re.compile(r"must be a base ?64[ -]encoded image", flags=re.I)
+OPTIMIZER_IMAGE_RETRY_JPEG_QUALITY = 90
+
+
+def _optimizer_jpeg_data_url(url: str) -> str | None:
+    """`url` re-encoded as a JPEG data URL, or None when it already is one or cannot be read."""
+    text = str(url or "")
+    if not text.startswith("data:") or "," not in text:
+        return None
+    header, encoded = text.split(",", 1)
+    if ";base64" not in header:
+        return None
+    if header[5:].split(";", 1)[0].strip().lower() in ("image/jpeg", "image/jpg"):
+        return None
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(base64.b64decode(encoded)))
+        image.load()
+        if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+            # JPEG has no alpha; a transparent reference is flattened onto
+            # white rather than onto the black `convert("RGB")` would give it.
+            flattened = Image.new("RGB", image.size, (255, 255, 255))
+            flattened.paste(image.convert("RGBA"), mask=image.convert("RGBA").split()[-1])
+            image = flattened
+        else:
+            image = image.convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=OPTIMIZER_IMAGE_RETRY_JPEG_QUALITY)
+    except Exception as exc:
+        logging.warning("MiniMax H3 Easy: could not re-encode a reference image as JPEG (%s).", exc)
+        return None
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _optimizer_payload_with_jpeg_images(payload: Any) -> tuple[Any, int]:
+    """A copy of the payload with every image part transcoded to JPEG, and how many changed.
+
+    Walks the two OpenAI shapes alike: chat completions carries
+    `{"type": "image_url", "image_url": {"url": ...}}`, the Responses API
+    `{"type": "input_image", "image_url": "..."}`. Parts already in JPEG are
+    left as they are, so a zero count means a retry would send the same bytes.
+    """
+    if isinstance(payload, list):
+        items = [_optimizer_payload_with_jpeg_images(item) for item in payload]
+        return [item for item, _ in items], sum(count for _, count in items)
+    if not isinstance(payload, Mapping):
+        return payload, 0
+    kind = payload.get("type")
+    if kind == "image_url" and isinstance(payload.get("image_url"), Mapping):
+        replaced = _optimizer_jpeg_data_url(str(payload["image_url"].get("url") or ""))
+        if replaced is None:
+            return dict(payload), 0
+        return {**payload, "image_url": {**payload["image_url"], "url": replaced}}, 1
+    if kind == "input_image" and isinstance(payload.get("image_url"), str):
+        replaced = _optimizer_jpeg_data_url(payload["image_url"])
+        if replaced is None:
+            return dict(payload), 0
+        return {**payload, "image_url": replaced}, 1
+    result: dict[str, Any] = {}
+    total = 0
+    for key, value in payload.items():
+        result[key], count = _optimizer_payload_with_jpeg_images(value)
+        total += count
+    return result, total
+
+
+def _optimizer_http_timeout(settings: Mapping[str, Any]) -> float:
+    """The configured request timeout, clamped like the normalizer clamps it."""
+    try:
+        value = float(settings.get("http_timeout") or PROMPT_OPTIMIZER_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        value = float(PROMPT_OPTIMIZER_TIMEOUT_SECONDS)
+    return float(min(PROMPT_OPTIMIZER_TIMEOUT_LIMIT_SECONDS, max(PROMPT_OPTIMIZER_TIMEOUT_MIN_SECONDS, value)))
+
+
 def _optimizer_http_post(
     url: str,
     headers: Mapping[str, str],
@@ -1207,13 +1301,33 @@ def _optimizer_http_post(
     never heard of them answers 400 rather than ignoring them. Dropping them and
     trying again is better than failing outright — `_strip_optimizer_output` is
     still there to catch a tagged reasoning block.
+
+    The other retry is for the image format: a 400 matching
+    `_OPTIMIZER_IMAGE_REJECTED_RE` means the server would not decode a
+    reference (LM Studio and WebP), so the images are transcoded to JPEG once
+    and the attempts start over from the current one. A payload whose images
+    were already JPEG is not resent; the error is raised with the explanation.
     """
-    attempts: list[Mapping[str, Any]] = [_optimizer_merge_payload(payload, extra)] if extra else []
-    attempts.append(payload)
+
+    def plan(base: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        return ([_optimizer_merge_payload(base, extra)] if extra else []) + [base]
+
+    attempts = plan(payload)
+    transcoded = False
     last: Exception | None = None
-    for index, body in enumerate(attempts):
+    index = 0
+    while index < len(attempts):
+        body = attempts[index]
+        index += 1
         try:
             response = _optimizer_http_request("POST", url, timeout_seconds, json=body, headers=dict(headers))
+        except requests.Timeout as exc:
+            # Name the setting: "Read timed out" alone does not say that the
+            # limit is this pack's and can be raised.
+            raise RuntimeError(
+                f"Prompt optimization request timed out after {int(timeout_seconds)} s with no answer from the "
+                "server. Raise \"Request timeout\" in the prompt optimization settings if the model needs longer."
+            ) from exc
         except requests.RequestException as exc:
             raise RuntimeError(f"Prompt optimization request failed: {exc}") from exc
         # The status is read rather than raised on, because the retry below has
@@ -1222,7 +1336,26 @@ def _optimizer_http_post(
         if response.status_code >= 400:
             detail = response.text or ""
             last = RuntimeError(f"Prompt optimization API error ({response.status_code}): {detail[:1000]}")
-            if index + 1 < len(attempts) and response.status_code in {400, 404, 422}:
+            if response.status_code == 400 and _OPTIMIZER_IMAGE_REJECTED_RE.search(detail):
+                if not transcoded:
+                    payload, changed = _optimizer_payload_with_jpeg_images(payload)
+                    if changed:
+                        transcoded = True
+                        _optimizer_log(
+                            "the endpoint rejected a reference image's format; re-encoding %d image(s) as JPEG "
+                            "and retrying",
+                            changed,
+                        )
+                        # The same thinking-switch sequence again, from the step
+                        # that failed: the switch was not what was rejected.
+                        attempts = plan(payload)[index - 1:]
+                        index = 0
+                        continue
+                raise RuntimeError(
+                    f"{last} - the server accepts only JPEG or PNG reference images"
+                    + (" and rejected them even after they were re-encoded as JPEG" if transcoded else "")
+                ) from None
+            if index < len(attempts) and response.status_code in {400, 404, 422}:
                 _optimizer_log(
                     "the endpoint rejected the thinking-off fields (%d); retrying without them", response.status_code,
                 )
@@ -3492,7 +3625,7 @@ def _optimize_prompt_on_run(
             system,
             request_prompt,
             media_parts,
-            timeout_seconds=PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS,
+            timeout_seconds=_optimizer_http_timeout(settings),
             unload_after=bool(settings.get("remote_unload_after", False)),
         )
         cleaned = re.sub(r"^```(?:text)?\s*", "", str(optimized or ""), flags=re.I)
@@ -3818,6 +3951,7 @@ def _register_prompt_optimizer_route() -> bool:
                 else:
                     result = await asyncio.to_thread(
                         _optimizer_http_json, api_url, api_key, model, api_format, system, prompt, media_parts,
+                        timeout_seconds=_optimizer_http_timeout(settings),
                         unload_after=bool(settings.get("remote_unload_after", False)),
                     )
             finally:

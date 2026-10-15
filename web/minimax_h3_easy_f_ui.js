@@ -65,6 +65,9 @@ const GGUF_MMPROJ_NONE = "none";
 const GGUF_CONTEXT_DEFAULT = 16384;
 const GGUF_CONTEXT_MIN = 512;
 const GGUF_CONTEXT_LIMIT = 1048576;
+const HTTP_TIMEOUT_DEFAULT = 600;
+const HTTP_TIMEOUT_MIN = 10;
+const HTTP_TIMEOUT_LIMIT = 7200;
 const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     api_format: OPTIMIZER_FORMAT_OPENAI,
     api_url: "",
@@ -73,6 +76,7 @@ const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     read_media: false,
     optimize_on_run: false,
     remote_unload_after: false,
+    http_timeout: HTTP_TIMEOUT_DEFAULT,
     video_sample: VIDEO_SAMPLE_DEFAULT,
     local_max_length: LOCAL_MAX_LENGTH_DEFAULT,
     gguf_model: "",
@@ -186,6 +190,7 @@ const TEXT = {
     apiKey: "API Key",
     apiKeyStored: ZH_BROWSER ? "\u5df2\u4fdd\u5b58 - \u8f93\u5165\u4ee5\u66ff\u6362" : "stored - type to replace it",
     apiModel: ZH_BROWSER ? "\u6a21\u578b\u540d" : "Model",
+    httpTimeout: ZH_BROWSER ? "\u8bf7\u6c42\u8d85\u65f6\uff08\u79d2\uff09" : "Request timeout (seconds)",
     localMaxLength: ZH_BROWSER ? "\u751f\u6210\u4e0a\u9650 (tokens)" : "Max generated tokens",
     ggufModel: ZH_BROWSER ? "GGUF \u6a21\u578b" : "GGUF model",
     ggufMmproj: ZH_BROWSER ? "\u89c6\u89c9\u6295\u5f71 (mmproj)" : "Vision projector (mmproj)",
@@ -4103,6 +4108,7 @@ function normalizePromptOptimizerSettings(value) {
         read_media: asBoolean(source.read_media, false),
         optimize_on_run: asBoolean(source.optimize_on_run, false),
         remote_unload_after: asBoolean(source.remote_unload_after, false),
+        http_timeout: clamp(source.http_timeout, HTTP_TIMEOUT_DEFAULT, HTTP_TIMEOUT_MIN, HTTP_TIMEOUT_LIMIT),
         video_sample: canonicalVideoSample(source.video_sample),
         // Named clip_max_length before the GGUF format shared the setting.
         local_max_length: clamp(
@@ -4506,6 +4512,7 @@ async function openPromptOptimizerSettings(node) {
         return input;
     };
     const localMaxLength = makeNumberInput(promptOptimizerSettingsCache.local_max_length, LOCAL_MIN_LENGTH, LOCAL_MAX_LENGTH_LIMIT, 16);
+    const httpTimeout = makeNumberInput(promptOptimizerSettingsCache.http_timeout, HTTP_TIMEOUT_MIN, HTTP_TIMEOUT_LIMIT, 10);
     const ggufContext = makeNumberInput(promptOptimizerSettingsCache.gguf_context, GGUF_CONTEXT_MIN, GGUF_CONTEXT_LIMIT, 512);
     const ggufGpuLayers = makeNumberInput(promptOptimizerSettingsCache.gguf_gpu_layers, -1, 1024, 1);
     const ggufModel = makePromptOptimizerSelect(promptOptimizerSettingsCache.gguf_model, null, [
@@ -4588,6 +4595,7 @@ async function openPromptOptimizerSettings(node) {
         + TEXT.apiUrlHintEdit;
     const apiKeyRow = makePromptOptimizerSettingsRow(TEXT.apiKey, apiKey);
     const modelRow = makePromptOptimizerSettingsRow(TEXT.apiModel, model);
+    const httpTimeoutRow = makePromptOptimizerSettingsRow(TEXT.httpTimeout, httpTimeout);
     const localMaxLengthRow = makePromptOptimizerSettingsRow(TEXT.localMaxLength, localMaxLength);
     const ggufModelRow = makePromptOptimizerSettingsRow(TEXT.ggufModel, ggufModel);
     const ggufMmprojRow = makePromptOptimizerSettingsRow(TEXT.ggufMmproj, ggufMmproj);
@@ -4602,6 +4610,7 @@ async function openPromptOptimizerSettings(node) {
         apiUrlHint,
         apiKeyRow,
         modelRow,
+        httpTimeoutRow,
         ggufModelRow,
         ggufMmprojRow,
         ggufContextRow,
@@ -4622,7 +4631,7 @@ async function openPromptOptimizerSettings(node) {
         const clip = isClipOptimizerFormat(apiFormat.value);
         const gguf = isGgufOptimizerFormat(apiFormat.value);
         const local = clip || gguf;
-        for (const row of [apiUrlRow, apiUrlHint, apiKeyRow, modelRow]) row.hidden = local;
+        for (const row of [apiUrlRow, apiUrlHint, apiKeyRow, modelRow, httpTimeoutRow]) row.hidden = local;
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadLabel]) row.hidden = !gguf;
         clipModelRow.hidden = !clip;
         // Only a `clip_model` encoder is this pack's to unload; one wired to
@@ -4746,6 +4755,7 @@ async function openPromptOptimizerSettings(node) {
                 clip_unload_after: clipUnload.checked,
                 optimize_on_run: optimizeOnRun.checked,
                 remote_unload_after: remoteUnload.checked,
+                http_timeout: httpTimeout.value,
             }, promptOptimizerSettingsCache.api_key_set && !apiKeyTouched);
             notifyPromptOptimizer(TEXT.settingsSaved, "success");
             close();

@@ -239,7 +239,12 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   `GET/POST /minimax_h3_easy/prompt_optimizer_settings`, `POST /minimax_h3_easy/prompt_optimize`
   (plus `prompt_optimize_cancel`, `prompt_optimizer_unload`, `gguf_models`, `clip_models`).
 - Settings are **installation-global** (`prompt_optimizer.json`), not per-node; only
-  `prompt_optimizer_scene_guide` is a saved node widget. The `prompt_optimizer_settings` boolean is a
+  `prompt_optimizer_scene_guide` is a saved node widget. `http_timeout` (10–7200 s, default
+  `PROMPT_OPTIMIZER_TIMEOUT_SECONDS`) is the one timeout for the HTTP formats, read through
+  `_optimizer_http_timeout` by the editor route **and** `_optimize_prompt_on_run` — the run-time path
+  used to have its own fixed 120 s, which is what cut long optimizations off; do not reintroduce a
+  second constant. `PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS` stays separate because unloading is a
+  management call. `requests.Timeout` is reported with a message that names the setting. The `prompt_optimizer_settings` boolean is a
   momentary trigger that the frontend resets to `false` and `graphToPrompt` always forces to `false`.
 - There are **three** places a prompt can be optimized, and each one checks the configured `api_format`
   itself so only one of them ever fires:
@@ -369,6 +374,14 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   result is pushed to the editor with `PromptServer.send_sync(PROMPT_OPTIMIZER_EVENT)`. It only fires while
   the hidden `prompt_needs_optimization` transport input is true (frontend: "the open tab's Optimized
   field is empty"; default true so headless runs still optimize).
+- `_optimizer_http_post` has a second retry besides the thinking-switch one: a 400 matching
+  `_OPTIMIZER_IMAGE_REJECTED_RE` (`'url' field must be a base64 encoded image`) is LM Studio refusing
+  the image *format*, not the encoding — the parts are already base64 data URLs; it decodes JPEG/PNG
+  and says this for WebP, which ComfyUI inputs often are. `_optimizer_payload_with_jpeg_images`
+  transcodes every `image_url` / `input_image` part to JPEG once and the attempts restart from the
+  step that failed. Zero transcoded parts means the same bytes would be resent, so it raises instead.
+  Do not pre-convert every image to JPEG to avoid the retry: cloud endpoints take WebP/PNG fine and a
+  lossy re-encode of every reference is not free.
 - A chat-completions message has no video part, so `_optimizer_media_items` gives a reference video
   `_optimizer_video_still_parts` instead: PyAV *seeks* one candidate per second, then decodes forward
   to the target — a seek only reaches the keyframe before it, and a candidate set that collapses onto

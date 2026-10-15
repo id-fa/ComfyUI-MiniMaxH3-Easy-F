@@ -926,6 +926,63 @@ the next `✦` will tell you to add it to the file.
 
 ---
 
+## Request timeout for the HTTP formats
+
+An optimization over `openai`, `responses` or `gemini` used to be cut off after a
+fixed time: 600 s from the `✦` button and 120 s when "Optimize when workflow
+runs" did it. A reasoning model behind a slow endpoint, or a large set of
+references, can legitimately need longer, and the only symptom was a request
+that "failed" with a bare `Read timed out`.
+
+The limit is now the **Request timeout (seconds)** field in the ⚙ dialog, shown
+for the three HTTP formats (`http_timeout` in `prompt_optimizer.json`, 10–7200,
+default 600). The same value applies to the `✦` button and to "Optimize when
+workflow runs", so the run-time path no longer has a shorter limit of its own.
+It is the time the server may go without sending anything — the connect and
+each read are timed separately — not a cap on the whole exchange. A request
+that does hit it now fails with a message that names the setting. The unload
+button keeps its own short limit; it is a management call, not a generation.
+
+### Scope
+
+`nodes.py` (`http_timeout`, `_optimizer_http_timeout`) and the settings modal
+in `web/minimax_h3_easy_f_ui.js`. **Restart ComfyUI and hard refresh.** This
+supersedes the fixed `PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS` upstream uses.
+
+---
+
+## Reference images LM Studio will not decode
+
+LM Studio's OpenAI-compatible server answers
+
+```
+400 'url' field must be a base64 encoded image
+```
+
+to a reference it will not decode. The message is misleading: the images this
+pack sends *are* base64 data URLs. What the server means is the image format —
+it decodes JPEG and PNG and says this for WebP
+([lmstudio-bug-tracker #1752](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1752)),
+and ComfyUI inputs are often WebP.
+
+With `openai` or `responses` as the API format, a `400` whose body matches that
+message now makes the optimizer transcode every attached image to JPEG (quality
+90, transparency flattened onto white) and send the request once more. The
+thinking-switch retry sequence resumes from the step that failed, since the
+switch was not what was rejected. Images that were already JPEG are not resent;
+if nothing could be re-encoded, or the server rejects the JPEGs too, the error
+is raised with that explanation appended. Sampled video frames are JPEG already
+and never trigger this.
+
+### Scope
+
+`nodes.py` (`_OPTIMIZER_IMAGE_REJECTED_RE`, `_optimizer_jpeg_data_url`,
+`_optimizer_payload_with_jpeg_images`, the loop in `_optimizer_http_post`).
+**Restart ComfyUI.** Gemini takes the file whole with its own mime type and the
+local formats decode the parts themselves, so neither is affected.
+
+---
+
 ## Frontend file name and prompt editor globals
 
 This fork's frontend is `web/minimax_h3_easy_f_ui.js`. Upstream calls it
