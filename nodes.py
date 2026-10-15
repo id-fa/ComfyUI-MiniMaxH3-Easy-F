@@ -269,6 +269,24 @@ OPTIMIZER_CLIP_VIDEO_FRAMES_NOTE = "The attached frames are sampled {detail}."
 OPTIMIZER_MEDIA_MAX_BYTES = 32 * 1024 * 1024
 PROMPT_OPTIMIZER_EVENT = "minimax_h3_easy/prompt_optimized"
 PROMPT_OPTIMIZER_CANCEL_LIMIT = 64
+# Where an HTTP backend may be sent. The settings dialog types the URL, but the
+# server only ever contacts an origin (`scheme://host:port`) on this list, and
+# the list is hand-edited in prompt_optimizer.json: no route and no workflow can
+# grow it. Without that, whoever reaches the settings route chooses where this
+# process sends the API key, the prompt and the references, and gets the reply
+# back - a server-side request forgery, which is what ComfyUI-LLM-Widget was
+# flagged for on the Comfy Registry over the same shape of route. The default
+# covers the local servers this is used with, on their default ports, and the
+# two vendors the formats name.
+OPTIMIZER_ALLOWED_API_URLS_KEY = "allowed_api_urls"
+OPTIMIZER_DEFAULT_ALLOWED_API_URLS = (
+    "http://localhost:1234",  # LM Studio
+    "http://localhost:11434",  # Ollama
+    "http://localhost:8080",  # llama.cpp server
+    "http://localhost:8000",  # vLLM
+    "https://api.openai.com",
+    "https://generativelanguage.googleapis.com",
+)
 PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
     "api_format": OPTIMIZER_FORMAT_OPENAI,
@@ -291,6 +309,8 @@ PROMPT_OPTIMIZER_CONFIG_DEFAULTS = {
     # Extra Host names the routes answer to, for a reverse proxy on this machine.
     # Hand-edited only: the settings route never writes it.
     "allowed_hosts": [],
+    # The origins an HTTP backend may be sent to. Hand-edited only, same reason.
+    OPTIMIZER_ALLOWED_API_URLS_KEY: list(OPTIMIZER_DEFAULT_ALLOWED_API_URLS),
 }
 
 
@@ -614,6 +634,11 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
     if isinstance(clip_unload, str):
         clip_unload = clip_unload.strip().lower() in {"1", "true", "yes", "on"}
     hosts = source.get("allowed_hosts")
+    destinations = source.get(OPTIMIZER_ALLOWED_API_URLS_KEY)
+    if not isinstance(destinations, (list, tuple)):
+        # The key is missing from a file written before it existed: the default
+        # list. An empty list, on the other hand, is the owner saying "nothing".
+        destinations = OPTIMIZER_DEFAULT_ALLOWED_API_URLS
     return {
         "version": PROMPT_OPTIMIZER_CONFIG_VERSION,
         "api_format": api_format,
@@ -637,6 +662,7 @@ def _normalize_prompt_optimizer_config(value: Mapping[str, Any] | None) -> dict[
             str(host).strip().lower() for host in (hosts if isinstance(hosts, (list, tuple)) else [])
             if str(host).strip()
         ],
+        OPTIMIZER_ALLOWED_API_URLS_KEY: _optimizer_allowed_origins(destinations),
     }
 
 
@@ -659,7 +685,7 @@ def _read_prompt_optimizer_config() -> dict[str, Any]:
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
         except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
-            return dict(PROMPT_OPTIMIZER_CONFIG_DEFAULTS)
+            payload = PROMPT_OPTIMIZER_CONFIG_DEFAULTS
     return _normalize_prompt_optimizer_config(payload)
 
 
@@ -696,6 +722,9 @@ def _public_prompt_optimizer_config(settings: Mapping[str, Any]) -> dict[str, An
 
     The API key goes in and never comes back out: the dialog only needs to know
     that one is stored. `allowed_hosts` is not the editor's business at all.
+    `allowed_api_urls` is not secret and goes through, so the dialog can show
+    under the URL field where a request may be sent - but it is display only;
+    `_update_prompt_optimizer_config` never takes it from a request.
     """
     public = {key: value for key, value in settings.items() if key != "allowed_hosts"}
     public["api_key_set"] = bool(str(public.get("api_key") or "").strip())
@@ -708,15 +737,25 @@ def _update_prompt_optimizer_config(payload: Mapping[str, Any]) -> dict[str, Any
     with _PROMPT_OPTIMIZER_CONFIG_LOCK:
         stored = _read_prompt_optimizer_config()
         merged = dict(payload)
-        # What decides who may call the routes cannot be settable through one.
+        # What decides who may call the routes, and where they may send this
+        # process, cannot be settable through one.
         merged["allowed_hosts"] = stored["allowed_hosts"]
+        merged[OPTIMIZER_ALLOWED_API_URLS_KEY] = stored[OPTIMIZER_ALLOWED_API_URLS_KEY]
         # The dialog never had the key, so an untouched field means "as it was".
         keep = payload.get("api_key_keep", False)
         if isinstance(keep, str):
             keep = keep.strip().lower() in {"1", "true", "yes", "on"}
         if bool(keep):
             merged["api_key"] = stored["api_key"]
-        return _write_prompt_optimizer_config(merged)
+        normalized = _normalize_prompt_optimizer_config(merged)
+        # Refuse the URL at save time so the dialog says why, not the next ✦.
+        # Only for the formats that use it: a stale URL under gguf or clip is
+        # nobody's problem and must not block saving the rest.
+        if normalized["api_format"] in OPTIMIZER_HTTP_FORMATS and normalized["api_url"]:
+            problem = _optimizer_destination_problem(_normalize_optimizer_base_url(normalized["api_url"]), normalized)
+            if problem:
+                raise ValueError(problem)
+        return _write_prompt_optimizer_config(normalized)
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -774,6 +813,118 @@ def _optimizer_request_problem(request, token: bool = True) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# Outbound destinations
+# --------------------------------------------------------------------------- #
+
+
+# DNS labels, with the underscore some internal names carry; an IDN arrives punycoded.
+_OPTIMIZER_HOSTNAME_RE = re.compile(
+    r"[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*\.?"
+)
+
+
+def _optimizer_url_origin(url: str) -> str:
+    """`scheme://host:port` of a URL, in the one spelling the allowlist compares.
+
+    Lowercased, the default port written out, an IPv6 literal bracketed, and
+    every loopback address - `127.0.0.1`, `::1`, `localhost` - spelled
+    `localhost`, so the list does not need three entries per local server.
+    """
+    parts = urllib.parse.urlsplit(str(url or "").strip())
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Only http and https URLs are accepted, not '{scheme or url}'")
+    host = (parts.hostname or "").lower()
+    if not host:
+        raise ValueError(f"The URL '{url}' has no host")
+    if not _is_ip_literal(host) and not _OPTIMIZER_HOSTNAME_RE.fullmatch(host):
+        raise ValueError(f"The URL '{url}' has an invalid host")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError(f"The URL '{url}' has an invalid port") from exc
+    port = port or (443 if scheme == "https" else 80)
+    if _is_ip_literal(host):
+        address = ipaddress.ip_address(host)
+        if address.is_loopback:
+            host = "localhost"
+        elif address.is_link_local or address.is_unspecified or address.is_multicast:
+            # Cloud metadata services live on link-local addresses, and nothing
+            # that answers a chat request does. Not even the allowlist can
+            # name these.
+            raise ValueError(f"'{host}' is not an address an API server can have")
+        elif address.version == 6:
+            host = f"[{host}]"
+    return f"{scheme}://{host}:{port}"
+
+
+def _optimizer_allowed_origins(entries: Sequence[Any]) -> list[str]:
+    """The allowlist as origins, keeping the order and dropping what is not a URL.
+
+    An entry may be a bare `host:port` or carry a path (`.../v1`): only its
+    origin matters, and it is completed the same way the API URL is.
+    """
+    origins: list[str] = []
+    for entry in entries:
+        text = str(entry or "").strip()
+        if not text:
+            continue
+        try:
+            origin = _optimizer_url_origin(_normalize_optimizer_base_url(text))
+        except ValueError as exc:
+            logging.warning("MiniMax H3 Easy: ignoring '%s' in %s: %s", text, OPTIMIZER_ALLOWED_API_URLS_KEY, exc)
+            continue
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+def _optimizer_destination_problem(url: str, settings: Mapping[str, Any] | None = None) -> str:
+    """Why this process may not send a request to `url`, or "" when it may."""
+    try:
+        origin = _optimizer_url_origin(url)
+    except ValueError as exc:
+        return str(exc)
+    if settings is not None and isinstance(settings.get(OPTIMIZER_ALLOWED_API_URLS_KEY), list):
+        allowed = settings[OPTIMIZER_ALLOWED_API_URLS_KEY]
+    else:
+        # A partial settings dict (`_optimizer_auto_remote_unload` builds one
+        # from the request's arguments) means "whatever the file says".
+        allowed = _read_prompt_optimizer_config()[OPTIMIZER_ALLOWED_API_URLS_KEY]
+    if origin in allowed:
+        return ""
+    listed = ", ".join(allowed) if allowed else "none"
+    return (
+        f"{origin} is not an allowed API destination. Add it to \"{OPTIMIZER_ALLOWED_API_URLS_KEY}\" in "
+        f"prompt_optimizer.json (next to nodes.py; only that file can change the list). Allowed now: {listed}"
+    )
+
+
+def _optimizer_http_request(method: str, url: str, timeout_seconds: float, **kwargs: Any) -> requests.Response:
+    """The one way out. Every outbound request is checked here, whatever built it.
+
+    The destination is checked against the URL asked for, so a 3xx is an error
+    rather than a hop: following it would send the same headers - the API key
+    among them - wherever the server pointed. `requests` follows redirects by
+    default, hence `allow_redirects=False` and the explicit status check.
+    """
+    problem = _optimizer_destination_problem(url)
+    if problem:
+        raise ValueError(problem)
+    response = requests.request(
+        method, url, timeout=max(1.0, float(timeout_seconds)), allow_redirects=False, **kwargs,
+    )
+    if 300 <= response.status_code < 400:
+        target = response.headers.get("Location") or "?"
+        response.close()
+        raise RuntimeError(
+            f"The server redirected to {target}, and redirects are not followed: a request is only sent to "
+            "the destination that was checked against the allowlist"
+        )
+    return response
+
+
 _OPTIMIZER_KNOWN_ENDPOINT_SUFFIXES = (
     "/v1/chat/completions",
     "/chat/completions",
@@ -790,8 +941,15 @@ def _normalize_optimizer_base_url(api_url: str) -> str:
     base = str(api_url or "").strip()
     if not base:
         raise ValueError("Prompt optimization API URL is required")
-    if not re.match(r"^https?://", base, flags=re.I):
-        base = "https://" + base
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", base, flags=re.I):
+        # A bare `host:port` gets the scheme its host implies: a local server
+        # speaks plain HTTP, anything out on the internet is HTTPS. Any other
+        # scheme is kept as written and refused by `_optimizer_url_origin`.
+        host = (urllib.parse.urlsplit("//" + base).hostname or "").lower()
+        local = host == "localhost" or (
+            _is_ip_literal(host) and (ipaddress.ip_address(host).is_loopback or ipaddress.ip_address(host).is_private)
+        )
+        base = ("http://" if local else "https://") + base
     parsed = urllib.parse.urlsplit(base)
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), parsed.query, ""))
 
@@ -1055,9 +1213,7 @@ def _optimizer_http_post(
     last: Exception | None = None
     for index, body in enumerate(attempts):
         try:
-            response = requests.post(
-                url, json=body, headers=dict(headers), timeout=max(1.0, float(timeout_seconds)),
-            )
+            response = _optimizer_http_request("POST", url, timeout_seconds, json=body, headers=dict(headers))
         except requests.RequestException as exc:
             raise RuntimeError(f"Prompt optimization request failed: {exc}") from exc
         # The status is read rather than raised on, because the retry below has
@@ -2553,12 +2709,12 @@ def _optimizer_gguf_request_has_media(request: Mapping[str, Any]) -> bool:
 
 
 def _optimizer_api_request(url: str, headers: Mapping[str, str], payload: Any = None, method: str = "GET") -> Any:
-    response = requests.request(
+    response = _optimizer_http_request(
         method,
         url,
+        PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS,
         json=payload if payload is not None else None,
         headers=dict(headers),
-        timeout=PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS,
     )
     # `raise_for_status` rather than a status check, because the one caller that
     # cares about the code (`_optimizer_unload_each`, for a 404) reads it off the
@@ -2673,6 +2829,11 @@ def _optimizer_remote_unload(settings: Mapping[str, Any]) -> tuple[int, str]:
         headers["Authorization"] = f"Bearer {api_key}"
     if not model:
         raise ValueError("Set the model in the prompt optimization settings first")
+    # The probes swallow every error to tell the servers apart, so a refused
+    # destination would otherwise come out as "no unload endpoint".
+    problem = _optimizer_destination_problem(root, settings)
+    if problem:
+        raise ValueError(problem)
 
     instances = _optimizer_lmstudio_instances(root, headers)
     if instances is not None:
@@ -3464,6 +3625,9 @@ def _register_prompt_optimizer_route() -> bool:
                 _update_prompt_optimizer_config, payload if isinstance(payload, dict) else {},
             )
             return web.json_response({"ok": True, "settings": _public_prompt_optimizer_config(settings)})
+        except ValueError as exc:
+            # A URL off the allowlist, or not a URL: the dialog shows the reason.
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
@@ -3564,6 +3728,18 @@ def _register_prompt_optimizer_route() -> bool:
                 return web.json_response({"ok": False, "error": "Select a GGUF model in the prompt optimization settings"}, status=400)
             if not local and not encoder and not _prompt_optimizer_settings_complete(api_url, api_key, model, api_format):
                 return web.json_response({"ok": False, "error": "Prompt optimization settings are incomplete"}, status=400)
+            if not local and not encoder:
+                # `_optimizer_http_request` checks again before sending; this is
+                # only so the answer is the real one, before the references are
+                # read and encoded for nothing.
+                try:
+                    problem = _optimizer_destination_problem(
+                        _normalize_optimizer_url(api_url, api_format, model), settings,
+                    )
+                except ValueError as exc:
+                    problem = str(exc)
+                if problem:
+                    return web.json_response({"ok": False, "error": problem}, status=400)
             raw_counts = payload.get("media_counts") if isinstance(payload.get("media_counts"), dict) else {}
             counts = {kind: max(0, min(MAX_MEDIA, int(raw_counts.get(kind, 0) or 0))) for kind in ("image", "video", "audio")}
             resources = payload.get("resources") if isinstance(payload.get("resources"), list) else []

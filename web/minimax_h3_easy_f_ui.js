@@ -85,6 +85,9 @@ const PROMPT_OPTIMIZER_SETTINGS_DEFAULTS = Object.freeze({
     clip_unload_after: false,
     // Read-only, from the server: the key itself is never sent to the editor.
     api_key_set: false,
+    // Read-only, from the server: the origins an HTTP backend may be sent to.
+    // Hand-edited in prompt_optimizer.json; the settings route never takes it.
+    allowed_api_urls: [],
 });
 let promptOptimizerSettingsCache = { ...PROMPT_OPTIMIZER_SETTINGS_DEFAULTS };
 let promptOptimizerSettingsLoaded = false;
@@ -172,6 +175,14 @@ const TEXT = {
     settingsLoadFailed: ZH_BROWSER ? "\u65e0\u6cd5\u8bfb\u53d6\u63d0\u793a\u8bcd\u4f18\u5316 API \u8bbe\u7f6e" : "Unable to load prompt optimization API settings",
     apiFormat: ZH_BROWSER ? "API \u683c\u5f0f" : "API format",
     apiUrl: ZH_BROWSER ? "API \u5730\u5740" : "API URL",
+    apiUrlHint: ZH_BROWSER
+        ? "\u8bf7\u6c42\u53ea\u4f1a\u53d1\u9001\u5230\u4ee5\u4e0b\u76ee\u6807\uff08\u534f\u8bae\u3001\u4e3b\u673a\u548c\u7aef\u53e3\u5fc5\u987b\u4e00\u81f4\uff09\uff1a"
+        : "Requests are only sent to these destinations (scheme, host and port must match): ",
+    apiUrlHintNone: ZH_BROWSER ? "\u65e0" : "none",
+    apiUrlHintEdit: ZH_BROWSER
+        ? "\u3002\u8981\u6dfb\u52a0\uff0c\u8bf7\u7f16\u8f91 nodes.py \u65c1\u7684 prompt_optimizer.json \u4e2d\u7684 \"allowed_api_urls\"\uff1b\u6b64\u5bf9\u8bdd\u6846\u65e0\u6cd5\u66f4\u6539\u8be5\u5217\u8868\u3002"
+        : ". To add one, edit \"allowed_api_urls\" in prompt_optimizer.json next to nodes.py; this dialog cannot "
+        + "change the list.",
     apiKey: "API Key",
     apiKeyStored: ZH_BROWSER ? "\u5df2\u4fdd\u5b58 - \u8f93\u5165\u4ee5\u66ff\u6362" : "stored - type to replace it",
     apiModel: ZH_BROWSER ? "\u6a21\u578b\u540d" : "Model",
@@ -4107,6 +4118,9 @@ function normalizePromptOptimizerSettings(value) {
         clip_model: String(source.clip_model || "").trim(),
         clip_unload_after: asBoolean(source.clip_unload_after, false),
         api_key_set: asBoolean(source.api_key_set, false),
+        allowed_api_urls: Array.isArray(source.allowed_api_urls)
+            ? source.allowed_api_urls.map((item) => String(item || "").trim()).filter(Boolean)
+            : [],
     };
 }
 
@@ -4220,7 +4234,9 @@ async function loadPromptOptimizerSettings({ force = false } = {}) {
 }
 
 async function savePromptOptimizerSettings(value, keepApiKey = false) {
-    const settings = normalizePromptOptimizerSettings(value);
+    // The server's own fields are not sent back: it would ignore them anyway,
+    // and the allowlist in particular is exactly what a request may not set.
+    const { api_key_set: _apiKeySet, allowed_api_urls: _allowedApiUrls, ...settings } = normalizePromptOptimizerSettings(value);
     const response = await callPromptOptimizerRoute(PROMPT_OPTIMIZER_SETTINGS_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -4561,6 +4577,15 @@ async function openPromptOptimizerSettings(node) {
     const hint = document.createElement("p");
     hint.className = "h3-optimizer-settings-hint";
     const apiUrlRow = makePromptOptimizerSettingsRow(TEXT.apiUrl, apiUrl);
+    // The server says where it is willing to send a request; the URL typed
+    // above has to be one of them, and the list is not editable from here.
+    const apiUrlHint = document.createElement("p");
+    apiUrlHint.className = "h3-optimizer-settings-hint";
+    apiUrlHint.textContent = TEXT.apiUrlHint
+        + (promptOptimizerSettingsCache.allowed_api_urls.length
+            ? promptOptimizerSettingsCache.allowed_api_urls.join(", ")
+            : TEXT.apiUrlHintNone)
+        + TEXT.apiUrlHintEdit;
     const apiKeyRow = makePromptOptimizerSettingsRow(TEXT.apiKey, apiKey);
     const modelRow = makePromptOptimizerSettingsRow(TEXT.apiModel, model);
     const localMaxLengthRow = makePromptOptimizerSettingsRow(TEXT.localMaxLength, localMaxLength);
@@ -4574,6 +4599,7 @@ async function openPromptOptimizerSettings(node) {
         makePromptOptimizerSettingsRow(TEXT.apiFormat, apiFormat),
         hint,
         apiUrlRow,
+        apiUrlHint,
         apiKeyRow,
         modelRow,
         ggufModelRow,
@@ -4596,7 +4622,7 @@ async function openPromptOptimizerSettings(node) {
         const clip = isClipOptimizerFormat(apiFormat.value);
         const gguf = isGgufOptimizerFormat(apiFormat.value);
         const local = clip || gguf;
-        for (const row of [apiUrlRow, apiKeyRow, modelRow]) row.hidden = local;
+        for (const row of [apiUrlRow, apiUrlHint, apiKeyRow, modelRow]) row.hidden = local;
         for (const row of [ggufModelRow, ggufMmprojRow, ggufContextRow, ggufGpuLayersRow, ggufUnloadLabel]) row.hidden = !gguf;
         clipModelRow.hidden = !clip;
         // Only a `clip_model` encoder is this pack's to unload; one wired to

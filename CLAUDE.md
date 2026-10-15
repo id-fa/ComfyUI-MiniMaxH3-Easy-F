@@ -155,7 +155,9 @@ Constants are duplicated between `nodes.py` and `web/minimax_h3_easy_f_ui.js` an
 `MAX_MEDIA`, `MIN_SECONDS` / `MAX_SECONDS`, mode ids, `KEYFRAME_*`, `REF_IMAGE_*`,
 `REFERENCE_MENTION_*`, `RESOLUTION_CUSTOM`, the resolution/aspect lists, `OPTIMIZER_VIDEO_SAMPLES`,
 `OPTIMIZER_TOKEN_HEADER` (`PROMPT_OPTIMIZER_TOKEN_HEADER` in JS), every optimizer settings key (both
-sides normalize independently, and the server's normalization is authoritative),
+sides normalize independently, and the server's normalization is authoritative; `allowed_api_urls` is
+the exception: the JS only displays what `GET prompt_optimizer_settings` returns and never sends it, so
+its default lives in `nodes.py` alone),
 the prompt-guide id list (`PROMPT_GUIDES` in JS vs `prompt_guides/manifest.json` on the server), and the
 `__MINIMAX_H3_REF_` / `__MINIMAX_H3_UNRESOLVED_REF_` prefixes.
 
@@ -199,6 +201,34 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
     a rebinding page, which is same-origin with itself and can read the token, so neither other check
     stops it. `allowed_hosts` in `prompt_optimizer.json` is the escape hatch for a same-machine reverse
     proxy, and `_update_prompt_optimizer_config` deliberately never takes it from the request.
+
+  **Where the server may connect is not the request's choice either** (`allowed_api_urls`, ported from
+  `ComfyUI-LLM-Widget` 0.2.4, which was flagged `policy-v0.5: ssrf` for the shape above: `POST
+  prompt_optimizer_settings` sets `api_url`, `_optimizer_http_json` and `_optimizer_remote_unload` then
+  send the API key, the prompt and the references there and hand the body back). The fix is an
+  owner-held allowlist outside every route and workflow:
+  - hand-edited in `prompt_optimizer.json` only. `_update_prompt_optimizer_config` keeps the stored list
+    (as it does `allowed_hosts`) and refuses, with a `ValueError` the route turns into a 400 naming the
+    file, a save whose URL is off it — for `OPTIMIZER_HTTP_FORMATS` only, so a stale URL under `gguf` or
+    `clip` blocks nothing. A missing key means `OPTIMIZER_DEFAULT_ALLOWED_API_URLS` (the local servers'
+    default ports plus the two vendors the formats name); an empty list means nothing is allowed.
+    `_read_prompt_optimizer_config` normalizes the defaults too, because the list is compared in origin
+    form (`https://api.openai.com:443`), not as written;
+  - compared by origin (`_optimizer_url_origin`): scheme, host, port, loopback folded to `localhost`.
+    Link-local, unspecified and multicast literals are refused even when listed;
+  - **every outbound request goes through `_optimizer_http_request`**, which checks the destination
+    again and sends with `allow_redirects=False`, turning a 3xx into an error: the check was made against
+    the URL asked for, not where it points. **A new call site uses `_optimizer_http_request`, never
+    `requests.post` / `requests.request`.** The optimize route and `_optimizer_remote_unload` check up
+    front as well, only so the message is the real one instead of the media being read for nothing or
+    a listing probe swallowing it;
+  - the list is not secret: `_public_prompt_optimizer_config` passes it through so the dialog can show
+    it under the URL field. The JS does not duplicate the defaults and never sends the key back.
+  `_normalize_optimizer_base_url` completes a bare `host:port` to `http://` for localhost, loopback and
+  private hosts and `https://` otherwise, and leaves any other scheme for `_optimizer_url_origin` to
+  refuse. Do not make the check "block private ranges": the LLM server *is* on loopback or the LAN, and
+  the owner's explicit entry is the authority. Do not add a route or a dialog control that edits the
+  list, however convenient — that is the exact hole.
 
   **The API key never goes back to the editor**: `_public_prompt_optimizer_config` blanks it and adds
   `api_key_set`; the dialog sends `api_key_keep` when the field was not touched and

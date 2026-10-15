@@ -860,6 +860,72 @@ that called these routes directly must fetch the token first.
 
 ---
 
+## Where the optimizer may send a request
+
+The section above decides *who* may call the routes. This one decides *where*
+the server may connect once called, which is not the request's choice either.
+`POST prompt_optimizer_settings` sets `api_url`; `✦`, "Optimize when workflow
+runs" and `⏏` then send the API key, the prompt and the references there and
+hand the reply (or the first 1000 characters of the error) back. Whoever reaches
+that route therefore picks where this ComfyUI process connects and reads the
+answer — a server-side request forgery, the finding the Comfy Registry raised
+against `ComfyUI-LLM-Widget` over the same shape of route. The fix is the same
+one: an owner-held allowlist outside every route and workflow.
+
+A request to an HTTP backend (`openai`, `responses`, `gemini`) is only sent to a
+destination listed under `allowed_api_urls` in `prompt_optimizer.json`. The
+comparison is by **scheme, host and port** (the origin); the path does not
+matter, and `127.0.0.1`, `::1` and `localhost` count as the same host. The
+default:
+
+```json
+"allowed_api_urls": [
+  "http://localhost:1234",
+  "http://localhost:11434",
+  "http://localhost:8080",
+  "http://localhost:8000",
+  "https://api.openai.com",
+  "https://generativelanguage.googleapis.com"
+]
+```
+
+That is LM Studio (1234), Ollama (11434), llama.cpp server (8080) and vLLM
+(8000) on their default ports, plus the official OpenAI and Gemini endpoints. For
+another port or another server — OpenRouter, a box on the LAN — open
+`prompt_optimizer.json` next to `nodes.py` in a text editor and add it to the
+array. No restart is needed; the next request reads the file. A file written
+before this key existed gets the default list; an empty list means nothing is
+allowed.
+
+- The ⚙ dialog shows the current list under the API URL field but **cannot
+  change it**: whatever the settings route sends for this key is ignored, and
+  saving a URL that is not on the list is refused on the spot with a `400` that
+  names the file. Only the three HTTP formats are checked at save time, so a
+  stale URL left under `gguf` or `clip` blocks nothing.
+- Every outbound request goes through one function that checks the destination
+  again right before sending, so a check cannot be skipped by a new caller.
+- HTTP redirects are not followed: a `3xx` is an error. The allowlist was
+  checked against the URL asked for, not where the server points, and following
+  it would send the same `Authorization` header there.
+- Link-local (`169.254.*`, where cloud metadata services live), unspecified and
+  multicast addresses are refused even when listed. Loopback, private and LAN
+  addresses are fine when listed — the LLM server usually *is* on one.
+- A bare `host:port` without a scheme is completed to `http://` for `localhost`,
+  loopback and private addresses and to `https://` for anything else. Before
+  this change every bare URL became `https://`, which is why `localhost:1234`
+  had to be typed with its scheme.
+
+### Scope
+
+`nodes.py` (`OPTIMIZER_DEFAULT_ALLOWED_API_URLS`, `_optimizer_url_origin`,
+`_optimizer_allowed_origins`, `_optimizer_destination_problem`,
+`_optimizer_http_request`, `_update_prompt_optimizer_config`), the API URL hint
+in the ⚙ dialog in `web/minimax_h3_easy_f_ui.js`. **Restart ComfyUI and hard
+refresh.** If your API URL is not one of the defaults above, the next save and
+the next `✦` will tell you to add it to the file.
+
+---
+
 ## Frontend file name and prompt editor globals
 
 This fork's frontend is `web/minimax_h3_easy_f_ui.js`. Upstream calls it
