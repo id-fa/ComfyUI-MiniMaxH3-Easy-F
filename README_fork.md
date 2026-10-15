@@ -943,11 +943,19 @@ each read are timed separately — not a cap on the whole exchange. A request
 that does hit it now fails with a message that names the setting. The unload
 button keeps its own short limit; it is a management call, not a generation.
 
+**The browser had a second, shorter limit.** ComfyUI frontend 1.55 and later
+give `api.fetchApi` a 60 s timeout of its own and abort the request with a
+`Fetch timeout` error — which is what a 600 s setting still ran into after one
+minute, while the server went on optimizing and logged `finished` later. The
+`✦` and `⏏` calls now opt out of that limit (`timeoutMs: null`), so the server's
+`http_timeout` is the only one. An older frontend ignores the option.
+
 ### Scope
 
-`nodes.py` (`http_timeout`, `_optimizer_http_timeout`) and the settings modal
-in `web/minimax_h3_easy_f_ui.js`. **Restart ComfyUI and hard refresh.** This
-supersedes the fixed `PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS` upstream uses.
+`nodes.py` (`http_timeout`, `_optimizer_http_timeout`), the settings modal and
+`PROMPT_OPTIMIZER_LONG_CALL` in `web/minimax_h3_easy_f_ui.js`. **Restart ComfyUI
+and hard refresh.** This supersedes the fixed
+`PROMPT_OPTIMIZER_ON_RUN_TIMEOUT_SECONDS` upstream uses.
 
 ---
 

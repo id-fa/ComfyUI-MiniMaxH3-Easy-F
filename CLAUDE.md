@@ -244,7 +244,12 @@ must keep sorting before GGUF (`_sort_model_names`) so existing workflows keep r
   `_optimizer_http_timeout` by the editor route **and** `_optimize_prompt_on_run` — the run-time path
   used to have its own fixed 120 s, which is what cut long optimizations off; do not reintroduce a
   second constant. `PROMPT_OPTIMIZER_UNLOAD_TIMEOUT_SECONDS` stays separate because unloading is a
-  management call. `requests.Timeout` is reported with a message that names the setting. The `prompt_optimizer_settings` boolean is a
+  management call. `requests.Timeout` is reported with a message that names the setting. **The frontend
+  has a timeout of its own**: ComfyUI frontend 1.55+ aborts `api.fetchApi` after 60 s (`Fetch timeout`,
+  a `TimeoutError` DOMException), so `prompt_optimize` and `prompt_optimizer_unload` pass
+  `PROMPT_OPTIMIZER_LONG_CALL` (`timeoutMs: null`) and the server's limit is the only one; a new
+  long-running route call must do the same, or it dies at a minute whatever `http_timeout` says.
+  The `prompt_optimizer_settings` boolean is a
   momentary trigger that the frontend resets to `false` and `graphToPrompt` always forces to `false`.
 - There are **three** places a prompt can be optimized, and each one checks the configured `api_format`
   itself so only one of them ever fires:
